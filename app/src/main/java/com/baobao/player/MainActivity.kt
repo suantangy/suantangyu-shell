@@ -94,7 +94,10 @@ class MainActivity : AppCompatActivity() {
                 // 有状态栏时期望 --safe-t 非 0；无状态栏时只看类
                 val valOk = lastTopCss == 0 || !(s.startsWith("\"1|0px\"") || s == "\"1|\"")
                 if (clsOk && valOk) {
+                    // 淡入显示，避免内容"啪"一下弹出的两层感
+                    webView.alpha = 0f
                     webView.visibility = View.VISIBLE
+                    webView.animate().alpha(1f).setDuration(250).start()
                 } else {
                     webView.postDelayed({ check() }, 100)
                 }
