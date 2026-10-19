@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.webkit.WebSettings
@@ -16,10 +17,18 @@ import androidx.activity.addCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 /**
  * 宝宝巴士混合壳：WebView 承载现有网页播放器（音频仍由网页 <audio> 播放，
  * 你的几万行代码不用动），原生 ForegroundService 保活 + 通知栏媒体控制。
+ *
+ * 沉浸式：网页内容延伸到状态栏/导航栏之下（顶部全屏无黑条），
+ * 真实系统栏高度注入网页的 --fm-safe-top / --fm-safe-bottom，
+ * 页面自己的安全区变量会自动避让，不会被状态栏图标压住。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -32,6 +41,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var webView: WebView
+    private var lastTopCss: Int = 0
+    private var lastBottomCss: Int = 0
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -45,10 +56,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 把系统栏高度注入网页，页面 CSS 的 var(--fm-safe-top/bottom) 自动生效 */
+    private fun injectSafeArea() {
+        if (!::webView.isInitialized) return
+        webView.post {
+            webView.evaluateJavascript(
+                "document.documentElement.style.setProperty('--fm-safe-top','" + lastTopCss + "px');" +
+                    "document.documentElement.style.setProperty('--fm-safe-bottom','" + lastBottomCss + "px')",
+                null
+            )
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         instance = this
+
+        // —— 沉浸式：内容延伸到系统栏之下，系统栏透明（顶部全屏，不再有黑条） ——
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        val insetsController = WindowInsetsControllerCompat(window, window.decorView)
+        // 首页/搜索页是浅色底，状态栏和导航栏图标用深色
+        insetsController.isAppearanceLightStatusBars = true
+        insetsController.isAppearanceLightNavigationBars = true
 
         webView = WebView(this)
         setContentView(webView)
@@ -64,7 +96,23 @@ class MainActivity : AppCompatActivity() {
         }
         // 网页 → 原生：上报曲名/播放状态，驱动通知栏
         webView.addJavascriptInterface(BaoBridge(this), "BaoBus")
-        webView.webViewClient = WebViewClient()
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                // 页面加载完补一次注入（防止 insets 先到、页面后到的情况）
+                injectSafeArea()
+            }
+        }
+
+        // 监听系统栏高度变化（旋转、分屏等），实时注入网页
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val density = resources.displayMetrics.density
+            lastTopCss = (bars.top / density).toInt()
+            lastBottomCss = (bars.bottom / density).toInt()
+            injectSafeArea()
+            insets
+        }
 
         // 通知栏控制 → 网页
         val filter = IntentFilter(ACTION_CONTROL)
