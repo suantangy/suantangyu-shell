@@ -10,19 +10,27 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.media.app.NotificationCompat.MediaStyle
+import androidx.media.session.MediaButtonReceiver
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 
 /**
  * 前台保活服务：拿住 mediaPlayback 类型的前台服务身份，
  * 进程优先级拉满（熄屏/切后台不被杀），通知栏常驻媒体控制条。
  *
- * 注意：音频本身仍由 WebView 网页的 <audio> 播放，服务只负责保活和通知栏。
- * 因此"从最近任务划掉 App"仍会停播——要连划掉都不停，需要把解码搬进
- * 服务用 ExoPlayer 播，那是二期的大改（要重写音频管线）。
+ * 关键：创建一个真正的 MediaSessionCompat 并把它的 token 挂到通知上，
+ * 系统（通知栏媒体卡片、灵动岛胶囊、锁屏播放器、蓝牙/耳机线控）才认得
+ * "有音乐在播"。没有 session token 就只是一条普通通知。
+ *
+ * 注意：音频本身仍由 WebView 网页的 <audio> 播放，服务只负责保活、
+ * 通知栏和媒体会话；状态全部由网页经 BaoBus 上报，单向同步，无回环。
  */
 class KeepAliveService : Service() {
 
     companion object {
-        const val CHANNEL_ID = "bao_playback"
+        const val CHANNEL_ID = "bao_playback_v2"
         const val NOTIFY_ID = 1
         const val ACTION_UPDATE_TRACK = "com.baobao.player.UPDATE_TRACK"
         const val ACTION_UPDATE_STATE = "com.baobao.player.UPDATE_STATE"
@@ -35,6 +43,8 @@ class KeepAliveService : Service() {
     private var artist: String = "准备播放"
     private var playing: Boolean = false
 
+    private lateinit var mediaSession: MediaSessionCompat
+
     private val notificationManager by lazy {
         getSystemService(NotificationManager::class.java)
     }
@@ -42,6 +52,21 @@ class KeepAliveService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+
+        // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
+        mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
+            setFlags(MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onPlay() = sendControl("toggle")
+                override fun onPause() = sendControl("toggle")
+                override fun onSkipToNext() = sendControl("next")
+                override fun onSkipToPrevious() = sendControl("prev")
+            })
+            isActive = true
+        }
+        updateSessionMetadata()
+        updateSessionState()
+
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(
@@ -54,27 +79,39 @@ class KeepAliveService : Service() {
         }
     }
 
+    override fun onDestroy() {
+        try {
+            mediaSession.isActive = false
+            mediaSession.release()
+        } catch (_: Exception) {
+        }
+        super.onDestroy()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_UPDATE_TRACK -> {
                 title = intent.getStringExtra("title").orEmpty().ifEmpty { "宝宝巴士" }
                 artist = intent.getStringExtra("artist").orEmpty()
+                updateSessionMetadata()
                 updateNotification()
             }
             ACTION_UPDATE_STATE -> {
                 playing = intent.getBooleanExtra("playing", false)
+                updateSessionState()
                 updateNotification()
             }
             ACTION_TOGGLE, ACTION_NEXT, ACTION_PREV -> {
-                // 通知栏按钮 → 广播给 MainActivity → 转发进网页
                 val action = when (intent.action) {
                     ACTION_TOGGLE -> "toggle"
                     ACTION_NEXT -> "next"
                     else -> "prev"
                 }
-                sendBroadcast(
-                    Intent(MainActivity.ACTION_CONTROL).putExtra("action", action)
-                )
+                sendControl(action)
+            }
+            // 耳机/蓝牙媒体按钮走这里
+            Intent.ACTION_MEDIA_BUTTON -> {
+                MediaButtonReceiver.handleIntent(mediaSession, intent)
             }
         }
         return START_STICKY
@@ -82,11 +119,52 @@ class KeepAliveService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** 通知栏按钮 / 锁屏 / 线控 → 转发给 MainActivity → 网页的 window.__baoCtl */
+    private fun sendControl(action: String) {
+        sendBroadcast(Intent(MainActivity.ACTION_CONTROL).putExtra("action", action))
+    }
+
+    private fun updateSessionMetadata() {
+        try {
+            mediaSession.setMetadata(
+                MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist.ifEmpty { "宝宝巴士" })
+                    .build()
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun updateSessionState() {
+        try {
+            val state = if (playing) {
+                PlaybackStateCompat.STATE_PLAYING
+            } else {
+                PlaybackStateCompat.STATE_PAUSED
+            }
+            mediaSession.setPlaybackState(
+                PlaybackStateCompat.Builder()
+                    .setActions(
+                        PlaybackStateCompat.ACTION_PLAY or
+                            PlaybackStateCompat.ACTION_PAUSE or
+                            PlaybackStateCompat.ACTION_PLAY_PAUSE or
+                            PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+                    )
+                    .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1f)
+                    .build()
+            )
+        } catch (_: Exception) {
+        }
+    }
+
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(
                 CHANNEL_ID, "播放控制",
-                NotificationManager.IMPORTANCE_LOW
+                // DEFAULT：锁屏上可见；LOW 会被部分系统藏起
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply { description = "宝宝巴士后台播放保活与通知栏控制" }
             notificationManager.createNotificationChannel(channel)
         }
@@ -127,6 +205,8 @@ class KeepAliveService : Service() {
             .setContentIntent(contentIntent())
             .setOngoing(playing)
             .setOnlyAlertOnce(true)
+            // 锁屏上可见内容（不显示敏感信息，这里本就没有）
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .addAction(
                 android.R.drawable.ic_media_previous, "上一首",
                 actionIntent(ACTION_PREV)
@@ -137,7 +217,9 @@ class KeepAliveService : Service() {
                 actionIntent(ACTION_NEXT)
             )
             .setStyle(
-                androidx.media.app.NotificationCompat.MediaStyle()
+                MediaStyle()
+                    // 关键：把媒体会话 token 挂上，系统才认这是媒体播放
+                    .setMediaSession(mediaSession.sessionToken)
                     .setShowActionsInCompactView(0, 1, 2)
             )
             .build()
