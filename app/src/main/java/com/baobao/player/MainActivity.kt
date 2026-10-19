@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -43,6 +44,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private var lastTopCss: Int = 0
     private var lastBottomCss: Int = 0
+    /** 启动闪跳修复：insets 和页面都就绪、注入已画出来后，才显示 WebView */
+    private var insetsReady = false
+    private var pageReady = false
+    private var revealed = false
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -64,6 +69,28 @@ class MainActivity : AppCompatActivity() {
                 webView.evaluateJavascript(js, null)
             } catch (_: Exception) {
             }
+        }
+    }
+
+    /** 条件满足后：补一次注入，等新布局画出来再显示 WebView，避免标题先顶到状态栏再跳下来 */
+    private fun maybeReveal() {
+        if (revealed || !insetsReady || !pageReady || !::webView.isInitialized) return
+        revealed = true
+        injectSafeArea()
+        webView.post {
+            try {
+                if (Build.VERSION.SDK_INT >= 23) {
+                    webView.postVisualStateCallback(1L, object : WebView.VisualStateCallback() {
+                        override fun onComplete(requestId: Long) {
+                            webView.visibility = View.VISIBLE
+                        }
+                    })
+                }
+            } catch (_: Exception) {
+            }
+            // 兜底：300ms 后显示；3s 强制显示，极端情况也不白屏
+            webView.postDelayed({ webView.visibility = View.VISIBLE }, 300)
+            webView.postDelayed({ webView.visibility = View.VISIBLE }, 3000)
         }
     }
 
@@ -95,6 +122,8 @@ class MainActivity : AppCompatActivity() {
         insetsController.isAppearanceLightNavigationBars = true
 
         webView = WebView(this)
+        // 先隐身：等安全区注入画好再显示，标题不会先顶上去再跳下来
+        webView.visibility = View.INVISIBLE
         setContentView(webView)
 
         with(webView.settings) {
@@ -112,7 +141,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 // 页面加载完补一次注入（防止 insets 先到、页面后到的情况）
+                pageReady = true
                 injectSafeArea()
+                maybeReveal()
             }
         }
 
@@ -122,7 +153,10 @@ class MainActivity : AppCompatActivity() {
             val density = resources.displayMetrics.density
             lastTopCss = (bars.top / density).toInt()
             lastBottomCss = (bars.bottom / density).toInt()
-            injectSafeArea()
+            insetsReady = true
+            // 页面已就绪：值变了（旋转/分屏）就补注入
+            if (pageReady) injectSafeArea()
+            maybeReveal()
             insets
         }
 
