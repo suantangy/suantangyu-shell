@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.BaobaoShell" parent="Theme.AppCompat.NoActionBar">
-        <!-- 启动时 WebView 隐身等待安全区注入，窗口底色与首页底色一致，过渡无感 -->
-        <item name="android:windowBackground">#f3f3f6</item>
+        <!-- cheng 2026-10-20 试白色窗口底 -->
+        <item name="android:windowBackground">#ffffff</item>
         <item name="android:statusBarColor">#0c0c0e</item>
     </style>
 </resources>
