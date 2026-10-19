@@ -11,6 +11,7 @@ import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.view.View
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -48,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private var insetsReady = false
     private var pageReady = false
     private var revealed = false
+    private var earlyInjected = false
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -72,26 +74,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 条件满足后：补一次注入，等新布局画出来再显示 WebView，避免标题先顶到状态栏再跳下来 */
+    /** 条件满足后：补一次注入，轮询确认计算样式已生效再显示，彻底杜绝时序竞态 */
     private fun maybeReveal() {
         if (revealed || !insetsReady || !pageReady || !::webView.isInitialized) return
         revealed = true
         injectSafeArea()
-        webView.post {
-            try {
-                if (Build.VERSION.SDK_INT >= 23) {
-                    webView.postVisualStateCallback(1L, object : WebView.VisualStateCallback() {
-                        override fun onComplete(requestId: Long) {
-                            webView.visibility = View.VISIBLE
-                        }
-                    })
+        val checker = object : Runnable {
+            var tries = 0
+            override fun run() {
+                if (webView.visibility == View.VISIBLE) return
+                if (tries++ >= 50) { webView.visibility = View.VISIBLE; return } // 5s 兜底，绝不白屏
+                webView.evaluateJavascript(
+                    "(function(){try{var e=document.documentElement;" +
+                        "var c=e.classList.contains('fm-chrome-full')?'1':'0';" +
+                        "var v=getComputedStyle(e).getPropertyValue('--safe-t').trim();" +
+                        "return c+'|'+v;}catch(x){return '0|';}})()"
+                ) { r ->
+                    val s = r ?: ""
+                    val clsOk = s.startsWith("\"1|")
+                    // 有状态栏时期望 --safe-t 非 0；无状态栏时只看类
+                    val valOk = lastTopCss == 0 || !(s.startsWith("\"1|0px\"") || s == "\"1|\"")
+                    if (clsOk && valOk) {
+                        webView.visibility = View.VISIBLE
+                    } else {
+                        webView.postDelayed(checker, 100)
+                    }
                 }
-            } catch (_: Exception) {
             }
-            // 兜底：300ms 后显示；3s 强制显示，极端情况也不白屏
-            webView.postDelayed({ webView.visibility = View.VISIBLE }, 300)
-            webView.postDelayed({ webView.visibility = View.VISIBLE }, 3000)
         }
+        webView.post(checker)
     }
 
     /** 把系统栏高度注入网页，页面 CSS 的 var(--fm-safe-top/bottom) 自动生效 */
@@ -144,6 +155,16 @@ class MainActivity : AppCompatActivity() {
                 pageReady = true
                 injectSafeArea()
                 maybeReveal()
+            }
+        }
+        // 进度起来后 DOM 基本可用，提前注入一次，缩短隐身等待（最终显示仍以校验为准）
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (!earlyInjected && newProgress >= 20 && insetsReady && ::webView.isInitialized) {
+                    earlyInjected = true
+                    injectSafeArea()
+                }
             }
         }
 
