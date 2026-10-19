@@ -28,4 +28,26 @@ class BaoBridge(private val activity: MainActivity) {
         }
         activity.startService(intent)
     }
+
+    /** 播放进度（毫秒），网页每秒上报一次，服务只更新会话状态不重发通知 */
+    @JavascriptInterface
+    fun postProgress(positionMs: Long, durationMs: Long) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_UPDATE_PROGRESS
+            putExtra("position", positionMs)
+            putExtra("duration", durationMs)
+        }
+        activity.startService(intent)
+    }
+
+    /** 锁屏歌词行；空字符串表示恢复显示歌名 */
+    @JavascriptInterface
+    fun postLyric(line: String, sub: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_UPDATE_LYRIC
+            putExtra("line", line)
+            putExtra("sub", sub)
+        }
+        activity.startService(intent)
+    }
 }
