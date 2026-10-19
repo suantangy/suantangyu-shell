@@ -8,9 +8,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.View
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -23,6 +25,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.activity.result.contract.ActivityResultContracts
 
 /**
  * 宝宝巴士混合壳：WebView 承载现有网页播放器（音频仍由网页 <audio> 播放，
@@ -50,6 +53,15 @@ class MainActivity : AppCompatActivity() {
     private var pageReady = false
     private var revealed = false
     private var earlyInjected = false
+    /** 文件选择器回调（音源管理"本地文件"按钮用） */
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+        fileChooserCallback?.onReceiveValue(uris)
+        fileChooserCallback = null
+    }
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -165,6 +177,22 @@ class MainActivity : AppCompatActivity() {
                 if (!earlyInjected && newProgress >= 20 && insetsReady && ::webView.isInitialized) {
                     earlyInjected = true
                     injectSafeArea()
+                }
+            }
+            // 网页 <input type="file">（如音源管理"本地文件"）调起系统文件选择器
+            override fun onShowFileChooser(
+                view: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: FileChooserParams
+            ): Boolean {
+                fileChooserCallback?.onReceiveValue(null)
+                fileChooserCallback = filePathCallback
+                return try {
+                    fileChooserLauncher.launch(fileChooserParams.createIntent())
+                    true
+                } catch (_: Exception) {
+                    fileChooserCallback = null
+                    false
                 }
             }
         }
