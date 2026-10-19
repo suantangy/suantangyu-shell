@@ -56,9 +56,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 把系统栏高度注入网页，页面 CSS 的 var(--fm-safe-top/bottom) 自动生效 */
-    private fun injectSafeArea() {
+    /** 供 KeepAliveService 直接调用：在网页里执行 JS（通知栏/锁屏按钮直达页面，不经过广播） */
+    fun runJsOnPage(js: String) {
         if (!::webView.isInitialized) return
+        webView.post {
+            try {
+                webView.evaluateJavascript(js, null)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 把系统栏高度注入网页，页面 CSS 的 var(--fm-safe-top/bottom) 自动生效 */
+    private fun injectSafeArea() {        if (!::webView.isInitialized) return
         webView.post {
             webView.evaluateJavascript(
                 // fm-chrome-full：启用页面自己的沉浸式安全区（--safe-t = --safe-t-raw）
