@@ -198,7 +198,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 监听系统栏高度变化（旋转、分屏等），实时注入网页
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
+        // edge-to-edge 下系统不会自动压缩窗口，键盘高度必须手动处理：
+        // 用可见显示区域的高度直接设置 WebView 高度，触发页面的 resizes-content
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val density = resources.displayMetrics.density
             lastTopCss = (bars.top / density).toInt()
@@ -207,6 +209,19 @@ class MainActivity : AppCompatActivity() {
             // 页面已就绪：值变了（旋转/分屏）就补注入
             if (pageReady) injectSafeArea()
             maybeReveal()
+            // 键盘弹起/收起时，按可见区域重设 WebView 高度
+            view.post {
+                try {
+                    val rect = android.graphics.Rect()
+                    view.getWindowVisibleDisplayFrame(rect)
+                    val lp = view.layoutParams
+                    if (lp.height != rect.height() && rect.height() > 0) {
+                        lp.height = rect.height()
+                        view.layoutParams = lp
+                    }
+                } catch (_: Exception) {
+                }
+            }
             insets
         }
 
