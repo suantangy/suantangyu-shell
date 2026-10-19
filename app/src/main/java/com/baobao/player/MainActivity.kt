@@ -61,7 +61,9 @@ class MainActivity : AppCompatActivity() {
         if (!::webView.isInitialized) return
         webView.post {
             webView.evaluateJavascript(
-                "document.documentElement.style.setProperty('--fm-safe-top','" + lastTopCss + "px');" +
+                // fm-chrome-full：启用页面自己的沉浸式安全区（--safe-t = --safe-t-raw）
+                "document.documentElement.classList.add('fm-chrome-full');" +
+                    "document.documentElement.style.setProperty('--fm-safe-top','" + lastTopCss + "px');" +
                     "document.documentElement.style.setProperty('--fm-safe-bottom','" + lastBottomCss + "px')",
                 null
             )
