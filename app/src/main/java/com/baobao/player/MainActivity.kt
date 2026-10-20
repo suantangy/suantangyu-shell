@@ -62,6 +62,8 @@ class MainActivity : AppCompatActivity() {
     private var kbHeightAnim: ValueAnimator? = null
     /** 上次键盘开/关状态，避免动画帧里重复注入 dock 显隐 */
     private var lastKbOpen: Boolean? = null
+    /** IME 动画进行中：onProgress 直接驱动高度时，inset 监听不再启动 ValueAnimator，避免打架抖动 */
+    private var inImeAnim = false
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -282,8 +284,9 @@ class MainActivity : AppCompatActivity() {
             }
             // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，平滑重设 WebView 高度
             // （不用 getWindowVisibleDisplayFrame，它在全面屏下会多扣导航栏，底部留白条）
+            // IME 动画进行中时由上面的 onProgress 直接驱动，这里跳过，避免打架抖动
             val winH = view.rootView.height
-            if (winH > 0) smoothResizeWebView(view, winH - ime.bottom)
+            if (winH > 0 && !inImeAnim) smoothResizeWebView(view, winH - ime.bottom)
             insets
         }
 
@@ -292,6 +295,25 @@ class MainActivity : AppCompatActivity() {
         // 不再猜 200ms/120ms。若键盘不参与 inset 动画，这里不触发，上面兜底。
         ViewCompat.setWindowInsetsAnimationCallback(webView,
             object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                override fun onStart(
+                    animation: WindowInsetsAnimationCompat,
+                    bounds: WindowInsetsAnimationCompat.BoundsCompat
+                ): WindowInsetsAnimationCompat.BoundsCompat {
+                    if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
+                        inImeAnim = true
+                        kbHeightAnim?.cancel()
+                        kbHeightAnim = null
+                    }
+                    return super.onStart(animation, bounds)
+                }
+
+                override fun onEnd(animation: WindowInsetsAnimationCompat) {
+                    if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
+                        inImeAnim = false
+                    }
+                    super.onEnd(animation)
+                }
+
                 override fun onProgress(
                     insets: WindowInsetsCompat,
                     runningAnims: List<WindowInsetsAnimationCompat>
