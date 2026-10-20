@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.BaobaoShell" parent="Theme.AppCompat.NoActionBar">
+    <style name="Theme.SuantangyuShell" parent="Theme.AppCompat.NoActionBar">
         <!-- cheng 2026-10-20 试白色窗口底 -->
         <item name="android:windowBackground">#ffffff</item>
         <item name="android:statusBarColor">#0c0c0e</item>

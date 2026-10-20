@@ -1,4 +1,4 @@
-package com.baobao.player
+package com.suantangyu.player
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -42,7 +42,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         /** 你的 Cloudflare Pages 地址，换了部署地址就改这里 */
         const val START_URL = "https://yinyue-bfq.pages.dev/"
-        const val ACTION_CONTROL = "com.baobao.player.CONTROL"
+        const val ACTION_CONTROL = "com.suantangyu.player.CONTROL"
         var instance: MainActivity? = null
             private set
     }

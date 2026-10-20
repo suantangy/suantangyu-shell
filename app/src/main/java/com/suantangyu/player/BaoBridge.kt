@@ -1,4 +1,4 @@
-package com.baobao.player
+package com.suantangyu.player
 
 import android.content.Intent
 import android.webkit.JavascriptInterface

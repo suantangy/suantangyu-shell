@@ -1,4 +1,4 @@
-package com.baobao.player
+package com.suantangyu.player
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -37,13 +37,13 @@ class KeepAliveService : Service() {
     companion object {
         const val CHANNEL_ID = "bao_playback_v2"
         const val NOTIFY_ID = 1
-        const val ACTION_UPDATE_TRACK = "com.baobao.player.UPDATE_TRACK"
-        const val ACTION_UPDATE_STATE = "com.baobao.player.UPDATE_STATE"
-        const val ACTION_UPDATE_PROGRESS = "com.baobao.player.UPDATE_PROGRESS"
-        const val ACTION_UPDATE_LYRIC = "com.baobao.player.UPDATE_LYRIC"
-        const val ACTION_TOGGLE = "com.baobao.player.TOGGLE"
-        const val ACTION_NEXT = "com.baobao.player.NEXT"
-        const val ACTION_PREV = "com.baobao.player.PREV"
+        const val ACTION_UPDATE_TRACK = "com.suantangyu.player.UPDATE_TRACK"
+        const val ACTION_UPDATE_STATE = "com.suantangyu.player.UPDATE_STATE"
+        const val ACTION_UPDATE_PROGRESS = "com.suantangyu.player.UPDATE_PROGRESS"
+        const val ACTION_UPDATE_LYRIC = "com.suantangyu.player.UPDATE_LYRIC"
+        const val ACTION_TOGGLE = "com.suantangyu.player.TOGGLE"
+        const val ACTION_NEXT = "com.suantangyu.player.NEXT"
+        const val ACTION_PREV = "com.suantangyu.player.PREV"
     }
 
     private var title: String = "酸汤鱼音乐"

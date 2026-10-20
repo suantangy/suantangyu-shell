@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.baobao.player"
+    namespace = "com.suantangyu.player"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.baobao.player"
+        applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

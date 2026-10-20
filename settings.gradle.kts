@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "baobao-shell"
+rootProject.name = "suantangyu-shell"
 include(":app")
