@@ -54,6 +54,35 @@ class KeepAliveService : Service() {
     private var lastNotifyMs: Long = 0L
     private var durationMs: Long = 0L
 
+    /**
+     * 进度自走表：网页退后台后它的 1s 定时器会被 Chromium 节流，进度报不上来。
+     * 壳是原生前台服务，定时器不受网页节流影响——用"锚点"（网页最后报的位置+系统时间）
+     * 自己每秒推算当前位置并刷会话/通知；网页偶尔报上来的进度只当校准锚点。
+     */
+    private val tickHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var anchorPosMs: Long = 0L
+    private var anchorAtMs: Long = 0L
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            try {
+                if (playing) {
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    var cur = anchorPosMs + (now - anchorAtMs)
+                    if (durationMs > 0 && cur > durationMs) cur = durationMs
+                    if (cur < 0) cur = 0
+                    // 秒变了才刷，避免同一秒重复重发通知
+                    if (cur / 1000 != positionMs / 1000) {
+                        positionMs = cur
+                        updateSessionState()
+                        updateNotification()
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            tickHandler.postDelayed(this, 1000)
+        }
+    }
+
     /** 锁屏歌词行（网页上报）；非空时卡片标题显示歌词，歌名/歌手降为副标题 */
     private var lyricLine: String = ""
     private var lyricSub: String = ""
@@ -87,6 +116,8 @@ class KeepAliveService : Service() {
         }
         updateSessionMetadata()
         updateSessionState()
+        // 启动进度自走表（壳自己的 1s 滴答，后台不受网页定时器节流影响）
+        tickHandler.postDelayed(tickRunnable, 1000)
 
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= 29) {
@@ -101,6 +132,10 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        try {
+            tickHandler.removeCallbacks(tickRunnable)
+        } catch (_: Exception) {
+        }
         try {
             mediaSession.isActive = false
             mediaSession.release()
@@ -119,10 +154,12 @@ class KeepAliveService : Service() {
             ACTION_UPDATE_TRACK -> {
                 title = intent.getStringExtra("title").orEmpty().ifEmpty { "宝宝巴士" }
                 artist = intent.getStringExtra("artist").orEmpty()
-                // 切歌：歌词覆盖清掉，回到显示歌名
+                // 切歌：歌词覆盖清掉，回到显示歌名；进度锚点归零
                 lyricLine = ""
                 lyricSub = ""
                 positionMs = 0L
+                anchorPosMs = 0L
+                anchorAtMs = SystemClock.elapsedRealtime()
                 val newCover = intent.getStringExtra("cover").orEmpty()
                 updateSessionMetadata()
                 updateSessionState()
@@ -136,19 +173,34 @@ class KeepAliveService : Service() {
                 }
             }
             ACTION_UPDATE_STATE -> {
-                playing = intent.getBooleanExtra("playing", false)
+                val nowPlaying = intent.getBooleanExtra("playing", false)
+                val nowRt = SystemClock.elapsedRealtime()
+                if (playing && !nowPlaying) {
+                    // 暂停：把自走表推算的当前位置冻结下来
+                    var cur = anchorPosMs + (nowRt - anchorAtMs)
+                    if (durationMs > 0 && cur > durationMs) cur = durationMs
+                    if (cur < 0) cur = 0
+                    positionMs = cur
+                    anchorPosMs = cur
+                }
+                if (!playing && nowPlaying) {
+                    // 恢复播放：从当前冻结位置重新起锚
+                    anchorPosMs = positionMs
+                }
+                anchorAtMs = nowRt
+                playing = nowPlaying
                 updateSessionState()
                 updateNotification()
             }
             ACTION_UPDATE_PROGRESS -> {
+                // 网页报上来的真实进度 = 校准锚点，覆盖自走表推算
                 positionMs = intent.getLongExtra("position", 0L)
                 durationMs = intent.getLongExtra("duration", 0L)
+                anchorPosMs = positionMs
+                anchorAtMs = SystemClock.elapsedRealtime()
                 updateSessionState()
-                // 灵动岛读的是通知快照，不会自己按速度推进——进度也必须重发通知；
-                // 网页本就 1s 上报一次，这里再加 1s 节流兜底，避免刷屏
-                val now = SystemClock.uptimeMillis()
-                if (now - lastNotifyMs >= 1000) {
-                    lastNotifyMs = now
+                // 节流：距离上次通知不到 1s 就跳过（tick 自走表本身 1s 一次，网页报上来也 1s 一次）
+                if (SystemClock.uptimeMillis() - lastNotifyMs >= 1000) {
                     updateNotification()
                 }
             }
@@ -334,6 +386,7 @@ class KeepAliveService : Service() {
 
     private fun updateNotification() {
         try {
+            lastNotifyMs = SystemClock.uptimeMillis()
             notificationManager.notify(NOTIFY_ID, buildNotification())
         } catch (_: Exception) {
         }
