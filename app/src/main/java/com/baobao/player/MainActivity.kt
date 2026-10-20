@@ -25,7 +25,6 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.result.contract.ActivityResultContracts
@@ -53,11 +52,6 @@ class MainActivity : AppCompatActivity() {
     private var lastBottomCss: Int = 0
     /** 当前键盘高度（CSS px），由系统 IME inset 换算；只灌给网页当 --kb-h 用，不动 WebView 布局 */
     private var lastKbCss: Int = 0
-    /** 键盘升降动画进行中（此时 --kb-h 由逐帧回调接管） */
-    @Volatile
-    private var inImeAnim: Boolean = false
-    /** 本次动画里收到过的不同高度值个数（≥2 才算真逐帧流） */
-    private var imeAnimFrames: Int = 0
     /** 启动闪跳修复：insets 和页面都就绪、注入已画出来后，才显示 WebView */
     private var insetsReady = false
     private var pageReady = false
@@ -149,8 +143,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * 键盘高度精确版：只把系统 IME 高度灌成 CSS 变量 --kb-h，并给 <html> 挂 kb-on 类；
      * 网页弹窗用 padding-bottom: var(--kb-h) 居中到键盘上方可见区。不改 WebView 高度。
-     * 键盘升降动画期间由 WindowInsetsAnimationCompat 逐帧调用 applyKbCss 喂插值高度，
-     * 弹窗下边黏住键盘上沿同步滑动；动画外（监听收到最终值）走 injectKb 一次到位。
+     * 动画全权交给网页的一条 CSS 过渡：值只在这里随 inset 变化更新一次，过渡一笔画完。
      */
     private fun injectKb() {
         if (!pageReady) return
@@ -235,6 +228,8 @@ class MainActivity : AppCompatActivity() {
         // 监听系统栏高度变化（旋转、分屏等），实时注入网页。
         // 键盘：WebView 永远全高，键盘作为系统窗口直接盖在 App 上层（导航栏被盖住是主流行为）；
         // 壳只把系统 IME 高度换算成 CSS px 灌给网页（--kb-h），弹窗居中由网页 CSS 用这个值完成。
+        // 刻意不用逐帧动画回调：它在部分输入法上时有时无、采样不匀，逐帧直写拼出来的轨迹
+        // 反而不如一条完整的 CSS 过渡顺滑——弹窗动画全权交给网页的一条过渡（见 --kb-h 注释）。
         ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
@@ -246,66 +241,12 @@ class MainActivity : AppCompatActivity() {
             if (pageReady) injectSafeArea()
             maybeReveal()
             val kbCss = (ime.bottom / density).toInt()
-            if (!inImeAnim && kbCss != lastKbCss) {
-                // 动画期间逐帧回调自己管变量（见下方回调）；这里只在动画外收最终值
+            if (kbCss != lastKbCss) {
                 lastKbCss = kbCss
                 injectKb()
             }
             insets
         }
-
-        // 键盘升降动画逐帧回调：只把插值后的真实键盘高度写进网页 --kb-h，
-        // 不碰 WebView 布局尺寸，因此不会产生白条/抖动。无动画回调的输入法走上方的监听兜底。
-        ViewCompat.setWindowInsetsAnimationCallback(
-            webView,
-            object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
-                override fun onStart(
-                    animation: WindowInsetsAnimationCompat,
-                    bounds: WindowInsetsAnimationCompat.BoundsCompat
-                ): WindowInsetsAnimationCompat.BoundsCompat {
-                    if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
-                        inImeAnim = true
-                        imeAnimFrames = 0
-                        // kb-anim（关过渡、逐帧直写）不在这里加：等 onProgress 确认是真逐帧流再加，
-                        // 单次跳变退化时靠 CSS 过渡滑过去，避免瞬移
-                    }
-                    return super.onStart(animation, bounds)
-                }
-
-                override fun onProgress(
-                    insets: WindowInsetsCompat,
-                    runningAnimations: MutableList<WindowInsetsAnimationCompat>
-                ): WindowInsetsCompat {
-                    val isImeAnim = runningAnimations.any {
-                        (it.typeMask and WindowInsetsCompat.Type.ime()) != 0
-                    }
-                    if (isImeAnim && pageReady) {
-                        val kbCss =
-                            (insets.getInsets(WindowInsetsCompat.Type.ime()).bottom /
-                                    resources.displayMetrics.density).toInt()
-                        if (kbCss != lastKbCss) {
-                            lastKbCss = kbCss
-                            applyKbCss(kbCss)
-                            imeAnimFrames++
-                            if (imeAnimFrames == 2) {
-                                // 连续两帧不同值 = 确认逐帧流：关掉网页过渡，之后逐帧直写黏住键盘
-                                runJsOnPage("document.documentElement.classList.add('kb-anim')")
-                            }
-                        }
-                    }
-                    return insets
-                }
-
-                override fun onEnd(animation: WindowInsetsAnimationCompat) {
-                    if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
-                        inImeAnim = false
-                        runJsOnPage("document.documentElement.classList.remove('kb-anim')")
-                        injectKb() // 以最终值收尾
-                    }
-                    super.onEnd(animation)
-                }
-            }
-        )
 
         // 通知栏控制 → 网页
         val filter = IntentFilter(ACTION_CONTROL)
