@@ -11,6 +11,8 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -77,10 +79,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 供 KeepAliveService 直接调用：在网页里执行 JS（通知栏/锁屏按钮直达页面，不经过广播） */
+    /** 供 KeepAliveService 直接调用：在网页里执行 JS（通知栏/锁屏按钮直达页面，不经过广播）。
+     * 注意：必须走主线程 Handler，不能用 webView.post——App 在后台、WebView 脱离窗口时
+     * View.post 的任务会被攒住不执行，导致暂停/切歌指令石沉大海。 */
+    private val uiHandler = Handler(Looper.getMainLooper())
     fun runJsOnPage(js: String) {
         if (!::webView.isInitialized) return
-        webView.post {
+        uiHandler.post {
             try {
                 webView.evaluateJavascript(js, null)
             } catch (_: Exception) {
