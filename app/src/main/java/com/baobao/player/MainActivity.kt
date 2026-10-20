@@ -1,7 +1,9 @@
 package com.baobao.player
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
+import android.view.animation.DecelerateInterpolator
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -55,6 +57,8 @@ class MainActivity : AppCompatActivity() {
     private var earlyInjected = false
     /** 文件选择器回调（音源管理"本地文件"按钮用） */
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    /** 键盘高度平滑过渡动画（与键盘视觉动画同步，消除白条闪现） */
+    private var kbHeightAnim: ValueAnimator? = null
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -83,6 +87,38 @@ class MainActivity : AppCompatActivity() {
                 webView.evaluateJavascript(js, null)
             } catch (_: Exception) {
             }
+        }
+    }
+
+    /**
+     * 键盘高度变化时平滑过渡 WebView 高度（~200ms），与键盘视觉动画大致同步。
+     * 背景：系统上报的 IME inset 是"一步到位"的终值，而键盘视觉上是慢慢升起的；
+     * 若 WebView 瞬间缩到终值，动画期间会露出一截白色窗口底。平滑过渡盖住这个差值。
+     */
+    private fun smoothResizeWebView(view: View, target: Int) {
+        if (target <= 0) return
+        val lp = view.layoutParams
+        if (lp.height == target) return
+        kbHeightAnim?.cancel()
+        kbHeightAnim = null
+        val start = view.height.takeIf { it > 0 } ?: lp.height
+        if (start <= 0 || start == target) {
+            lp.height = target
+            view.layoutParams = lp
+            return
+        }
+        kbHeightAnim = ValueAnimator.ofInt(start, target).apply {
+            duration = 200
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { a ->
+                try {
+                    val p = view.layoutParams
+                    p.height = a.animatedValue as Int
+                    view.layoutParams = p
+                } catch (_: Exception) {
+                }
+            }
+            start()
         }
     }
 
@@ -234,22 +270,10 @@ class MainActivity : AppCompatActivity() {
             maybeReveal()
             // 键盘开/关：藏/显底部导航，避免导航栏骑在键盘上
             syncKbDock(ime.bottom > 0)
-            // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，直接重设 WebView 高度
+            // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，平滑重设 WebView 高度
             // （不用 getWindowVisibleDisplayFrame，它在全面屏下会多扣导航栏，底部留白条）
-            view.post {
-                try {
-                    val winH = view.rootView.height
-                    val target = winH - ime.bottom
-                    if (winH > 0 && target > 0) {
-                        val lp = view.layoutParams
-                        if (lp.height != target) {
-                            lp.height = target
-                            view.layoutParams = lp
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
+            val winH = view.rootView.height
+            if (winH > 0) smoothResizeWebView(view, winH - ime.bottom)
             insets
         }
 
