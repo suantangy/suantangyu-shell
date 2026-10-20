@@ -30,7 +30,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.result.contract.ActivityResultContracts
 
 /**
- * 宝宝巴士混合壳：WebView 承载现有网页播放器（音频仍由网页 <audio> 播放，
+ * 酸汤鱼音乐混合壳：WebView 承载现有网页播放器（音频仍由网页 <audio> 播放，
  * 你的几万行代码不用动），原生 ForegroundService 保活 + 通知栏媒体控制。
  *
  * 沉浸式：网页内容延伸到状态栏/导航栏之下（顶部全屏无黑条），
