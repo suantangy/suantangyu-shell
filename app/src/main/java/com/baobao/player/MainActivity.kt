@@ -56,6 +56,8 @@ class MainActivity : AppCompatActivity() {
     /** 键盘升降动画进行中（此时 --kb-h 由逐帧回调接管） */
     @Volatile
     private var inImeAnim: Boolean = false
+    /** 本次动画里收到过的不同高度值个数（≥2 才算真逐帧流） */
+    private var imeAnimFrames: Int = 0
     /** 启动闪跳修复：insets 和页面都就绪、注入已画出来后，才显示 WebView */
     private var insetsReady = false
     private var pageReady = false
@@ -263,8 +265,9 @@ class MainActivity : AppCompatActivity() {
                 ): WindowInsetsAnimationCompat.BoundsCompat {
                     if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
                         inImeAnim = true
-                        // 逐帧同步期间关网页侧过渡，弹窗直接黏住键盘；动画外由 CSS 过渡兜底
-                        runJsOnPage("document.documentElement.classList.add('kb-anim')")
+                        imeAnimFrames = 0
+                        // kb-anim（关过渡、逐帧直写）不在这里加：等 onProgress 确认是真逐帧流再加，
+                        // 单次跳变退化时靠 CSS 过渡滑过去，避免瞬移
                     }
                     return super.onStart(animation, bounds)
                 }
@@ -283,6 +286,11 @@ class MainActivity : AppCompatActivity() {
                         if (kbCss != lastKbCss) {
                             lastKbCss = kbCss
                             applyKbCss(kbCss)
+                            imeAnimFrames++
+                            if (imeAnimFrames == 2) {
+                                // 连续两帧不同值 = 确认逐帧流：关掉网页过渡，之后逐帧直写黏住键盘
+                                runJsOnPage("document.documentElement.classList.add('kb-anim')")
+                            }
                         }
                     }
                     return insets
