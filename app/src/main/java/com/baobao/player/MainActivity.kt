@@ -91,9 +91,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 键盘高度变化时平滑过渡 WebView 高度（~200ms），与键盘视觉动画大致同步。
-     * 背景：系统上报的 IME inset 是"一步到位"的终值，而键盘视觉上是慢慢升起的；
-     * 若 WebView 瞬间缩到终值，动画期间会露出一截白色窗口底。平滑过渡盖住这个差值。
+     * 键盘高度变化时平滑过渡 WebView 高度，与键盘视觉动画大致同步。
+     * 背景：系统上报的 IME inset 是"一步到位"的终值，而键盘视觉上是慢慢升起/降下的；
+     * 若 WebView 瞬间变到终值，动画期间会露出一截白色窗口底。平滑过渡盖住这个差值。
+     * 方向差异：弹起（缩小）用 200ms 跟住键盘升起；收起（放大）用 120ms 抢先铺满，
+     * 因为键盘降下比 WebView 长高快，慢了就会在导航栏和键盘之间闪出白条。
      */
     private fun smoothResizeWebView(view: View, target: Int) {
         if (target <= 0) return
@@ -107,8 +109,9 @@ class MainActivity : AppCompatActivity() {
             view.layoutParams = lp
             return
         }
+        val growing = target > start // true=键盘收起，WebView 需要长高
         kbHeightAnim = ValueAnimator.ofInt(start, target).apply {
-            duration = 200
+            duration = if (growing) 120 else 200
             interpolator = DecelerateInterpolator()
             addUpdateListener { a ->
                 try {
