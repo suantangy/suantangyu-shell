@@ -202,6 +202,7 @@ class MainActivity : AppCompatActivity() {
         // 用可见显示区域的高度直接设置 WebView 高度，触发页面的 resizes-content
         ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             val density = resources.displayMetrics.density
             lastTopCss = (bars.top / density).toInt()
             lastBottomCss = (bars.bottom / density).toInt()
@@ -209,15 +210,18 @@ class MainActivity : AppCompatActivity() {
             // 页面已就绪：值变了（旋转/分屏）就补注入
             if (pageReady) injectSafeArea()
             maybeReveal()
-            // 键盘弹起/收起时，按可见区域重设 WebView 高度
+            // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，直接重设 WebView 高度
+            // （不用 getWindowVisibleDisplayFrame，它在全面屏下会多扣导航栏，底部留白条）
             view.post {
                 try {
-                    val rect = android.graphics.Rect()
-                    view.getWindowVisibleDisplayFrame(rect)
-                    val lp = view.layoutParams
-                    if (lp.height != rect.height() && rect.height() > 0) {
-                        lp.height = rect.height()
-                        view.layoutParams = lp
+                    val winH = view.rootView.height
+                    val target = winH - ime.bottom
+                    if (winH > 0 && target > 0) {
+                        val lp = view.layoutParams
+                        if (lp.height != target) {
+                            lp.height = target
+                            view.layoutParams = lp
+                        }
                     }
                 } catch (_: Exception) {
                 }
