@@ -46,7 +46,7 @@ class KeepAliveService : Service() {
         const val ACTION_PREV = "com.baobao.player.PREV"
     }
 
-    private var title: String = "宝宝巴士"
+    private var title: String = "酸汤鱼音乐"
     private var artist: String = "准备播放"
     private var playing: Boolean = false
     private var positionMs: Long = 0L
@@ -152,7 +152,7 @@ class KeepAliveService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_UPDATE_TRACK -> {
-                title = intent.getStringExtra("title").orEmpty().ifEmpty { "宝宝巴士" }
+                title = intent.getStringExtra("title").orEmpty().ifEmpty { "酸汤鱼音乐" }
                 artist = intent.getStringExtra("artist").orEmpty()
                 // 切歌：歌词覆盖清掉，回到显示歌名；进度锚点归零
                 lyricLine = ""
@@ -248,9 +248,9 @@ class KeepAliveService : Service() {
 
     private fun showArtist(): String =
         if (lyricLine.isNotEmpty()) {
-            lyricSub.ifEmpty { artist.ifEmpty { "宝宝巴士" } }
+            lyricSub.ifEmpty { artist.ifEmpty { "酸汤鱼音乐" } }
         } else {
-            artist.ifEmpty { "宝宝巴士" }
+            artist.ifEmpty { "酸汤鱼音乐" }
         }
 
     private fun updateSessionMetadata() {
@@ -321,7 +321,7 @@ class KeepAliveService : Service() {
                 CHANNEL_ID, "播放控制",
                 // DEFAULT：锁屏上可见；LOW 会被部分系统藏起
                 NotificationManager.IMPORTANCE_DEFAULT
-            ).apply { description = "宝宝巴士后台播放保活与通知栏控制" }
+            ).apply { description = "酸汤鱼音乐后台播放保活与通知栏控制" }
             notificationManager.createNotificationChannel(channel)
         }
     }
