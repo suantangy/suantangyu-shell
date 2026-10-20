@@ -1,9 +1,7 @@
 package com.baobao.player
 
 import android.Manifest
-import android.animation.ValueAnimator
 import android.annotation.SuppressLint
-import android.view.animation.DecelerateInterpolator
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -25,7 +23,6 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.result.contract.ActivityResultContracts
@@ -58,12 +55,6 @@ class MainActivity : AppCompatActivity() {
     private var earlyInjected = false
     /** 文件选择器回调（音源管理"本地文件"按钮用） */
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
-    /** 键盘高度平滑过渡动画（与键盘视觉动画同步，消除白条闪现） */
-    private var kbHeightAnim: ValueAnimator? = null
-    /** 上次键盘开/关状态，避免动画帧里重复注入 dock 显隐 */
-    private var lastKbOpen: Boolean? = null
-    /** IME 动画进行中：onProgress 直接驱动高度时，inset 监听不再启动 ValueAnimator，避免打架抖动 */
-    private var inImeAnim = false
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -90,63 +81,6 @@ class MainActivity : AppCompatActivity() {
         webView.post {
             try {
                 webView.evaluateJavascript(js, null)
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    /**
-     * 键盘高度变化时平滑过渡 WebView 高度，与键盘视觉动画大致同步。
-     * 背景：系统上报的 IME inset 是"一步到位"的终值，而键盘视觉上是慢慢升起/降下的；
-     * 若 WebView 瞬间变到终值，动画期间会露出一截白色窗口底。平滑过渡盖住这个差值。
-     * 方向差异：弹起（缩小）用 200ms 跟住键盘升起；收起（放大）用 120ms 抢先铺满，
-     * 因为键盘降下比 WebView 长高快，慢了就会在导航栏和键盘之间闪出白条。
-     */
-    private fun smoothResizeWebView(view: View, target: Int) {
-        if (target <= 0) return
-        val lp = view.layoutParams
-        if (lp.height == target) return
-        kbHeightAnim?.cancel()
-        kbHeightAnim = null
-        val start = view.height.takeIf { it > 0 } ?: lp.height
-        if (start <= 0 || start == target) {
-            lp.height = target
-            view.layoutParams = lp
-            return
-        }
-        val growing = target > start // true=键盘收起，WebView 需要长高
-        kbHeightAnim = ValueAnimator.ofInt(start, target).apply {
-            duration = if (growing) 120 else 200
-            interpolator = DecelerateInterpolator()
-            addUpdateListener { a ->
-                try {
-                    val p = view.layoutParams
-                    p.height = a.animatedValue as Int
-                    view.layoutParams = p
-                } catch (_: Exception) {
-                }
-            }
-            start()
-        }
-    }
-
-    /** 键盘弹起时隐藏页面底部导航（#dock），收起时恢复；CSS 由壳注入，无需改网页包 */
-    private fun syncKbDock(kbOpen: Boolean) {
-        if (!::webView.isInitialized) return
-        val cls = if (kbOpen) "add" else "remove"
-        webView.post {
-            try {
-                webView.evaluateJavascript(
-                    "(function(){try{" +
-                        "var h=document.documentElement;" +
-                        "h.classList." + cls + "('kb-open');" +
-                        "if(!document.getElementById('kb-dock-fix')){" +
-                        "var s=document.createElement('style');s.id='kb-dock-fix';" +
-                        "s.textContent='html.kb-open #dock{display:none!important}';" +
-                        "document.head.appendChild(s);}" +
-                        "}catch(e){}})()",
-                    null
-                )
             } catch (_: Exception) {
             }
         }
@@ -263,12 +197,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // 监听系统栏高度变化（旋转、分屏等），实时注入网页
-        // edge-to-edge 下系统不会自动压缩窗口，键盘高度必须手动处理：
-        // 用可见显示区域的高度直接设置 WebView 高度，触发页面的 resizes-content
-        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
+        // 监听系统栏高度变化（旋转、分屏等），实时注入网页。
+        // 注意：键盘不再由壳处理——WebView 永远全高，键盘作为系统窗口直接盖在 App 上层
+        // （导航栏被盖住是主流行为）；弹窗上移由网页自己的 visualViewport JS 负责。
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             val density = resources.displayMetrics.density
             lastTopCss = (bars.top / density).toInt()
             lastBottomCss = (bars.bottom / density).toInt()
@@ -276,76 +209,8 @@ class MainActivity : AppCompatActivity() {
             // 页面已就绪：值变了（旋转/分屏）就补注入
             if (pageReady) injectSafeArea()
             maybeReveal()
-            // 键盘开/关：藏/显底部导航，避免导航栏骑在键盘上
-            val kbOpen = ime.bottom > 0
-            if (lastKbOpen != kbOpen) {
-                lastKbOpen = kbOpen
-                syncKbDock(kbOpen)
-            }
-            // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，平滑重设 WebView 高度
-            // （不用 getWindowVisibleDisplayFrame，它在全面屏下会多扣导航栏，底部留白条）
-            // IME 动画进行中时由上面的 onProgress 直接驱动，这里跳过，避免打架抖动
-            val winH = view.rootView.height
-            if (winH > 0 && !inImeAnim) smoothResizeWebView(view, winH - ime.bottom)
             insets
         }
-
-        // 键盘动画帧回调：收起时系统 inset 是"后报"的（动画快结束才回调），
-        // 只靠上面的 listener 永远追不上。这里拿动画每一帧的真实键盘高度直接设置，
-        // 不再猜 200ms/120ms。若键盘不参与 inset 动画，这里不触发，上面兜底。
-        ViewCompat.setWindowInsetsAnimationCallback(webView,
-            object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
-                override fun onStart(
-                    animation: WindowInsetsAnimationCompat,
-                    bounds: WindowInsetsAnimationCompat.BoundsCompat
-                ): WindowInsetsAnimationCompat.BoundsCompat {
-                    if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
-                        inImeAnim = true
-                        kbHeightAnim?.cancel()
-                        kbHeightAnim = null
-                    }
-                    return super.onStart(animation, bounds)
-                }
-
-                override fun onEnd(animation: WindowInsetsAnimationCompat) {
-                    if ((animation.typeMask and WindowInsetsCompat.Type.ime()) != 0) {
-                        inImeAnim = false
-                    }
-                    super.onEnd(animation)
-                }
-
-                override fun onProgress(
-                    insets: WindowInsetsCompat,
-                    runningAnims: List<WindowInsetsAnimationCompat>
-                ): WindowInsetsCompat {
-                    val isIme = runningAnims.any { (it.typeMask and WindowInsetsCompat.Type.ime()) != 0 }
-                    if (!isIme || !::webView.isInitialized) return insets
-                    try {
-                        val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-                        val winH = webView.rootView.height
-                        if (winH > 0) {
-                            val target = winH - ime.bottom
-                            if (target > 0) {
-                                // 动画帧直接设置，取消猜测性的 ValueAnimator，避免打架
-                                kbHeightAnim?.cancel()
-                                kbHeightAnim = null
-                                val lp = webView.layoutParams
-                                if (lp.height != target) {
-                                    lp.height = target
-                                    webView.layoutParams = lp
-                                }
-                            }
-                        }
-                        val kbOpen = ime.bottom > 0
-                        if (lastKbOpen != kbOpen) {
-                            lastKbOpen = kbOpen
-                            syncKbDock(kbOpen)
-                        }
-                    } catch (_: Exception) {
-                    }
-                    return insets
-                }
-            })
 
         // 通知栏控制 → 网页
         val filter = IntentFilter(ACTION_CONTROL)
