@@ -86,6 +86,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 键盘弹起时隐藏页面底部导航（#dock），收起时恢复；CSS 由壳注入，无需改网页包 */
+    private fun syncKbDock(kbOpen: Boolean) {
+        if (!::webView.isInitialized) return
+        val cls = if (kbOpen) "add" else "remove"
+        webView.post {
+            try {
+                webView.evaluateJavascript(
+                    "(function(){try{" +
+                        "var h=document.documentElement;" +
+                        "h.classList." + cls + "('kb-open');" +
+                        "if(!document.getElementById('kb-dock-fix')){" +
+                        "var s=document.createElement('style');s.id='kb-dock-fix';" +
+                        "s.textContent='html.kb-open #dock{display:none!important}';" +
+                        "document.head.appendChild(s);}" +
+                        "}catch(e){}})()",
+                    null
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     /** 条件满足后：补一次注入，轮询确认计算样式已生效再显示，彻底杜绝时序竞态 */
     private fun maybeReveal() {
         if (revealed || !insetsReady || !pageReady || !::webView.isInitialized) return
@@ -210,6 +232,8 @@ class MainActivity : AppCompatActivity() {
             // 页面已就绪：值变了（旋转/分屏）就补注入
             if (pageReady) injectSafeArea()
             maybeReveal()
+            // 键盘开/关：藏/显底部导航，避免导航栏骑在键盘上
+            syncKbDock(ime.bottom > 0)
             // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，直接重设 WebView 高度
             // （不用 getWindowVisibleDisplayFrame，它在全面屏下会多扣导航栏，底部留白条）
             view.post {
