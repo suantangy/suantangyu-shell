@@ -11,6 +11,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.media.app.NotificationCompat.MediaStyle
 import androidx.media.session.MediaButtonReceiver
@@ -49,6 +50,8 @@ class KeepAliveService : Service() {
     private var artist: String = "准备播放"
     private var playing: Boolean = false
     private var positionMs: Long = 0L
+    /** 上次重发通知时间（进度刷新节流用） */
+    private var lastNotifyMs: Long = 0L
     private var durationMs: Long = 0L
 
     /** 锁屏歌词行（网页上报）；非空时卡片标题显示歌词，歌名/歌手降为副标题 */
@@ -70,7 +73,10 @@ class KeepAliveService : Service() {
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
-            setFlags(MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
+            setFlags(
+                MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS or
+                    MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS
+            )
             setCallback(object : MediaSessionCompat.Callback() {
                 override fun onPlay() = sendControl("toggle")
                 override fun onPause() = sendControl("toggle")
@@ -137,8 +143,14 @@ class KeepAliveService : Service() {
             ACTION_UPDATE_PROGRESS -> {
                 positionMs = intent.getLongExtra("position", 0L)
                 durationMs = intent.getLongExtra("duration", 0L)
-                // 进度只刷新会话状态（系统自己按速度推进进度条），不重发通知
                 updateSessionState()
+                // 灵动岛读的是通知快照，不会自己按速度推进——进度也必须重发通知；
+                // 网页本就 1s 上报一次，这里再加 1s 节流兜底，避免刷屏
+                val now = SystemClock.uptimeMillis()
+                if (now - lastNotifyMs >= 1000) {
+                    lastNotifyMs = now
+                    updateNotification()
+                }
             }
             ACTION_UPDATE_LYRIC -> {
                 lyricLine = intent.getStringExtra("line").orEmpty()
