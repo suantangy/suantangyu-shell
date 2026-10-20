@@ -48,6 +48,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private var lastTopCss: Int = 0
     private var lastBottomCss: Int = 0
+    /** 当前键盘高度（CSS px），由系统 IME inset 换算；只灌给网页当 --kb-h 用，不动 WebView 布局 */
+    private var lastKbCss: Int = 0
     /** 启动闪跳修复：insets 和页面都就绪、注入已画出来后，才显示 WebView */
     private var insetsReady = false
     private var pageReady = false
@@ -129,6 +131,30 @@ class MainActivity : AppCompatActivity() {
                 null
             )
         }
+        // 顺带同步一次键盘高度（页面后到、insets 先到的情况）
+        injectKb()
+    }
+
+    /**
+     * 键盘高度精确版：只把系统 IME 高度灌成 CSS 变量 --kb-h，并给 <html> 挂 kb-on 类；
+     * 网页弹窗用 padding-bottom: var(--kb-h) 居中到键盘上方可见区。不改 WebView 高度、
+     * 不做动画，因此不会产生白条和抖动。
+     */
+    private fun injectKb() {
+        if (!::webView.isInitialized || !pageReady) return
+        val kbCss = lastKbCss
+        webView.post {
+            try {
+                webView.evaluateJavascript(
+                    "(function(){try{var h=document.documentElement;" +
+                        "h.style.setProperty('--kb-h','" + kbCss + "px');" +
+                        "if(" + kbCss + ">0)h.classList.add('kb-on');else h.classList.remove('kb-on');" +
+                        "}catch(e){}})()",
+                    null
+                )
+            } catch (_: Exception) {
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -198,10 +224,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 监听系统栏高度变化（旋转、分屏等），实时注入网页。
-        // 注意：键盘不再由壳处理——WebView 永远全高，键盘作为系统窗口直接盖在 App 上层
-        // （导航栏被盖住是主流行为）；弹窗上移由网页自己的 visualViewport JS 负责。
+        // 键盘：WebView 永远全高，键盘作为系统窗口直接盖在 App 上层（导航栏被盖住是主流行为）；
+        // 壳只把系统 IME 高度换算成 CSS px 灌给网页（--kb-h），弹窗居中由网页 CSS 用这个值完成。
         ViewCompat.setOnApplyWindowInsetsListener(webView) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             val density = resources.displayMetrics.density
             lastTopCss = (bars.top / density).toInt()
             lastBottomCss = (bars.bottom / density).toInt()
@@ -209,6 +236,11 @@ class MainActivity : AppCompatActivity() {
             // 页面已就绪：值变了（旋转/分屏）就补注入
             if (pageReady) injectSafeArea()
             maybeReveal()
+            val kbCss = (ime.bottom / density).toInt()
+            if (kbCss != lastKbCss) {
+                lastKbCss = kbCss
+                injectKb()
+            }
             insets
         }
 
