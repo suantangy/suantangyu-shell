@@ -25,6 +25,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.result.contract.ActivityResultContracts
@@ -59,6 +60,8 @@ class MainActivity : AppCompatActivity() {
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     /** 键盘高度平滑过渡动画（与键盘视觉动画同步，消除白条闪现） */
     private var kbHeightAnim: ValueAnimator? = null
+    /** 上次键盘开/关状态，避免动画帧里重复注入 dock 显隐 */
+    private var lastKbOpen: Boolean? = null
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -272,13 +275,55 @@ class MainActivity : AppCompatActivity() {
             if (pageReady) injectSafeArea()
             maybeReveal()
             // 键盘开/关：藏/显底部导航，避免导航栏骑在键盘上
-            syncKbDock(ime.bottom > 0)
+            val kbOpen = ime.bottom > 0
+            if (lastKbOpen != kbOpen) {
+                lastKbOpen = kbOpen
+                syncKbDock(kbOpen)
+            }
             // 键盘弹起/收起时：窗口总高度 - 键盘高度 = 可见高度，平滑重设 WebView 高度
             // （不用 getWindowVisibleDisplayFrame，它在全面屏下会多扣导航栏，底部留白条）
             val winH = view.rootView.height
             if (winH > 0) smoothResizeWebView(view, winH - ime.bottom)
             insets
         }
+
+        // 键盘动画帧回调：收起时系统 inset 是"后报"的（动画快结束才回调），
+        // 只靠上面的 listener 永远追不上。这里拿动画每一帧的真实键盘高度直接设置，
+        // 不再猜 200ms/120ms。若键盘不参与 inset 动画，这里不触发，上面兜底。
+        ViewCompat.setWindowInsetsAnimationCallback(webView,
+            object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                override fun onProgress(
+                    insets: WindowInsetsCompat,
+                    runningAnims: List<WindowInsetsAnimationCompat>
+                ): WindowInsetsCompat {
+                    val isIme = runningAnims.any { (it.typeMask and WindowInsetsCompat.Type.ime()) != 0 }
+                    if (!isIme || !::webView.isInitialized) return insets
+                    try {
+                        val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+                        val winH = webView.rootView.height
+                        if (winH > 0) {
+                            val target = winH - ime.bottom
+                            if (target > 0) {
+                                // 动画帧直接设置，取消猜测性的 ValueAnimator，避免打架
+                                kbHeightAnim?.cancel()
+                                kbHeightAnim = null
+                                val lp = webView.layoutParams
+                                if (lp.height != target) {
+                                    lp.height = target
+                                    webView.layoutParams = lp
+                                }
+                            }
+                        }
+                        val kbOpen = ime.bottom > 0
+                        if (lastKbOpen != kbOpen) {
+                            lastKbOpen = kbOpen
+                            syncKbDock(kbOpen)
+                        }
+                    } catch (_: Exception) {
+                    }
+                    return insets
+                }
+            })
 
         // 通知栏控制 → 网页
         val filter = IntentFilter(ACTION_CONTROL)
