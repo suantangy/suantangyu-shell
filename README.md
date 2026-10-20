@@ -1,4 +1,4 @@
-# 宝宝巴士原生壳（混合版）
+# 酸汤鱼原生壳（混合版）
 
 WebView 承载你现有的网页播放器（`https://yinyue-bfq.pages.dev/`），
 原生 `ForegroundService` 负责后台保活 + 通知栏常驻媒体控制。
