@@ -50,4 +50,73 @@ class BaoBridge(private val activity: MainActivity) {
         }
         activity.startService(intent)
     }
+
+    // —— phase-2 原生播放：网页把解析好的流地址交给服务里的 ExoPlayer 播 ——
+    // 网页侧检测到 postPlayUrl 存在才启用原生垫片；老壳没有这些方法，网页自动回退 <audio>。
+
+    /** 播放一条流（新装载并起播；同一条已在播则只同步状态，不重启） */
+    @JavascriptInterface
+    fun postPlayUrl(url: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_PLAY_URL
+            putExtra("url", url)
+        }
+        activity.startService(intent)
+    }
+
+    @JavascriptInterface
+    fun postNativePause() {
+        activity.startService(
+            Intent(activity, KeepAliveService::class.java).apply {
+                action = KeepAliveService.ACTION_NATIVE_PAUSE
+            }
+        )
+    }
+
+    @JavascriptInterface
+    fun postNativeResume() {
+        activity.startService(
+            Intent(activity, KeepAliveService::class.java).apply {
+                action = KeepAliveService.ACTION_NATIVE_RESUME
+            }
+        )
+    }
+
+    @JavascriptInterface
+    fun postNativeSeek(positionMs: Long) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_NATIVE_SEEK
+            putExtra("pos", positionMs)
+        }
+        activity.startService(intent)
+    }
+
+    @JavascriptInterface
+    fun postNativeRate(rate: Float) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_NATIVE_RATE
+            putExtra("rate", rate)
+        }
+        activity.startService(intent)
+    }
+
+    /** 网页清掉 src 时调用：卸载当前流 */
+    @JavascriptInterface
+    fun postNativeStop() {
+        activity.startService(
+            Intent(activity, KeepAliveService::class.java).apply {
+                action = KeepAliveService.ACTION_NATIVE_STOP
+            }
+        )
+    }
+
+    /** 网页（重）加载时调用：服务把当前原生播放状态整包同步回网页（__baoSync hello） */
+    @JavascriptInterface
+    fun postHello() {
+        activity.startService(
+            Intent(activity, KeepAliveService::class.java).apply {
+                action = KeepAliveService.ACTION_HELLO
+            }
+        )
+    }
 }
