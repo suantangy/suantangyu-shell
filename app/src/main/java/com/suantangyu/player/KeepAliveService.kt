@@ -66,6 +66,9 @@ class KeepAliveService : Service() {
         const val ACTION_NATIVE_RATE = "com.suantangyu.player.NATIVE_RATE"
         const val ACTION_NATIVE_STOP = "com.suantangyu.player.NATIVE_STOP"
         const val ACTION_HELLO = "com.suantangyu.player.HELLO"
+        // phase-2.5 预置续播（网页提前把后续曲目交给服务，播完自动接播）
+        const val ACTION_ARM_NEXT = "com.suantangyu.player.ARM_NEXT"
+        const val ACTION_DISARM_NEXT = "com.suantangyu.player.DISARM_NEXT"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -135,6 +138,80 @@ class KeepAliveService : Service() {
     private var nativeActive: Boolean = false
     private var pendingRate: Float = 1f
 
+    // —— phase-2.5 预置续播：网页提前把接下来 1~2 首的流地址预置给服务。
+    // 当前曲播完时先等一个宽限期（网页醒着会自己切歌，PLAY_URL 一到就取消）；
+    // 宽限期满网页还没接上（熄屏被冻/解析卡住），服务按预置自己接播下一首，
+    // 音乐不断档；接播后经 advanced 同步通知网页补记账对齐队列。
+    private data class ArmedItem(
+        val url: String, val key: String, val title: String,
+        val artist: String, val cover: String, val repeat: Boolean
+    )
+
+    private val armedItems = mutableListOf<ArmedItem>()
+    /** 最近一次由预置接播的曲目 key/url（hello 时告诉网页，网页据此对齐） */
+    private var lastAdvancedKey: String = ""
+    private var lastAdvancedUrl: String = ""
+    private val graceHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var pendingAdvance: Runnable? = null
+
+    private fun cancelPendingAdvance() {
+        pendingAdvance?.let {
+            try {
+                graceHandler.removeCallbacks(it)
+            } catch (_: Exception) {
+            }
+        }
+        pendingAdvance = null
+    }
+
+    private fun scheduleArmedAdvance() {
+        if (armedItems.isEmpty()) return
+        cancelPendingAdvance()
+        val r = Runnable { doArmedAdvance() }
+        pendingAdvance = r
+        graceHandler.postDelayed(r, 2500)
+    }
+
+    private fun doArmedAdvance() {
+        pendingAdvance = null
+        if (!nativeActive) return
+        val item = armedItems.firstOrNull() ?: return
+        if (item.repeat) {
+            // 单曲循环预置：不消费，跳回 0 点继续这首（网页醒来会重新预置/对齐）
+            try {
+                player?.seekTo(0)
+                player?.play()
+            } catch (_: Exception) {
+            }
+            pushSync(
+                JSONObject().put("t", "advanced").put("key", item.key)
+                    .put("url", nativeUrl).put("repeat", true)
+            )
+            return
+        }
+        armedItems.removeAt(0)
+        // 先把曲目信息换上，锁屏卡片立刻是对的，不必等网页醒来
+        if (item.title.isNotEmpty()) title = item.title
+        artist = item.artist
+        lyricLine = ""
+        lyricSub = ""
+        updateSessionMetadata()
+        if (item.cover != coverUrl) {
+            coverUrl = item.cover
+            coverBitmap = null
+            if (item.cover.isNotEmpty()) {
+                Thread { downloadCover(item.cover) }.start()
+            }
+        }
+        lastAdvancedKey = item.key
+        lastAdvancedUrl = item.url
+        playNative(item.url)
+        pushSync(
+            JSONObject().put("t", "advanced").put("key", item.key)
+                .put("url", item.url).put("repeat", false)
+        )
+    }
+
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
@@ -166,6 +243,8 @@ class KeepAliveService : Service() {
                     updateSessionState()
                     updateNotification()
                     pushSync(JSONObject().put("t", "ended"))
+                    // 网页醒着会自己切歌（PLAY_URL 到达即取消）；没接上就由预置接播
+                    scheduleArmedAdvance()
                 }
             }
         }
@@ -264,7 +343,14 @@ class KeepAliveService : Service() {
     private fun playNative(url: String) {
         val p = ensurePlayer()
         if (nativeActive && url == nativeUrl && p.playbackState != Player.STATE_IDLE) {
-            // 同一条流已装载（多半是网页重载后回来接管）：不重启，只起播+同步
+            // 同一条流已装载（多半是网页重载后回来接管）：不重启，只起播+同步；
+            // 已播完（ENDED）时单独 play() 不会从头播，先跳回 0
+            if (p.playbackState == Player.STATE_ENDED) {
+                try {
+                    p.seekTo(0)
+                } catch (_: Exception) {
+                }
+            }
             p.play()
             syncAnchorFromPlayer()
             pushSyncState()
@@ -290,6 +376,10 @@ class KeepAliveService : Service() {
     }
 
     private fun stopNative() {
+        cancelPendingAdvance()
+        armedItems.clear()
+        lastAdvancedKey = ""
+        lastAdvancedUrl = ""
         try {
             player?.stop()
             player?.clearMediaItems()
@@ -324,7 +414,17 @@ class KeepAliveService : Service() {
                 // 原生模式下播放/暂停直达播放器（不绕网页，网页死了也管用）；
                 // 上一首/下一首的队列在网页手里，仍转发给网页
                 override fun onPlay() {
-                    if (nativeActive) player?.play() else sendControl("toggle")
+                    if (nativeActive) {
+                        val p = player
+                        // 播完后按播放：ExoPlayer 在 ENDED 单独 play() 不重启，先跳回 0
+                        if (p != null && p.playbackState == Player.STATE_ENDED) {
+                            try {
+                                p.seekTo(0)
+                            } catch (_: Exception) {
+                            }
+                        }
+                        p?.play()
+                    } else sendControl("toggle")
                 }
 
                 override fun onPause() {
@@ -354,6 +454,7 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        cancelPendingAdvance()
         try {
             tickHandler.removeCallbacks(tickRunnable)
         } catch (_: Exception) {
@@ -443,16 +544,32 @@ class KeepAliveService : Service() {
             }
             // —— phase-2 原生播放指令（网页垫片发来） ——
             ACTION_PLAY_URL -> {
+                // 网页自己接上了：预置接播取消，记账权回到网页
+                cancelPendingAdvance()
+                lastAdvancedKey = ""
+                lastAdvancedUrl = ""
                 val url = intent.getStringExtra("url").orEmpty()
                 if (url.isNotEmpty()) playNative(url)
             }
-            ACTION_NATIVE_PAUSE -> player?.pause()
+            ACTION_NATIVE_PAUSE -> {
+                // 宽限期内被暂停：别再自动接播
+                cancelPendingAdvance()
+                player?.pause()
+            }
             ACTION_NATIVE_RESUME -> {
                 if (nativeActive) {
                     val p = player
                     if (p != null && p.playbackState == Player.STATE_IDLE && nativeUrl.isNotEmpty()) {
                         // 出错后播放器回到 IDLE，单独 play() 救不回来，整条重装
                         playNative(nativeUrl)
+                    } else if (p != null && p.playbackState == Player.STATE_ENDED) {
+                        // 播完后网页/用户再按播放：先跳回 0 再播（ENDED 单独 play() 不重启）
+                        cancelPendingAdvance()
+                        try {
+                            p.seekTo(0)
+                        } catch (_: Exception) {
+                        }
+                        p.play()
                     } else {
                         p?.play()
                     }
@@ -476,6 +593,33 @@ class KeepAliveService : Service() {
                 }
             }
             ACTION_NATIVE_STOP -> stopNative()
+            ACTION_ARM_NEXT -> {
+                // 网页重新预置（或接管记账）：旧预置与待接播一并作废，以新清单为准
+                cancelPendingAdvance()
+                lastAdvancedKey = ""
+                lastAdvancedUrl = ""
+                armedItems.clear()
+                try {
+                    val arr = org.json.JSONArray(intent.getStringExtra("json") ?: "[]")
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val u = o.optString("u")
+                        if (u.isEmpty()) continue
+                        armedItems.add(
+                            ArmedItem(
+                                u, o.optString("k"), o.optString("t"),
+                                o.optString("a"), o.optString("c"),
+                                o.optBoolean("r", false)
+                            )
+                        )
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            ACTION_DISARM_NEXT -> {
+                cancelPendingAdvance()
+                armedItems.clear()
+            }
             ACTION_HELLO -> {
                 if (nativeActive) syncAnchorFromPlayer()
                 pushSync(
@@ -486,13 +630,26 @@ class KeepAliveService : Service() {
                         .put("playing", playing)
                         .put("pos", positionMs)
                         .put("dur", durationMs)
+                        // 当前这条若是预置接播的，把它的 key 告诉网页用于对齐队列
+                        .put(
+                            "advKey",
+                            if (nativeUrl == lastAdvancedUrl) lastAdvancedKey else ""
+                        )
                 )
             }
             ACTION_TOGGLE -> {
                 // 原生模式：通知按钮直达播放器；否则走老路转发网页
                 if (nativeActive && player != null) {
                     val p = player!!
-                    if (p.isPlaying || p.playWhenReady) p.pause() else p.play()
+                    if (p.playbackState == Player.STATE_ENDED) {
+                        // 已播完：playWhenReady 仍是 true 会误判成"暂停"，这里直接重播
+                        cancelPendingAdvance()
+                        try {
+                            p.seekTo(0)
+                        } catch (_: Exception) {
+                        }
+                        p.play()
+                    } else if (p.isPlaying || p.playWhenReady) p.pause() else p.play()
                 } else {
                     sendControl("toggle")
                 }
