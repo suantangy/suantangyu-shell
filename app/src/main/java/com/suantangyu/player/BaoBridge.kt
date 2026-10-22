@@ -119,4 +119,27 @@ class BaoBridge(private val activity: MainActivity) {
             }
         )
     }
+
+    // —— phase-2.5 预置续播：网页把接下来 1~2 首的流提前交给服务，
+    // 当前曲播完而网页没接上（熄屏被冻/解析卡住）时，服务按预置自己接播。 ——
+
+    /** 预置接播清单（JSON 数组：[{u,k,t,a,c,r}]，空数组等于取消预置） */
+    @JavascriptInterface
+    fun postArmNext(json: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_ARM_NEXT
+            putExtra("json", json)
+        }
+        activity.startService(intent)
+    }
+
+    /** 取消预置接播（如设置了"播完本首停"） */
+    @JavascriptInterface
+    fun postDisarmNext() {
+        activity.startService(
+            Intent(activity, KeepAliveService::class.java).apply {
+                action = KeepAliveService.ACTION_DISARM_NEXT
+            }
+        )
+    }
 }
