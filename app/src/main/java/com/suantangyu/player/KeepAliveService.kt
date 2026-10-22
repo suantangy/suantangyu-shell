@@ -176,7 +176,7 @@ class KeepAliveService : Service() {
             var httpCode = 0
             var c: Throwable? = error
             while (c != null) {
-                if (c is HttpDataSource.HttpDataSourceException) {
+                if (c is HttpDataSource.InvalidResponseCodeException) {
                     httpCode = c.responseCode
                     break
                 }
