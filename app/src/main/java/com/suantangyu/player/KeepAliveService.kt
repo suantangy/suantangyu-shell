@@ -302,17 +302,34 @@ class KeepAliveService : Service() {
             watchdogStall = 0
             return
         }
+        // phase-3.1：接播后的起播宽限——慢网下母带首缓冲常超 10s，原首击
+        // 线会把「慢但活着」的起播也打断重拉、越救越糟。接播后 20s 内
+        // 缓冲无进展不计卡住，宽限过后恢复原节奏（首击重拉、再击报错）。
+        if (lastAdvanceAtMs > 0L &&
+            SystemClock.elapsedRealtime() - lastAdvanceAtMs < 20_000L
+        ) {
+            watchdogStall = 0
+            return
+        }
         watchdogStall++
         if (watchdogStall == 1) {
-            // 第一次卡住：整条重拉（换一条新连接），中途卡住的先 seek 回原位置。
-            // 注意不能用 setMediaItem 重装单曲——phase-3 起播放器里排着后面
-            // 的预置曲目，整表替换会把队列冲掉；stop+prepare 同样换新连接，
-            // 且保留播放列表与当前项。
+            // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
+            // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
+            // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
+            // 一版 43 首靠它反复救活），但只作用于当前项——队列里排着的
+            // 预置项原样保留；mediaId 沿用当前项的，接播记账的 key 身份
+            // 不断。3.0 的 stop+seek+prepare 在多项列表下实测没把卡住的
+            // 起播救回来（《洛神》彻底没声，cheng 2026-10-23 确认）。
             val keepPos = pos
             try {
-                p.stop()
+                val idx = p.currentMediaItemIndex
+                val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { nativeUrl }
+                p.replaceMediaItem(
+                    idx,
+                    MediaItem.Builder().setUri(nativeUrl).setMediaId(mid).build()
+                )
                 if (keepPos > 2000) p.seekTo(keepPos)
-                p.prepare()
+                if (p.playbackState == Player.STATE_IDLE) p.prepare()
                 p.play()
             } catch (_: Exception) {
             }
@@ -477,6 +494,19 @@ class KeepAliveService : Service() {
             ) {
                 prefix++
             }
+            // phase-3.1：前缀按 key 对齐上了，但同一首歌的签名 URL 可能已被
+            // 页面换新——队列里还排着旧 URL 的话，接播播的是旧地址（可能已
+            // 过期）。原地把该项换成新 URL，不动排队位置与其它项的预加载。
+            for (i in 0 until prefix) {
+                try {
+                    val queuedUri =
+                        p.getMediaItemAt(cur + 1 + i).localConfiguration?.uri?.toString()
+                    if (queuedUri != null && queuedUri != desired[i].url) {
+                        p.replaceMediaItem(cur + 1 + i, mediaItemFor(desired[i]))
+                    }
+                } catch (_: Exception) {
+                }
+            }
             if (prefix == existingIds.size && prefix == desiredIds.size) return
             if (count > cur + 1 + prefix) {
                 p.removeMediaItems(cur + 1 + prefix, count)
@@ -504,12 +534,29 @@ class KeepAliveService : Service() {
         ) {
             return
         }
+        val mid = try {
+            mediaItem?.mediaId.orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
         val uri = try {
             mediaItem?.localConfiguration?.uri?.toString()
         } catch (_: Exception) {
             null
-        } ?: return
-        val idx = armedItems.indexOfFirst { it.url == uri }
+        }
+        // phase-3.1：身份统一按 mediaId（= 预置 key）对齐。同一首歌页面会
+        // 重复解析出新签名 URL（refreshArm / prefetchNextUrl），按 URL 匹配
+        // 会找不到（3.0 实测 idx=-1 → 不发 advanced、预置不消费，后续 ENDED
+        // 宽限兜底还会拿过期预置重播）；key 在一首歌的生命周期内不变。
+        // mediaId 缺失或没对上时才退回 URL 匹配。
+        var idx = if (mid.isNotEmpty()) {
+            armedItems.indexOfFirst { it.key.ifEmpty { it.url } == mid }
+        } else {
+            -1
+        }
+        if (idx < 0 && uri != null) {
+            idx = armedItems.indexOfFirst { it.url == uri }
+        }
         if (idx < 0) return
         val item = armedItems[idx]
         if (item.repeat) return
