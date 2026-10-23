@@ -183,6 +183,125 @@ class KeepAliveService : Service() {
         graceWakeLock = null
     }
 
+    // —— phase-2.7 起播看门狗 + 接播后保护窗 ——
+    // 2.6 复测的新故障形态：预置接播成功（新曲已装载、时长已知），但新曲的流
+    // 卡在 0:00 永远进不了播放——且无人察觉：流滴漏式卡缓冲不报错（读超时
+    // 20s 只管彻底断线），网页迟到的切歌前摇（pause / 清 src 的 stop）又可能
+    // 在接播后落到新曲上把它按停/卸载，而网页自己的切歌流程卡在解析上，
+    // 后续的 PLAY_URL 永远不来。两条卡法共同的缺口是：装载后没人确认"真的
+    // 出声了"。看门狗每 10s 采样一次：有播放意图却不在播、位置也没推进，
+    // 先整条重拉一次（换新连接），仍卡就停掉播放器并给网页发 error 同步，
+    // 交垫片重试 / 页面换源降级链接管，不再无限期静默。
+    private val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var watchdogRunning = false
+    private var watchdogStall = 0
+    private var watchdogLastPos = -1L
+    /** 最近一次预置接播的时刻（elapsedRealtime）；0 = 无 */
+    private var lastAdvanceAtMs = 0L
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            try {
+                watchdogTick()
+            } catch (_: Exception) {
+            }
+            if (watchdogRunning) watchdogHandler.postDelayed(this, 10_000)
+        }
+    }
+
+    private fun startWatchdog() {
+        watchdogStall = 0
+        watchdogLastPos = -1L
+        if (watchdogRunning) return
+        watchdogRunning = true
+        watchdogHandler.postDelayed(watchdogRunnable, 10_000)
+    }
+
+    private fun stopWatchdog() {
+        watchdogRunning = false
+        watchdogStall = 0
+        watchdogLastPos = -1L
+        try {
+            watchdogHandler.removeCallbacks(watchdogRunnable)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun watchdogTick() {
+        val p = player
+        if (!nativeActive || p == null || nativeUrl.isEmpty()) {
+            watchdogStall = 0
+            watchdogLastPos = -1L
+            return
+        }
+        val pos = try {
+            p.currentPosition.coerceAtLeast(0)
+        } catch (_: Exception) {
+            0L
+        }
+        // 在播、或位置在推进 = 健康
+        if (p.isPlaying || pos > watchdogLastPos + 250) {
+            watchdogStall = 0
+            watchdogLastPos = pos
+            return
+        }
+        watchdogLastPos = pos
+        val wantPlay = try {
+            p.playWhenReady
+        } catch (_: Exception) {
+            false
+        }
+        val st = try {
+            p.playbackState
+        } catch (_: Exception) {
+            Player.STATE_IDLE
+        }
+        // 用户暂停（无播放意图）不干预；非缓冲态（已播完/已停）不归这里管
+        if (!wantPlay || st != Player.STATE_BUFFERING) {
+            watchdogStall = 0
+            return
+        }
+        watchdogStall++
+        if (watchdogStall == 1) {
+            // 第一次卡住：整条重拉（换一条新连接），中途卡住的先 seek 回原位置
+            val keepPos = pos
+            try {
+                p.setMediaItem(MediaItem.fromUri(nativeUrl))
+                if (keepPos > 2000) p.seekTo(keepPos)
+                p.prepare()
+                p.play()
+            } catch (_: Exception) {
+            }
+        } else if (watchdogStall >= 2) {
+            // 第二次仍卡：停掉播放器（网页重试须走整条装载，别在坏连接上复用），
+            // 发 error 同步交网页的重试/换源降级链处理
+            watchdogStall = 0
+            try {
+                p.stop()
+            } catch (_: Exception) {
+            }
+            playing = false
+            updateSessionState()
+            updateNotification()
+            pushSync(
+                JSONObject().put("t", "error").put("code", -7)
+                    .put("http", 0).put("msg", "stall watchdog: buffering made no progress")
+            )
+        }
+    }
+
+    /**
+     * 接播后保护窗：预置接播刚完成、新曲还没起播的 10s 内，网页迟到的切歌
+     * 前摇（pause / stop / disarm）不是用户意图，而是它自己没走完的切歌流程
+     * ——照单全收会把刚接上的新曲按停/卸载，而它随后的 PLAY_URL 又可能永远
+     * 不来（phase-2.6 复测卡 0:00 的候选成因之一）。保护窗内一律忽略；
+     * 网页接管记账（PLAY_URL / ARM_NEXT 到达）即提前解除。
+     */
+    private fun inAdvanceGuard(): Boolean {
+        if (lastAdvanceAtMs <= 0L || playing) return false
+        if (positionMs > 0L) return false
+        return SystemClock.elapsedRealtime() - lastAdvanceAtMs < 10_000L
+    }
+
     private fun cancelPendingAdvance() {
         pendingAdvance?.let {
             try {
@@ -237,6 +356,7 @@ class KeepAliveService : Service() {
         }
         lastAdvancedKey = item.key
         lastAdvancedUrl = item.url
+        lastAdvanceAtMs = SystemClock.elapsedRealtime()
         playNative(item.url)
         val advJson = JSONObject().put("t", "advanced").put("key", item.key)
             .put("url", item.url).put("repeat", false)
@@ -271,7 +391,12 @@ class KeepAliveService : Service() {
                         JSONObject().put("t", "ready").put("dur", playerDurationMs())
                     )
                 }
-                Player.STATE_BUFFERING -> pushSync(JSONObject().put("t", "buffering"))
+                Player.STATE_BUFFERING -> {
+                    pushSync(JSONObject().put("t", "buffering"))
+                    // 会话状态如实报缓冲中，别让锁屏把"在缓冲"显示成"已暂停"
+                    updateSessionState()
+                    updateNotification()
+                }
                 Player.STATE_ENDED -> {
                     playing = false
                     syncAnchorFromPlayer()
@@ -411,12 +536,15 @@ class KeepAliveService : Service() {
         p.setMediaItem(MediaItem.fromUri(url))
         p.prepare()
         p.play()
+        startWatchdog()
         updateSessionState()
         updateNotification()
     }
 
     private fun stopNative() {
         cancelPendingAdvance()
+        stopWatchdog()
+        lastAdvanceAtMs = 0L
         armedItems.clear()
         lastAdvancedKey = ""
         lastAdvancedUrl = ""
@@ -495,6 +623,7 @@ class KeepAliveService : Service() {
 
     override fun onDestroy() {
         cancelPendingAdvance()
+        stopWatchdog()
         try {
             tickHandler.removeCallbacks(tickRunnable)
         } catch (_: Exception) {
@@ -588,6 +717,7 @@ class KeepAliveService : Service() {
                 cancelPendingAdvance()
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
+                lastAdvanceAtMs = 0L
                 val url = intent.getStringExtra("url").orEmpty()
                 if (url.isNotEmpty()) playNative(url)
             }
@@ -599,7 +729,10 @@ class KeepAliveService : Service() {
                 // 真正的用户暂停发生在播放中（无待接播），不受影响；播完状态下
                 // 单独 pause 也没有实际意义，保留待接播，让 PLAY_URL 来接管。
                 if (pendingAdvance == null) cancelPendingAdvance()
-                player?.pause()
+                // 接播后保护窗内同理：网页迟到的切歌前摇 pause 会把刚接上的
+                // 新曲按停（playWhenReady=false），而它自己的 PLAY_URL 又可能
+                // 卡在解析上永远不来——新曲就此卡在 0:00 静默。保护窗内忽略。
+                if (!inAdvanceGuard()) player?.pause()
             }
             ACTION_NATIVE_RESUME -> {
                 if (nativeActive) {
@@ -643,7 +776,9 @@ class KeepAliveService : Service() {
                 // fallback 被网页自己的前摇亲手拆掉。有待接播时忽略这次 stop：
                 // 网页随后送达的 PLAY_URL 会整条换装（等效于 stop 后重播），
                 // 若 PLAY_URL 最终没来，待接播按预置接上，音乐不断档。
-                if (pendingAdvance == null) stopNative()
+                // 接播后保护窗同样适用：迟到的清 src 会把刚接上的新曲卸载，
+                // 而网页的重装请求可能永远不来——保护窗内忽略这次 stop。
+                if (pendingAdvance == null && !inAdvanceGuard()) stopNative()
             }
             ACTION_ARM_NEXT -> {
                 // 网页重新预置（或接管记账）：以新清单为准。
@@ -652,6 +787,7 @@ class KeepAliveService : Service() {
                 if (pendingAdvance == null) cancelPendingAdvance()
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
+                lastAdvanceAtMs = 0L
                 armedItems.clear()
                 try {
                     val arr = org.json.JSONArray(intent.getStringExtra("json") ?: "[]")
@@ -675,7 +811,7 @@ class KeepAliveService : Service() {
                 // 宽限期内的 disarm 同样多来自网页切歌失败后的收尾（played=false 分支），
                 // 不是用户的"播完停"意图（那个意图在设定的当下、播放中就已发出，
                 // 待接播为空，不受影响）——有待接播时忽略，保住 fallback。
-                if (pendingAdvance == null) {
+                if (pendingAdvance == null && !inAdvanceGuard()) {
                     cancelPendingAdvance()
                     armedItems.clear()
                 }
@@ -767,10 +903,16 @@ class KeepAliveService : Service() {
 
     private fun updateSessionState() {
         try {
-            val state = if (playing) {
-                PlaybackStateCompat.STATE_PLAYING
-            } else {
-                PlaybackStateCompat.STATE_PAUSED
+            // 原生模式且有播放意图却卡在缓冲时如实报 BUFFERING——只报 PAUSED
+            // 会让锁屏显示成"被暂停了"，误导判断（2.6 复测截图就是这样）
+            val np = if (nativeActive) player else null
+            val isBuffering = np != null && !playing &&
+                (try { np.playWhenReady } catch (_: Exception) { false }) &&
+                (try { np.playbackState } catch (_: Exception) { -1 }) == Player.STATE_BUFFERING
+            val state = when {
+                playing -> PlaybackStateCompat.STATE_PLAYING
+                isBuffering -> PlaybackStateCompat.STATE_BUFFERING
+                else -> PlaybackStateCompat.STATE_PAUSED
             }
             // 播放中速度 1.0：系统按最后上报位置自动推进进度条；暂停速度 0 定格
             mediaSession.setPlaybackState(
