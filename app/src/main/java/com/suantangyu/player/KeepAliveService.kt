@@ -143,6 +143,11 @@ class KeepAliveService : Service() {
     // 当前曲播完时先等一个宽限期（网页醒着会自己切歌，PLAY_URL 一到就取消）；
     // 宽限期满网页还没接上（熄屏被冻/解析卡住），服务按预置自己接播下一首，
     // 音乐不断档；接播后经 advanced 同步通知网页补记账对齐队列。
+    // —— phase-3（2026-10-23，2.7 复测连播 43 首后第 44 首仍断链后的结构改）：
+    // 预置曲目同时排进 ExoPlayer 自己的播放列表（syncUpcomingToPlayer），
+    // 接播由播放器在当前曲结束瞬间内部完成——不经 ENDED、不等宽限计时、
+    // WakeLock 不释放、页面不在场也能接；宽限接播只保留作单曲循环与
+    // 未能入队情形的兜底，看门狗另扩管 ENDED 无人接播（watchdogTick）。
     private data class ArmedItem(
         val url: String, val key: String, val title: String,
         val artist: String, val cover: String, val repeat: Boolean
@@ -196,6 +201,8 @@ class KeepAliveService : Service() {
     private var watchdogRunning = false
     private var watchdogStall = 0
     private var watchdogLastPos = -1L
+    /** phase-3：ENDED 后无人接播的连续采样计数（与缓冲卡住分开计） */
+    private var watchdogEndedStall = 0
     /** 最近一次预置接播的时刻（elapsedRealtime）；0 = 无 */
     private var lastAdvanceAtMs = 0L
     private val watchdogRunnable = object : Runnable {
@@ -211,6 +218,7 @@ class KeepAliveService : Service() {
     private fun startWatchdog() {
         watchdogStall = 0
         watchdogLastPos = -1L
+        watchdogEndedStall = 0
         if (watchdogRunning) return
         watchdogRunning = true
         watchdogHandler.postDelayed(watchdogRunnable, 10_000)
@@ -220,6 +228,7 @@ class KeepAliveService : Service() {
         watchdogRunning = false
         watchdogStall = 0
         watchdogLastPos = -1L
+        watchdogEndedStall = 0
         try {
             watchdogHandler.removeCallbacks(watchdogRunnable)
         } catch (_: Exception) {
@@ -241,6 +250,7 @@ class KeepAliveService : Service() {
         // 在播、或位置在推进 = 健康
         if (p.isPlaying || pos > watchdogLastPos + 250) {
             watchdogStall = 0
+            watchdogEndedStall = 0
             watchdogLastPos = pos
             return
         }
@@ -255,17 +265,52 @@ class KeepAliveService : Service() {
         } catch (_: Exception) {
             Player.STATE_IDLE
         }
-        // 用户暂停（无播放意图）不干预；非缓冲态（已播完/已停）不归这里管
-        if (!wantPlay || st != Player.STATE_BUFFERING) {
+        // 用户暂停（无播放意图）不干预
+        if (!wantPlay) {
+            watchdogStall = 0
+            watchdogEndedStall = 0
+            return
+        }
+        // phase-3：ENDED 后无人接播也归看门狗管。此前这条链断了没人察觉——
+        // 宽限接播没触发（计时被冻/预置没赶上）、页面又冻着收不到 ended，
+        // 就永远停在满格。正常情况下宽限接播 2.5s 就完成、播放列表原生接播
+        // 更是即时，10s 采样点上还停在 ENDED 即异常：手里有预置就立刻强制
+        // 接播（先撤掉可能还挂着的宽限计时，防它稍后重复接一首）；没有预置
+        // 就持锁防 CPU 睡死并补发 ended，给页面一次自己接上的机会，之后
+        // 每约 30s 再补发一次，不无限静默也不狂发。
+        if (st == Player.STATE_ENDED) {
+            watchdogStall = 0
+            watchdogEndedStall++
+            if (watchdogEndedStall == 1 && armedItems.isNotEmpty()) {
+                cancelPendingAdvance()
+                doArmedAdvance()
+            } else if (watchdogEndedStall == 1 || watchdogEndedStall >= 3) {
+                if (armedItems.isEmpty()) {
+                    acquireGraceWakeLock()
+                    pushSync(JSONObject().put("t", "ended"))
+                } else {
+                    cancelPendingAdvance()
+                    doArmedAdvance()
+                }
+                if (watchdogEndedStall >= 3) watchdogEndedStall = 1
+            }
+            return
+        }
+        watchdogEndedStall = 0
+        // 非缓冲态（已停/空闲）不归缓冲看门狗管
+        if (st != Player.STATE_BUFFERING) {
             watchdogStall = 0
             return
         }
         watchdogStall++
         if (watchdogStall == 1) {
-            // 第一次卡住：整条重拉（换一条新连接），中途卡住的先 seek 回原位置
+            // 第一次卡住：整条重拉（换一条新连接），中途卡住的先 seek 回原位置。
+            // 注意不能用 setMediaItem 重装单曲——phase-3 起播放器里排着后面
+            // 的预置曲目，整表替换会把队列冲掉；stop+prepare 同样换新连接，
+            // 且保留播放列表与当前项。
             val keepPos = pos
             try {
-                p.setMediaItem(MediaItem.fromUri(nativeUrl))
+                p.stop()
                 if (keepPos > 2000) p.seekTo(keepPos)
                 p.prepare()
                 p.play()
@@ -341,6 +386,16 @@ class KeepAliveService : Service() {
             return
         }
         armedItems.removeAt(0)
+        applyAdvance(item, playIt = true)
+    }
+
+    /**
+     * 接播记账（宽限接播与播放列表原生接播共用）：换曲目信息、打保护窗
+     * 时间戳、发 advanced 同步并在 1s / 3s 后各补发一次（页面冻醒时首条
+     * 同步可能被吞）。playIt=true 是老路：服务自己装载新曲；playIt=false
+     * 是 phase-3 原生接播：播放器已经自己切到了这首，只补状态对齐。
+     */
+    private fun applyAdvance(item: ArmedItem, playIt: Boolean) {
         // 先把曲目信息换上，锁屏卡片立刻是对的，不必等网页醒来
         if (item.title.isNotEmpty()) title = item.title
         artist = item.artist
@@ -357,12 +412,26 @@ class KeepAliveService : Service() {
         lastAdvancedKey = item.key
         lastAdvancedUrl = item.url
         lastAdvanceAtMs = SystemClock.elapsedRealtime()
-        playNative(item.url)
+        if (playIt) {
+            playNative(item.url)
+            // 宽限接播是整表装载，剩下的预置曲目重新排进播放器队列
+            syncUpcomingToPlayer()
+        } else {
+            nativeUrl = item.url
+            positionMs = 0
+            anchorPosMs = 0
+            anchorAtMs = SystemClock.elapsedRealtime()
+            durationMs = 0
+            watchdogStall = 0
+            watchdogEndedStall = 0
+            watchdogLastPos = -1L
+            syncAnchorFromPlayer()
+            updateSessionState()
+            updateNotification()
+        }
         val advJson = JSONObject().put("t", "advanced").put("key", item.key)
             .put("url", item.url).put("repeat", false)
         pushSync(advJson)
-        // 网页渲染进程若是被冻到这一刻才醒，首条同步可能被吞：1s / 3s 后各补发一次，
-        // 让它有机会补记账并重新预置后续曲目（补发时这首已不是在播曲就不再发）
         for (delayMs in longArrayOf(1000L, 3000L)) {
             graceHandler.postDelayed({
                 if (nativeActive && nativeUrl == item.url && lastAdvancedKey == item.key) {
@@ -372,7 +441,88 @@ class KeepAliveService : Service() {
         }
     }
 
+    private fun mediaItemFor(item: ArmedItem): MediaItem =
+        MediaItem.Builder().setUri(item.url)
+            .setMediaId(item.key.ifEmpty { item.url }).build()
+
+    /** 能进播放器队列的预置曲目：含单曲循环预置时返回空（循环不入队，走 ENDED 老路） */
+    private fun desiredUpcoming(): List<ArmedItem> =
+        if (armedItems.any { it.repeat }) emptyList() else armedItems.toList()
+
+    /**
+     * phase-3 核心：把预置曲目同步成 ExoPlayer 播放列表里排在当前曲之后
+     * 的真实队列项。当前曲播完时播放器内部直接切到下一项——不经 ENDED、
+     * 不等宽限计时、播放器也不释放网络 WakeLock，页面在不在场都不影响
+     * 接播；页面醒来收到 advanced 同步后补记账、再经 ARM_NEXT 续排队尾。
+     * 同步方式为最长公共前缀对齐：已排好且与新清单一致的前段原样保留
+     * （保住播放器对它们的预加载），只换后面的部分。
+     */
+    private fun syncUpcomingToPlayer() {
+        val p = player ?: return
+        if (!nativeActive || nativeUrl.isEmpty()) return
+        try {
+            if (p.playbackState == Player.STATE_IDLE) return
+            val cur = p.currentMediaItemIndex
+            val count = p.mediaItemCount
+            if (cur < 0 || cur >= count) return
+            val desired = desiredUpcoming()
+            val existingIds = ArrayList<String>()
+            for (i in cur + 1 until count) {
+                existingIds.add(p.getMediaItemAt(i).mediaId)
+            }
+            val desiredIds = desired.map { it.key.ifEmpty { it.url } }
+            var prefix = 0
+            while (prefix < existingIds.size && prefix < desiredIds.size &&
+                existingIds[prefix] == desiredIds[prefix]
+            ) {
+                prefix++
+            }
+            if (prefix == existingIds.size && prefix == desiredIds.size) return
+            if (count > cur + 1 + prefix) {
+                p.removeMediaItems(cur + 1 + prefix, count)
+            }
+            if (desiredIds.size > prefix) {
+                p.addMediaItems(
+                    cur + 1 + prefix,
+                    desired.subList(prefix, desired.size).map { mediaItemFor(it) }
+                )
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 播放列表原生接播的记账入口：播放器内部切到下一项（AUTO），或看门狗
+     * 在 ENDED 卡死后把播放器 seek 到排队中的下一项（SEEK）时触发。切到的
+     * 项对得上预置清单才处理（网页自己换歌走 PLAY_URL，是 PLAYLIST_CHANGED，
+     * 不在这里）；对得上的按位置消费（含被跳过的），再走统一接播记账。
+     */
+    private fun handlePlaylistTransition(mediaItem: MediaItem?, reason: Int) {
+        if (!nativeActive) return
+        if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
+            reason != Player.MEDIA_ITEM_TRANSITION_REASON_SEEK
+        ) {
+            return
+        }
+        val uri = try {
+            mediaItem?.localConfiguration?.uri?.toString()
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val idx = armedItems.indexOfFirst { it.url == uri }
+        if (idx < 0) return
+        val item = armedItems[idx]
+        if (item.repeat) return
+        repeat(idx + 1) { if (armedItems.isNotEmpty()) armedItems.removeAt(0) }
+        applyAdvance(item, playIt = false)
+    }
+
     private val playerListener = object : Player.Listener {
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            // phase-3：播放列表原生接播在这里记账（服务自发 seek 接播同理）
+            handlePlaylistTransition(mediaItem, reason)
+        }
+
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
             playing = isPlaying
@@ -533,7 +683,7 @@ class KeepAliveService : Service() {
             p.setPlaybackSpeed(pendingRate)
         } catch (_: Exception) {
         }
-        p.setMediaItem(MediaItem.fromUri(url))
+        p.setMediaItem(MediaItem.Builder().setUri(url).setMediaId(url).build())
         p.prepare()
         p.play()
         startWatchdog()
@@ -719,6 +869,11 @@ class KeepAliveService : Service() {
                 lastAdvancedUrl = ""
                 lastAdvanceAtMs = 0L
                 val url = intent.getStringExtra("url").orEmpty()
+                // 网页自己点播的正是预置队首（它醒着主动切的歌）→ 该预置已被
+                // 它自己消费，别留着让队列同步/宽限接播再播一遍同一首
+                if (url.isNotEmpty() && armedItems.firstOrNull()?.url == url) {
+                    armedItems.removeAt(0)
+                }
                 if (url.isNotEmpty()) playNative(url)
             }
             ACTION_NATIVE_PAUSE -> {
@@ -806,6 +961,8 @@ class KeepAliveService : Service() {
                     }
                 } catch (_: Exception) {
                 }
+                // phase-3：新预置清单同步进播放器队列，接播改由播放器内部完成
+                syncUpcomingToPlayer()
             }
             ACTION_DISARM_NEXT -> {
                 // 宽限期内的 disarm 同样多来自网页切歌失败后的收尾（played=false 分支），
@@ -814,6 +971,8 @@ class KeepAliveService : Service() {
                 if (pendingAdvance == null && !inAdvanceGuard()) {
                     cancelPendingAdvance()
                     armedItems.clear()
+                    // 预置已撤，播放器队列里排着的后续项一并撤下，防它照旧接播
+                    syncUpcomingToPlayer()
                 }
             }
             ACTION_HELLO -> {
