@@ -187,6 +187,13 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_DEFAULT
             loadsImagesAutomatically = true
         }
+        // 渲染进程优先级拉到 IMPORTANT 且不可见时不降级：熄屏/切后台后系统别冻结
+        // 网页渲染进程——切歌决策、下一首解析、给服务重新预置续播都靠它的 JS 活着；
+        // 被冻住时页面收不到 ended、发不出新地址，原生播放器只能干等（phase-2.6）。
+        try {
+            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        } catch (_: Exception) {
+        }
         // 网页 → 原生：上报曲名/播放状态，驱动通知栏
         webView.addJavascriptInterface(BaoBridge(this), "BaoBus")
         webView.webViewClient = object : WebViewClient() {

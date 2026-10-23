@@ -11,6 +11,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.media.app.NotificationCompat.MediaStyle
@@ -154,6 +155,34 @@ class KeepAliveService : Service() {
     private val graceHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var pendingAdvance: Runnable? = null
 
+    /**
+     * 宽限期专用 WakeLock：当前曲播完后 ExoPlayer 停了，它自带的网络 WakeLock
+     * 随之释放，CPU 一睡，主线程上的 2.5s 宽限计时（uptime 时钟）也跟着冻住，
+     * 接播要等下一次亮屏才触发——这正是"播完卡住、亮屏才发现没接上"的一个闸口。
+     * 调度接播时单独持锁，接到播/取消/超时自动释放（最长 60s 兜底）。
+     */
+    private var graceWakeLock: PowerManager.WakeLock? = null
+
+    private fun acquireGraceWakeLock() {
+        try {
+            if (graceWakeLock?.isHeld == true) return
+            val pm = getSystemService(PowerManager::class.java) ?: return
+            val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Suantangyu:GraceAdvance")
+            wl.setReferenceCounted(false)
+            wl.acquire(60_000L)
+            graceWakeLock = wl
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseGraceWakeLock() {
+        try {
+            if (graceWakeLock?.isHeld == true) graceWakeLock?.release()
+        } catch (_: Exception) {
+        }
+        graceWakeLock = null
+    }
+
     private fun cancelPendingAdvance() {
         pendingAdvance?.let {
             try {
@@ -162,11 +191,13 @@ class KeepAliveService : Service() {
             }
         }
         pendingAdvance = null
+        releaseGraceWakeLock()
     }
 
     private fun scheduleArmedAdvance() {
         if (armedItems.isEmpty()) return
         cancelPendingAdvance()
+        acquireGraceWakeLock()
         val r = Runnable { doArmedAdvance() }
         pendingAdvance = r
         graceHandler.postDelayed(r, 2500)
@@ -174,6 +205,7 @@ class KeepAliveService : Service() {
 
     private fun doArmedAdvance() {
         pendingAdvance = null
+        releaseGraceWakeLock()
         if (!nativeActive) return
         val item = armedItems.firstOrNull() ?: return
         if (item.repeat) {
@@ -206,10 +238,18 @@ class KeepAliveService : Service() {
         lastAdvancedKey = item.key
         lastAdvancedUrl = item.url
         playNative(item.url)
-        pushSync(
-            JSONObject().put("t", "advanced").put("key", item.key)
-                .put("url", item.url).put("repeat", false)
-        )
+        val advJson = JSONObject().put("t", "advanced").put("key", item.key)
+            .put("url", item.url).put("repeat", false)
+        pushSync(advJson)
+        // 网页渲染进程若是被冻到这一刻才醒，首条同步可能被吞：1s / 3s 后各补发一次，
+        // 让它有机会补记账并重新预置后续曲目（补发时这首已不是在播曲就不再发）
+        for (delayMs in longArrayOf(1000L, 3000L)) {
+            graceHandler.postDelayed({
+                if (nativeActive && nativeUrl == item.url && lastAdvancedKey == item.key) {
+                    pushSync(advJson)
+                }
+            }, delayMs)
+        }
     }
 
     private val playerListener = object : Player.Listener {
@@ -552,8 +592,13 @@ class KeepAliveService : Service() {
                 if (url.isNotEmpty()) playNative(url)
             }
             ACTION_NATIVE_PAUSE -> {
-                // 宽限期内被暂停：别再自动接播
-                cancelPendingAdvance()
+                // 宽限期（已播完、等接播）内到达的 pause 多半是网页切歌前摇：
+                // 它收到 ended 后跑自己的 next()/play()，开头先 pause 再清 src——
+                // 若在此刻把待接播取消、预置又随后的 stop 清掉，网页的解析再在
+                // 后台卡住，就再没有东西能接上（phase-2.5 实测失效的主因之一）。
+                // 真正的用户暂停发生在播放中（无待接播），不受影响；播完状态下
+                // 单独 pause 也没有实际意义，保留待接播，让 PLAY_URL 来接管。
+                if (pendingAdvance == null) cancelPendingAdvance()
                 player?.pause()
             }
             ACTION_NATIVE_RESUME -> {
@@ -592,10 +637,19 @@ class KeepAliveService : Service() {
                 } catch (_: Exception) {
                 }
             }
-            ACTION_NATIVE_STOP -> stopNative()
+            ACTION_NATIVE_STOP -> {
+                // 同 NATIVE_PAUSE：宽限期内网页切歌前摇会先 removeAttribute("src")
+                // 触发一次 stop——照单全收就会把播放器卸载、预置清单清空，
+                // fallback 被网页自己的前摇亲手拆掉。有待接播时忽略这次 stop：
+                // 网页随后送达的 PLAY_URL 会整条换装（等效于 stop 后重播），
+                // 若 PLAY_URL 最终没来，待接播按预置接上，音乐不断档。
+                if (pendingAdvance == null) stopNative()
+            }
             ACTION_ARM_NEXT -> {
-                // 网页重新预置（或接管记账）：旧预置与待接播一并作废，以新清单为准
-                cancelPendingAdvance()
+                // 网页重新预置（或接管记账）：以新清单为准。
+                // 但宽限期内（已播完正等待接播）不要取消待接播计时——doArmedAdvance
+                // 在触发时才读清单，换上新清单即可；取消计时等于白等一首歌的时间。
+                if (pendingAdvance == null) cancelPendingAdvance()
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
                 armedItems.clear()
@@ -609,7 +663,8 @@ class KeepAliveService : Service() {
                             ArmedItem(
                                 u, o.optString("k"), o.optString("t"),
                                 o.optString("a"), o.optString("c"),
-                                o.optBoolean("r", false)
+                                // 网页发的是数字 0/1，optBoolean 不认数字，一并兼容
+                                o.optBoolean("r", false) || o.optInt("r", 0) == 1
                             )
                         )
                     }
@@ -617,8 +672,13 @@ class KeepAliveService : Service() {
                 }
             }
             ACTION_DISARM_NEXT -> {
-                cancelPendingAdvance()
-                armedItems.clear()
+                // 宽限期内的 disarm 同样多来自网页切歌失败后的收尾（played=false 分支），
+                // 不是用户的"播完停"意图（那个意图在设定的当下、播放中就已发出，
+                // 待接播为空，不受影响）——有待接播时忽略，保住 fallback。
+                if (pendingAdvance == null) {
+                    cancelPendingAdvance()
+                    armedItems.clear()
+                }
             }
             ACTION_HELLO -> {
                 if (nativeActive) syncAnchorFromPlayer()
