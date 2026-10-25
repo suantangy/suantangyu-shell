@@ -95,6 +95,17 @@ class KeepAliveService : Service() {
                     // 原生模式：位置直接读播放器（真实值），每秒对齐一次锚点并同步给网页
                     val prevSec = positionMs / 1000
                     syncAnchorFromPlayer()
+                    // 3.1.1：进度过 85% 或剩余 <25s 时再同步一次队列——补 ARM
+                    // 到达时播放器 IDLE / 索引无效导致同步提前 return 的缝；
+                    // 前缀对上即 return，成本低；只同步已预置清单，不重新解析地址。
+                    if (durationMs > 15000 && positionMs > 0 &&
+                        (positionMs * 100 / durationMs >= 85 || durationMs - positionMs < 25000)
+                    ) {
+                        try {
+                            syncUpcomingToPlayer()
+                        } catch (_: Exception) {
+                        }
+                    }
                     if (playing && positionMs / 1000 != prevSec) {
                         updateSessionState()
                         updateNotification()
@@ -605,8 +616,17 @@ class KeepAliveService : Service() {
                     updateSessionState()
                     updateNotification()
                     pushSync(JSONObject().put("t", "ended"))
-                    // 网页醒着会自己切歌（PLAY_URL 到达即取消）；没接上就由预置接播
-                    scheduleArmedAdvance()
+                    // 3.1.1：ENDED 立即接播——不再等 2.5s 宽限（熄屏下宽限计时
+                    // 本身可能被冻住）；有预置直接接播，无预置走原宽限路
+                    // （armed 为空时 scheduleArmedAdvance 直接 return）。
+                    // 代价：醒着的页面自己的 next 会被抢先一步，PLAY_URL /
+                    // ARM_NEXT 到达仍可接管（接播保护窗 + 接管记账不变）。
+                    if (armedItems.isNotEmpty()) {
+                        cancelPendingAdvance()
+                        doArmedAdvance()
+                    } else {
+                        scheduleArmedAdvance()
+                    }
                 }
             }
         }
