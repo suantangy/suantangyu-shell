@@ -9,6 +9,12 @@ import android.webkit.JavascriptInterface
  */
 class BaoBridge(private val activity: MainActivity) {
 
+    /** 设置页只显示壳版本：网页通过它读取壳的 versionName（3.1.1 起），网页自身版本不再显示 */
+    @JavascriptInterface
+    fun getShellVersion(): String {
+        return BuildConfig.VERSION_NAME
+    }
+
     @JavascriptInterface
     fun postTrack(title: String, artist: String, cover: String) {
         val intent = Intent(activity, KeepAliveService::class.java).apply {
