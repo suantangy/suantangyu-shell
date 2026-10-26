@@ -41,7 +41,15 @@ jobs:
           if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
             mkdir -p ~/.android
             echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
+            echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > app/debug.keystore
           fi
+
+      # 诊断：只打印指纹（证书指纹本来就公开在 APK 里），不打印密钥；若指纹不是固定密钥，构建就白打了。
+      - name: Verify debug keystore fingerprint
+        run: |
+          ls -lh ~/.android/debug.keystore app/debug.keystore || true
+          keytool -list -keystore ~/.android/debug.keystore -storepass android 2>&1 | grep -E "SHA-256|androiddebugkey" || echo "home keystore unreadable"
+          keytool -list -keystore app/debug.keystore -storepass android 2>&1 | grep -E "SHA-256|androiddebugkey" || echo "app keystore unreadable"
 
       - name: Build debug APK
         run: ./gradle-8.7/bin/gradle assembleDebug --no-daemon

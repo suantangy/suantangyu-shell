@@ -11,8 +11,22 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "3.1.6"
+        versionCode = 8
+        versionName = "3.1.7"
+    }
+
+    // 固定签名：工作流把 Secrets 里的固定 keystore 还原成 app/debug.keystore 时，debug 构建就用它签，
+    // 不再每台机器现生成临时 debug key；本地没有该文件时回落 AGP 默认 debug 签名，不影响本地构建。
+    signingConfigs {
+        getByName("debug") {
+            val fixed = file("debug.keystore")
+            if (fixed.exists()) {
+                storeFile = fixed
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     // BaoBridge.getShellVersion() 用 BuildConfig.VERSION_NAME，AGP 8 默认不生成 BuildConfig，必须显式打开
