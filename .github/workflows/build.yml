@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,3 +39,14 @@ jobs:
         with:
           name: suantangyu-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      # 检查更新的数据源：每次构建后发一个公开 Release，网页点“检查更新”时查 releases/latest。
+      # tag 用 v<versionName>-<run_number>，同版本号多次构建也不会撞 tag；网页比对时只取横杠前的版本号，
+      # 所以壳发版必须同时升 versionName，否则同版本号的新构建不会被判为新版本。
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          TAG="v${VERSION}-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" app/build/outputs/apk/debug/app-debug.apk --title "酸汤鱼音乐 v${VERSION}" --generate-notes

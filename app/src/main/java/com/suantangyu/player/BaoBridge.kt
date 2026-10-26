@@ -1,6 +1,7 @@
 package com.suantangyu.player
 
 import android.content.Intent
+import android.net.Uri
 import android.webkit.JavascriptInterface
 
 /**
@@ -13,6 +14,18 @@ class BaoBridge(private val activity: MainActivity) {
     @JavascriptInterface
     fun getShellVersion(): String {
         return BuildConfig.VERSION_NAME
+    }
+
+    /** 检查更新发现新版本时：用系统浏览器打开 Release 下载页（WebView 自身不处理 APK 下载） */
+    @JavascriptInterface
+    fun openExternalUrl(url: String) {
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.startActivity(intent)
+        } catch (_: Exception) {
+        }
     }
 
     @JavascriptInterface
