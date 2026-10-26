@@ -11,8 +11,8 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "3.1.4"
+        versionCode = 6
+        versionName = "3.1.5"
     }
 
     // BaoBridge.getShellVersion() 用 BuildConfig.VERSION_NAME，AGP 8 默认不生成 BuildConfig，必须显式打开
