@@ -216,6 +216,18 @@ class KeepAliveService : Service() {
     private var watchdogEndedStall = 0
     /** 最近一次预置接播的时刻（elapsedRealtime）；0 = 无 */
     private var lastAdvanceAtMs = 0L
+
+    // —— 3.1.11 报错自救：播放器报错后停进 IDLE，旧行为只把 error 同步
+    // 给网页；熄屏时网页冻住收不到，就永久停死。降级播放拿到的多是兜底
+    // 档/换源签发的地址，403/过期高发，所以这个洞在降级时最明显。自救
+    // 逻辑见 scheduleErrorRescue：宽限等网页接管，无人接管才跳预置。
+    /** 连续自救跳歌次数（真出声或网页接管即清零）；上限防坏地址连环跳 */
+    private var errorRescueCount = 0
+    private val MAX_ERROR_RESCUE = 2
+    /** 最近一次 onPlayerError 的时刻与当时在播地址（看门狗兜底判定用） */
+    private var lastErrorAtMs = 0L
+    private var lastErrorUrl: String = ""
+    private var pendingErrorRescue: Runnable? = null
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
@@ -308,6 +320,19 @@ class KeepAliveService : Service() {
             return
         }
         watchdogEndedStall = 0
+        // 3.1.11 报错自救兜底：onPlayerError 调度的自救若没跑成（宽限内
+        // 状态抖动被拦下等），IDLE 且有近期报错、手里还有预置时在这里
+        // 补跳一次（计数与 onPlayerError 路共用，连跳上限不变）。
+        if (st == Player.STATE_IDLE && armedItems.isNotEmpty() &&
+            errorRescueCount < MAX_ERROR_RESCUE &&
+            lastErrorAtMs > 0L &&
+            SystemClock.elapsedRealtime() - lastErrorAtMs < 30_000L
+        ) {
+            errorRescueCount++
+            cancelPendingAdvance()
+            doArmedAdvance()
+            return
+        }
         // 非缓冲态（已停/空闲）不归缓冲看门狗管
         if (st != Player.STATE_BUFFERING) {
             watchdogStall = 0
@@ -384,6 +409,68 @@ class KeepAliveService : Service() {
         }
         pendingAdvance = null
         releaseGraceWakeLock()
+    }
+
+    private fun cancelErrorRescue() {
+        pendingErrorRescue?.let {
+            try {
+                graceHandler.removeCallbacks(it)
+            } catch (_: Exception) {
+            }
+        }
+        pendingErrorRescue = null
+        // 宽限锁与待接播共用一个：还有待接播挂着时别把它的锁放掉
+        if (pendingAdvance == null) releaseGraceWakeLock()
+    }
+
+    /**
+     * 3.1.11 报错自救调度：报错后先等 4s——网页醒着会自己重试/换源，
+     * PLAY_URL 一到即取消自救并清零计数（cancelErrorRescue 在该指令处
+     * 调用）；4s 后仍无人接管、手里有预置，才由服务自己跳到下一首
+     * 预置续播（走 doArmedAdvance 的统一接播记账，网页醒来照常对齐）。
+     * 等待期间持宽限 WakeLock，防 CPU 睡死把计时冻住（同宽限接播）。
+     */
+    private fun scheduleErrorRescue() {
+        if (errorRescueCount >= MAX_ERROR_RESCUE) return
+        if (armedItems.isEmpty()) return
+        val wantPlay = try {
+            player?.playWhenReady
+        } catch (_: Exception) {
+            null
+        }
+        if (wantPlay != true) return
+        cancelErrorRescue()
+        acquireGraceWakeLock()
+        val r = Runnable { runErrorRescue() }
+        pendingErrorRescue = r
+        graceHandler.postDelayed(r, 4000)
+    }
+
+    private fun runErrorRescue() {
+        pendingErrorRescue = null
+        if (pendingAdvance == null) releaseGraceWakeLock()
+        if (!nativeActive) return
+        if (errorRescueCount >= MAX_ERROR_RESCUE) return
+        if (armedItems.isEmpty()) return
+        // 网页已接管（换了新地址重试/切歌）就不插手
+        if (nativeUrl != lastErrorUrl) return
+        val p = player ?: return
+        val wantPlay = try {
+            p.playWhenReady
+        } catch (_: Exception) {
+            false
+        }
+        if (!wantPlay) return
+        val st = try {
+            p.playbackState
+        } catch (_: Exception) {
+            Player.STATE_IDLE
+        }
+        // 网页的重试已让播放器重新缓冲/就绪，自救让路
+        if (st != Player.STATE_IDLE) return
+        errorRescueCount++
+        cancelPendingAdvance()
+        doArmedAdvance()
     }
 
     private fun scheduleArmedAdvance() {
@@ -583,6 +670,8 @@ class KeepAliveService : Service() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
+            // 3.1.11：真出声了，自救连跳计数清零
+            if (isPlaying) errorRescueCount = 0
             playing = isPlaying
             syncAnchorFromPlayer()
             updateSessionState()
@@ -650,6 +739,10 @@ class KeepAliveService : Service() {
                     .put("http", httpCode)
                     .put("msg", (error.message ?: "").take(120))
             )
+            // 3.1.11：记下这次报错并调度自救（宽限后网页没接管才跳预置）
+            lastErrorAtMs = SystemClock.elapsedRealtime()
+            lastErrorUrl = nativeUrl
+            scheduleErrorRescue()
         }
     }
 
@@ -760,6 +853,10 @@ class KeepAliveService : Service() {
 
     private fun stopNative() {
         cancelPendingAdvance()
+        cancelErrorRescue()
+        errorRescueCount = 0
+        lastErrorAtMs = 0L
+        lastErrorUrl = ""
         stopWatchdog()
         lastAdvanceAtMs = 0L
         armedItems.clear()
@@ -932,6 +1029,9 @@ class KeepAliveService : Service() {
             ACTION_PLAY_URL -> {
                 // 网页自己接上了：预置接播取消，记账权回到网页
                 cancelPendingAdvance()
+                // 3.1.11：报错自救同理取消并清零（网页的重试/切歌优先）
+                cancelErrorRescue()
+                errorRescueCount = 0
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
                 lastAdvanceAtMs = 0L
