@@ -253,11 +253,22 @@ class KeepAliveService : Service() {
     // —— 3.1.13 卡住不终局：跑道见底、缓冲卡死且无货可跳时不再 stop()
     // 定终局（旧兜底还没记 lastErrorAtMs，停进 IDLE 后看门狗各分支全
     // 绕开、永不自恢复）。改为进入孤儿重试：记账、保住播放意图、约每
-    // 60s 整条重拉一次并补发 error 喊网页；网络恢复或网页解冻任一发
+    // 30s 整条重拉一次并补发 error 喊网页；网络恢复或网页解冻任一发
     // 生即可自活，真出声/网页接管/用户暂停即退出。
     private var orphanStall = false
     private var orphanLastRetryMs = 0L
     private var orphanPos = 0L
+
+    // —— 3.1.14 防 pause 毒化：当前曲是否已真正出过声。页面切歌前摇的
+    // pause/stop 在深冻下迟到无上限，30s 保护窗（3.1.12）仍被击穿——
+    // 改为不看时间：首次出声前，页面来的 pause/stop 一律不认（那永远
+    // 是它自己的前摇，不是用户意图）。用户暂停走通知/耳机/锁屏（直
+    // 达播放器并打 userHold 标）与出声后的页面暂停，均不受影响。
+    private var soundedCurrent = false
+    /** 用户亲手暂停（会话回调/通知按钮）的标记，看门狗反毒化判定用 */
+    private var userHold = false
+    /** 本首已被看门狗反毒化恢复过一次（防与其它意图拉锯） */
+    private var poisonRescued = false
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
@@ -352,6 +363,16 @@ class KeepAliveService : Service() {
         }
         // 用户暂停（无播放意图）不干预
         if (!wantPlay) {
+            // 3.1.14 反毒化兜底：当前曲还没出声、又不是用户亲手暂停，
+            // 却没有播放意图——意图是被非用户路径按掉的（入口拦截漏网
+            // 时在此兜底）。每首只恢复一次，防拉锯。
+            if (nativeActive && !soundedCurrent && !userHold && !poisonRescued) {
+                poisonRescued = true
+                try {
+                    p.play()
+                } catch (_: Exception) {
+                }
+            }
             watchdogStall = 0
             watchdogEndedStall = 0
             orphanStall = false
@@ -397,7 +418,7 @@ class KeepAliveService : Service() {
             return
         }
         // 3.1.13 孤儿重试进行中（跑道见底卡死）：期间网页若醒来补上了
-        // 预置且自救额度还在，优先跳歌续播；否则约每 60s 整条重拉一
+        // 预置且自救额度还在，优先跳歌续播；否则约每 30s 整条重拉一
         // 次并补发 error 喊网页，直到出声/接管/用户暂停（上方分支与
         // 健康分支已处理退出）。不再像旧行为那样停死等人亮屏。
         if (orphanStall) {
@@ -409,7 +430,7 @@ class KeepAliveService : Service() {
                 return
             }
             val nowMs = SystemClock.elapsedRealtime()
-            if (nowMs - orphanLastRetryMs >= 60_000L) {
+            if (nowMs - orphanLastRetryMs >= 30_000L) {
                 orphanLastRetryMs = nowMs
                 lastErrorAtMs = nowMs
                 reloadCurrentItem(orphanPos)
@@ -599,6 +620,10 @@ class KeepAliveService : Service() {
      * 是 phase-3 原生接播：播放器已经自己切到了这首，只补状态对齐。
      */
     private fun applyAdvance(item: ArmedItem, playIt: Boolean) {
+        // 3.1.14：新曲接管——出声标记/用户暂停标记/反毒化额度全部复位
+        soundedCurrent = false
+        userHold = false
+        poisonRescued = false
         // 先把曲目信息换上，锁屏卡片立刻是对的，不必等网页醒来
         if (item.title.isNotEmpty()) title = item.title
         artist = item.artist
@@ -763,6 +788,8 @@ class KeepAliveService : Service() {
                 errorRescueCount = 0
                 // 3.1.13：孤儿重试自活成功，退出
                 orphanStall = false
+                // 3.1.14：本首已真正出声，页面 pause 自此恢复正常效力
+                soundedCurrent = true
             }
             playing = isPlaying
             syncAnchorFromPlayer()
@@ -988,6 +1015,10 @@ class KeepAliveService : Service() {
         nativeUrl = url
         nativeActive = true
         playing = false
+        // 3.1.14：新装载的曲目，出声标记等复位
+        soundedCurrent = false
+        userHold = false
+        poisonRescued = false
         positionMs = 0
         anchorPosMs = 0
         anchorAtMs = SystemClock.elapsedRealtime()
@@ -1008,6 +1039,9 @@ class KeepAliveService : Service() {
         cancelErrorRescue()
         errorRescueCount = 0
         orphanStall = false
+        soundedCurrent = false
+        userHold = false
+        poisonRescued = false
         lastErrorAtMs = 0L
         lastErrorUrl = ""
         stopWatchdog()
@@ -1050,6 +1084,7 @@ class KeepAliveService : Service() {
                 // 上一首/下一首的队列在网页手里，仍转发给网页
                 override fun onPlay() {
                     if (nativeActive) {
+                        userHold = false
                         val p = player
                         // 播完后按播放：ExoPlayer 在 ENDED 单独 play() 不重启，先跳回 0
                         if (p != null && p.playbackState == Player.STATE_ENDED) {
@@ -1063,7 +1098,12 @@ class KeepAliveService : Service() {
                 }
 
                 override fun onPause() {
-                    if (nativeActive) player?.pause() else sendControl("toggle")
+                    // 3.1.14：通知/耳机/锁屏的暂停是用户亲手意图，打标后
+                    // 看门狗反毒化不会跟它抢
+                    if (nativeActive) {
+                        userHold = true
+                        player?.pause()
+                    } else sendControl("toggle")
                 }
 
                 override fun onSkipToNext() = sendControl("next")
@@ -1187,6 +1227,8 @@ class KeepAliveService : Service() {
                 errorRescueCount = 0
                 // 3.1.13：网页接管，孤儿重试退出
                 orphanStall = false
+                // 3.1.14：网页接管播放，用户暂停标记一并清除
+                userHold = false
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
                 lastAdvanceAtMs = 0L
@@ -1206,13 +1248,18 @@ class KeepAliveService : Service() {
                 // 真正的用户暂停发生在播放中（无待接播），不受影响；播完状态下
                 // 单独 pause 也没有实际意义，保留待接播，让 PLAY_URL 来接管。
                 if (pendingAdvance == null) cancelPendingAdvance()
-                // 接播后保护窗内同理：网页迟到的切歌前摇 pause 会把刚接上的
-                // 新曲按停（playWhenReady=false），而它自己的 PLAY_URL 又可能
-                // 卡在解析上永远不来——新曲就此卡在 0:00 静默。保护窗内忽略。
-                if (!inAdvanceGuard()) player?.pause()
+                // 3.1.14：当前曲还没真正出声前，页面 pause 一律不认——不
+                // 再只看保护窗时间：深冻下前摇迟到无上限，30s 窗（3.1.12）
+                // 仍会被击穿，按停后看门狗又把「无播放意图」当用户暂停、
+                // 全线自救罢工（3.1.11–3.1.13 复测的终端形态）。出声后
+                // 页面暂停恢复正常（走保护窗老逻辑）。
+                if (!soundedCurrent) {
+                    // 未出声：忽略这次页面 pause
+                } else if (!inAdvanceGuard()) player?.pause()
             }
             ACTION_NATIVE_RESUME -> {
                 if (nativeActive) {
+                    userHold = false
                     val p = player
                     if (p != null && p.playbackState == Player.STATE_IDLE && nativeUrl.isNotEmpty()) {
                         // 出错后播放器回到 IDLE，单独 play() 救不回来，整条重装
@@ -1255,7 +1302,10 @@ class KeepAliveService : Service() {
                 // 若 PLAY_URL 最终没来，待接播按预置接上，音乐不断档。
                 // 接播后保护窗同样适用：迟到的清 src 会把刚接上的新曲卸载，
                 // 而网页的重装请求可能永远不来——保护窗内忽略这次 stop。
-                if (pendingAdvance == null && !inAdvanceGuard()) stopNative()
+                // 3.1.14：未出声前页面 stop 同样不认（与 NATIVE_PAUSE 同一毒化路径）
+                if (pendingAdvance == null && !inAdvanceGuard() &&
+                    (!nativeActive || soundedCurrent)
+                ) stopNative()
             }
             ACTION_ARM_NEXT -> {
                 // 网页重新预置（或接管记账）：以新清单为准。
@@ -1327,8 +1377,16 @@ class KeepAliveService : Service() {
                             p.seekTo(0)
                         } catch (_: Exception) {
                         }
+                        userHold = false
                         p.play()
-                    } else if (p.isPlaying || p.playWhenReady) p.pause() else p.play()
+                    } else if (p.isPlaying || p.playWhenReady) {
+                        // 3.1.14：通知按钮暂停 = 用户亲手意图，打标
+                        userHold = true
+                        p.pause()
+                    } else {
+                        userHold = false
+                        p.play()
+                    }
                 } else {
                     sendControl("toggle")
                 }
