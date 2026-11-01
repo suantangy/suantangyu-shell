@@ -664,7 +664,7 @@ class KeepAliveService : Service() {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(ua)
             .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(mapOf("Referer" to "https://yinyue-bfq.pages.dev/"))
+            .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(20000)
         val attrs = AudioAttributes.Builder()
