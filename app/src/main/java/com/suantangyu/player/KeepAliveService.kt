@@ -26,6 +26,13 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
+import java.io.File
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import org.json.JSONObject
@@ -228,6 +235,29 @@ class KeepAliveService : Service() {
     private var lastErrorAtMs = 0L
     private var lastErrorUrl: String = ""
     private var pendingErrorRescue: Runnable? = null
+
+    // —— 3.1.13 预缓存：播放走 SimpleCache（200MB LRU 滚动淘汰），预置
+    // 一到就用 CacheWriter 后台把每首开头约 1.5MB 拉进缓存——起播头一
+    // 段直接读本地，不再赌切歌瞬间那条兜底 CDN 的实时速度（形态②病
+    // 根）。只下开头不下整首：省流量；中后段仍边播边下、边下边进缓存。
+    private var httpFactory: DefaultHttpDataSource.Factory? = null
+    private var audioCache: SimpleCache? = null
+    private val PRELOAD_BYTES = 1_500_000L
+    private val prefetchExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "audio-prefetch").apply { isDaemon = true }
+        }
+    private val prefetchSeen =
+        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    // —— 3.1.13 卡住不终局：跑道见底、缓冲卡死且无货可跳时不再 stop()
+    // 定终局（旧兜底还没记 lastErrorAtMs，停进 IDLE 后看门狗各分支全
+    // 绕开、永不自恢复）。改为进入孤儿重试：记账、保住播放意图、约每
+    // 60s 整条重拉一次并补发 error 喊网页；网络恢复或网页解冻任一发
+    // 生即可自活，真出声/网页接管/用户暂停即退出。
+    private var orphanStall = false
+    private var orphanLastRetryMs = 0L
+    private var orphanPos = 0L
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
@@ -258,6 +288,37 @@ class KeepAliveService : Service() {
         }
     }
 
+    /**
+     * 整条重拉当前项（换一条新连接，只作用于当前项，队列里的预置项原
+     * 样保留；mediaId 沿用当前项，接播记账的 key 身份不断）；队列为空
+     * 时整条重装。phase-3.1 起播阶梯与 3.1.13 孤儿重试共用此救法——
+     * 3.0 的 stop+seek+prepare 在多项列表下实测救不回卡住的起播。
+     */
+    private fun reloadCurrentItem(keepPos: Long) {
+        val p = player ?: return
+        try {
+            if (p.mediaItemCount == 0) {
+                if (nativeUrl.isEmpty()) return
+                p.setMediaItem(
+                    MediaItem.Builder().setUri(nativeUrl).setMediaId(nativeUrl).build()
+                )
+                p.prepare()
+                p.play()
+                return
+            }
+            val idx = p.currentMediaItemIndex
+            val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { nativeUrl }
+            p.replaceMediaItem(
+                idx,
+                MediaItem.Builder().setUri(nativeUrl).setMediaId(mid).build()
+            )
+            if (keepPos > 2000) p.seekTo(keepPos)
+            if (p.playbackState == Player.STATE_IDLE) p.prepare()
+            p.play()
+        } catch (_: Exception) {
+        }
+    }
+
     private fun watchdogTick() {
         val p = player
         if (!nativeActive || p == null || nativeUrl.isEmpty()) {
@@ -274,6 +335,7 @@ class KeepAliveService : Service() {
         if (p.isPlaying || pos > watchdogLastPos + 250) {
             watchdogStall = 0
             watchdogEndedStall = 0
+            orphanStall = false
             watchdogLastPos = pos
             return
         }
@@ -292,6 +354,7 @@ class KeepAliveService : Service() {
         if (!wantPlay) {
             watchdogStall = 0
             watchdogEndedStall = 0
+            orphanStall = false
             return
         }
         // phase-3：ENDED 后无人接播也归看门狗管。此前这条链断了没人察觉——
@@ -333,6 +396,30 @@ class KeepAliveService : Service() {
             doArmedAdvance()
             return
         }
+        // 3.1.13 孤儿重试进行中（跑道见底卡死）：期间网页若醒来补上了
+        // 预置且自救额度还在，优先跳歌续播；否则约每 60s 整条重拉一
+        // 次并补发 error 喊网页，直到出声/接管/用户暂停（上方分支与
+        // 健康分支已处理退出）。不再像旧行为那样停死等人亮屏。
+        if (orphanStall) {
+            if (armedItems.isNotEmpty() && errorRescueCount < MAX_ERROR_RESCUE) {
+                orphanStall = false
+                errorRescueCount++
+                cancelPendingAdvance()
+                doArmedAdvance()
+                return
+            }
+            val nowMs = SystemClock.elapsedRealtime()
+            if (nowMs - orphanLastRetryMs >= 60_000L) {
+                orphanLastRetryMs = nowMs
+                lastErrorAtMs = nowMs
+                reloadCurrentItem(orphanPos)
+                pushSync(
+                    JSONObject().put("t", "error").put("code", -7)
+                        .put("http", 0).put("msg", "stall orphan retry")
+                )
+            }
+            return
+        }
         // 非缓冲态（已停/空闲）不归缓冲看门狗管
         if (st != Player.STATE_BUFFERING) {
             watchdogStall = 0
@@ -341,7 +428,7 @@ class KeepAliveService : Service() {
         // phase-3.1：接播后的起播宽限——慢网下母带首缓冲常超 10s，原首击
         // 线会把「慢但活着」的起播也打断重拉、越救越糟。接播后 20s 内
         // 缓冲无进展不计卡住，宽限过后走阶梯（3.1.12：重拉、再重拉、
-        // 仍不行有预置则跳歌、无预置才停掉交网页）。
+        // 仍不行有预置则跳歌；3.1.13：无预置改入孤儿重试、不再停掉交网页）。
         if (lastAdvanceAtMs > 0L &&
             SystemClock.elapsedRealtime() - lastAdvanceAtMs < 20_000L
         ) {
@@ -358,24 +445,13 @@ class KeepAliveService : Service() {
             // 预置项原样保留；mediaId 沿用当前项的，接播记账的 key 身份
             // 不断。3.0 的 stop+seek+prepare 在多项列表下实测没把卡住的
             // 起播救回来（《洛神》彻底没声，cheng 2026-10-23 确认）。
-            val keepPos = pos
-            try {
-                val idx = p.currentMediaItemIndex
-                val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { nativeUrl }
-                p.replaceMediaItem(
-                    idx,
-                    MediaItem.Builder().setUri(nativeUrl).setMediaId(mid).build()
-                )
-                if (keepPos > 2000) p.seekTo(keepPos)
-                if (p.playbackState == Player.STATE_IDLE) p.prepare()
-                p.play()
-            } catch (_: Exception) {
-            }
+            reloadCurrentItem(pos)
         } else {
             // 3.1.12：两次重拉仍不出声——手里有预置就跳下一首续播（计入
-            // 3.1.11 报错自救的连跳上限，防坏队列连环跳）；没预置或上限
-            // 已满，才停掉播放器交网页处理（原二击行为）。熄屏时网页冻
-            // 住接不了手，先跳为敬，别让一首滴漏流堵死整条队列。
+            // 3.1.11 报错自救的连跳上限，防坏队列连环跳）；3.1.13：没预
+            // 置或上限已满不再 stop() 交网页（熄屏网页冻住接不了手、且
+            // 旧兜底停进 IDLE 后无人再管），改为记账进入孤儿重试慢速自
+            // 救，别让一首滴漏流堵死整条队列。
             watchdogStall = 0
             if (armedItems.isNotEmpty() && errorRescueCount < MAX_ERROR_RESCUE) {
                 errorRescueCount++
@@ -383,13 +459,11 @@ class KeepAliveService : Service() {
                 doArmedAdvance()
                 return
             }
-            try {
-                p.stop()
-            } catch (_: Exception) {
-            }
-            playing = false
-            updateSessionState()
-            updateNotification()
+            orphanStall = true
+            orphanLastRetryMs = SystemClock.elapsedRealtime()
+            orphanPos = pos
+            lastErrorAtMs = orphanLastRetryMs
+            lastErrorUrl = nativeUrl
             pushSync(
                 JSONObject().put("t", "error").put("code", -7)
                     .put("http", 0).put("msg", "stall watchdog: buffering made no progress")
@@ -685,7 +759,11 @@ class KeepAliveService : Service() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
             // 3.1.11：真出声了，自救连跳计数清零
-            if (isPlaying) errorRescueCount = 0
+            if (isPlaying) {
+                errorRescueCount = 0
+                // 3.1.13：孤儿重试自活成功，退出
+                orphanStall = false
+            }
             playing = isPlaying
             syncAnchorFromPlayer()
             updateSessionState()
@@ -760,27 +838,87 @@ class KeepAliveService : Service() {
         }
     }
 
-    private fun ensurePlayer(): ExoPlayer {
-        player?.let { return it }
+    /** UA/Referer 与网页 <audio> 直连一致的 HTTP 工厂（播放与预拉共用） */
+    @Synchronized
+    private fun ensureHttpFactory(): DefaultHttpDataSource.Factory {
+        httpFactory?.let { return it }
         val ua = try {
             android.webkit.WebSettings.getDefaultUserAgent(this)
         } catch (_: Exception) {
             "Mozilla/5.0 (Linux; Android)"
         }
         // 请求头尽量模拟网页 <audio> 直连时的样子，降低 CDN 因 UA/Referer 拦截的概率
-        val httpFactory = DefaultHttpDataSource.Factory()
+        val f = DefaultHttpDataSource.Factory()
             .setUserAgent(ua)
             .setAllowCrossProtocolRedirects(true)
             .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(20000)
+        httpFactory = f
+        return f
+    }
+
+    /** 播放/预拉共用的磁盘缓存（200MB LRU 滚动淘汰） */
+    @Synchronized
+    private fun ensureAudioCache(): SimpleCache {
+        audioCache?.let { return it }
+        val c = SimpleCache(
+            File(cacheDir, "audio_cache"),
+            LeastRecentlyUsedCacheEvictor(200L * 1024 * 1024),
+            StandaloneDatabaseProvider(this)
+        )
+        audioCache = c
+        return c
+    }
+
+    /** 播放数据源：先读缓存，未命中走网络、顺手写入缓存；缓存出错则直连兜底 */
+    private fun cacheDataSourceFactory(): CacheDataSource.Factory =
+        CacheDataSource.Factory()
+            .setCache(ensureAudioCache())
+            .setUpstreamDataSourceFactory(ensureHttpFactory())
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+    /**
+     * 3.1.13 预缓存：预置到达时后台（单线程、按队列顺序）把每首开头约
+     * 1.5MB 拉进缓存。已缓存够/已拉过的地址跳过；失败静默——预拉只是
+     * 抢跑，拉不到不影响正常播放路径。
+     */
+    private fun prefetchArmedHeads() {
+        val urls = armedItems.filter { !it.repeat }.map { it.url }
+        for (url in urls) {
+            if (!url.startsWith("http")) continue
+            if (prefetchSeen.size > 64) prefetchSeen.clear()
+            if (!prefetchSeen.add(url)) continue
+            prefetchExecutor.execute {
+                try {
+                    val cache = ensureAudioCache()
+                    if (cache.getCachedLength(url, 0, PRELOAD_BYTES) >= PRELOAD_BYTES) {
+                        return@execute
+                    }
+                    val spec = DataSpec.Builder()
+                        .setUri(android.net.Uri.parse(url))
+                        .setPosition(0)
+                        .setLength(PRELOAD_BYTES)
+                        .build()
+                    CacheWriter(
+                        cacheDataSourceFactory().createDataSource(), spec, null, null
+                    ).cache()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    private fun ensurePlayer(): ExoPlayer {
+        player?.let { return it }
         val attrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
         val p = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
-                DefaultMediaSourceFactory(this).setDataSourceFactory(httpFactory)
+                // 3.1.13：播放走缓存通道——预置预拉的开头直接读本地
+                DefaultMediaSourceFactory(this).setDataSourceFactory(cacheDataSourceFactory())
             )
             .setAudioAttributes(attrs, true) // 播放器自管音频焦点（抢断/恢复/降音量）
             .setHandleAudioBecomingNoisy(true) // 拔耳机自动暂停
@@ -869,6 +1007,7 @@ class KeepAliveService : Service() {
         cancelPendingAdvance()
         cancelErrorRescue()
         errorRescueCount = 0
+        orphanStall = false
         lastErrorAtMs = 0L
         lastErrorUrl = ""
         stopWatchdog()
@@ -1046,6 +1185,8 @@ class KeepAliveService : Service() {
                 // 3.1.11：报错自救同理取消并清零（网页的重试/切歌优先）
                 cancelErrorRescue()
                 errorRescueCount = 0
+                // 3.1.13：网页接管，孤儿重试退出
+                orphanStall = false
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
                 lastAdvanceAtMs = 0L
@@ -1144,6 +1285,8 @@ class KeepAliveService : Service() {
                 }
                 // phase-3：新预置清单同步进播放器队列，接播改由播放器内部完成
                 syncUpcomingToPlayer()
+                // 3.1.13：预置一到就后台预拉每首开头进缓存，起播不赌实时流速
+                prefetchArmedHeads()
             }
             ACTION_DISARM_NEXT -> {
                 // 宽限期内的 disarm 同样多来自网页切歌失败后的收尾（played=false 分支），
