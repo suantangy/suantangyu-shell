@@ -230,7 +230,9 @@ class KeepAliveService : Service() {
     // 逻辑见 scheduleErrorRescue：宽限等网页接管，无人接管才跳预置。
     /** 连续自救跳歌次数（真出声或网页接管即清零）；上限防坏地址连环跳 */
     private var errorRescueCount = 0
-    private val MAX_ERROR_RESCUE = 2
+    // 3.1.15：页面预置做深到 5 首后放宽——跑道里连着几首坏地址时能一路
+    // 跳过去，不再跳两次就见底（真出声/网页接管仍会清零计数）
+    private val MAX_ERROR_RESCUE = 4
     /** 最近一次 onPlayerError 的时刻与当时在播地址（看门狗兜底判定用） */
     private var lastErrorAtMs = 0L
     private var lastErrorUrl: String = ""
