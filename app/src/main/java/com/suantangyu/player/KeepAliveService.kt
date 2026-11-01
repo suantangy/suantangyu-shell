@@ -340,7 +340,8 @@ class KeepAliveService : Service() {
         }
         // phase-3.1：接播后的起播宽限——慢网下母带首缓冲常超 10s，原首击
         // 线会把「慢但活着」的起播也打断重拉、越救越糟。接播后 20s 内
-        // 缓冲无进展不计卡住，宽限过后恢复原节奏（首击重拉、再击报错）。
+        // 缓冲无进展不计卡住，宽限过后走阶梯（3.1.12：重拉、再重拉、
+        // 仍不行有预置则跳歌、无预置才停掉交网页）。
         if (lastAdvanceAtMs > 0L &&
             SystemClock.elapsedRealtime() - lastAdvanceAtMs < 20_000L
         ) {
@@ -348,9 +349,10 @@ class KeepAliveService : Service() {
             return
         }
         watchdogStall++
-        if (watchdogStall == 1) {
-            // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
-            // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
+        if (watchdogStall <= 2) {
+            // 3.1.12：卡住前两次都整条重拉（原为一次）——滴漏流换一条新
+            // 连接经常就能活，一次机会不够。只换当前项整条重拉（换一条
+            // 新连接），中途卡住的先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
             // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
             // 一版 43 首靠它反复救活），但只作用于当前项——队列里排着的
             // 预置项原样保留；mediaId 沿用当前项的，接播记账的 key 身份
@@ -369,10 +371,18 @@ class KeepAliveService : Service() {
                 p.play()
             } catch (_: Exception) {
             }
-        } else if (watchdogStall >= 2) {
-            // 第二次仍卡：停掉播放器（网页重试须走整条装载，别在坏连接上复用），
-            // 发 error 同步交网页的重试/换源降级链处理
+        } else {
+            // 3.1.12：两次重拉仍不出声——手里有预置就跳下一首续播（计入
+            // 3.1.11 报错自救的连跳上限，防坏队列连环跳）；没预置或上限
+            // 已满，才停掉播放器交网页处理（原二击行为）。熄屏时网页冻
+            // 住接不了手，先跳为敬，别让一首滴漏流堵死整条队列。
             watchdogStall = 0
+            if (armedItems.isNotEmpty() && errorRescueCount < MAX_ERROR_RESCUE) {
+                errorRescueCount++
+                cancelPendingAdvance()
+                doArmedAdvance()
+                return
+            }
             try {
                 p.stop()
             } catch (_: Exception) {
@@ -388,16 +398,20 @@ class KeepAliveService : Service() {
     }
 
     /**
-     * 接播后保护窗：预置接播刚完成、新曲还没起播的 10s 内，网页迟到的切歌
-     * 前摇（pause / stop / disarm）不是用户意图，而是它自己没走完的切歌流程
-     * ——照单全收会把刚接上的新曲按停/卸载，而它随后的 PLAY_URL 又可能永远
-     * 不来（phase-2.6 复测卡 0:00 的候选成因之一）。保护窗内一律忽略；
-     * 网页接管记账（PLAY_URL / ARM_NEXT 到达）即提前解除。
+     * 接播后保护窗：预置接播刚完成、新曲还没起播的 30s 内（3.1.12 由
+     * 10s 延长：熄屏深冻下网页解冻送达前摇可能远超 10s，越窗落到未出声
+     * 的新曲上按停后无人 resume），网页迟到的切歌前摇（pause / stop /
+     * disarm）不是用户意图，而是它自己没走完的切歌流程——照单全收会
+     * 把刚接上的新曲按停/卸载，而它随后的 PLAY_URL 又可能永远不来
+     * （phase-2.6 复测卡 0:00 的候选成因之一）。保护窗内一律忽略；
+     * 网页接管记账（PLAY_URL / ARM_NEXT 到达）即提前解除。窗口只在
+     * 「新曲未出声」（未 playing 且位置为 0）时成立，歌已响后用户暂停
+     * 不受影响。
      */
     private fun inAdvanceGuard(): Boolean {
         if (lastAdvanceAtMs <= 0L || playing) return false
         if (positionMs > 0L) return false
-        return SystemClock.elapsedRealtime() - lastAdvanceAtMs < 10_000L
+        return SystemClock.elapsedRealtime() - lastAdvanceAtMs < 30_000L
     }
 
     private fun cancelPendingAdvance() {
