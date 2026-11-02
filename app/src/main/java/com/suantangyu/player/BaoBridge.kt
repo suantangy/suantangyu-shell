@@ -121,7 +121,7 @@ class BaoBridge(private val context: Context, private val resolver: Boolean = fa
                 try {
                     Toast.makeText(context, "下载完成，正在安装…", Toast.LENGTH_SHORT).show()
                     val uri = FileProvider.getUriForFile(
-                        activity,
+                        context,
                         context.packageName + ".fileprovider",
                         file
                     )
