@@ -1266,17 +1266,39 @@ class KeepAliveService : Service() {
                 // 3.3.1 诊断：页面（重）加载时把引擎日志尾巴与计数推给它，
                 // toast 里能直接看到断播前最后几步发生了什么
                 try {
-                    val tail: List<String>
+                    var tail: List<String>
                     synchronized(engineLogLock) { tail = ArrayList(engineLogRing) }
-                    if (tail.isNotEmpty()) {
+                    if (tail.isEmpty()) {
+                        // 进程若被划掉重开，内存环是空的——日志文件还在，从文件取尾巴
+                        try {
+                            val f = java.io.File(filesDir, "lx_engine.log")
+                            if (f.exists()) {
+                                tail = f.readLines(Charsets.UTF_8).takeLast(8)
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                    if (tail.isEmpty()) {
                         pushSync(
                             JSONObject().put("t", "enginelog")
-                                .put("msg", "引擎状态 " + engineCounters())
+                                .put("msg", "引擎：暂无日志")
                         )
+                    } else {
                         pushSync(
                             JSONObject().put("t", "enginelog")
-                                .put("msg", tail.takeLast(4).joinToString(" ⏐ "))
+                                .put("msg", tail.last())
                         )
+                        if (tail.size > 1) {
+                            val rest = tail.dropLast(1).takeLast(3).joinToString(" ⏐ ")
+                            tickHandler.postDelayed({
+                                try {
+                                    pushSync(
+                                        JSONObject().put("t", "enginelog").put("msg", rest)
+                                    )
+                                } catch (_: Exception) {
+                                }
+                            }, 5500)
+                        }
                     }
                 } catch (_: Exception) {
                 }
