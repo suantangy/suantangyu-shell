@@ -115,6 +115,25 @@ class KeepAliveService : Service() {
                         maybeEngineResolve()
                     } catch (_: Exception) {
                     }
+                    // 3.3.1 诊断：播放器 ENDED 且跑道为空持续 10 秒 = 断播点，
+                    // 把当时的引擎计数记进日志环，页面重开时随 hello 推出
+                    try {
+                        val pNow = player
+                        if (pNow != null && pNow.playbackState == Player.STATE_ENDED &&
+                            armedItems.isEmpty()
+                        ) {
+                            val nNow = android.os.SystemClock.elapsedRealtime()
+                            if (stallSinceMs == 0L) stallSinceMs = nNow
+                            if (nNow - stallSinceMs > 10000 && !stallLogged) {
+                                stallLogged = true
+                                engineLog("引擎：断播点 " + engineCounters())
+                            }
+                        } else {
+                            stallSinceMs = 0L
+                            stallLogged = false
+                        }
+                    } catch (_: Exception) {
+                    }
                     if (playing && positionMs / 1000 != prevSec) {
                         updateSessionState()
                         updateNotification()
@@ -191,6 +210,29 @@ class KeepAliveService : Service() {
     private var queueMode: String = "seq"
     private var engine: LxEngine? = null
     private val resolveExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // 3.3.1 诊断：引擎日志内存环 + 计数器。断播点与 hello 时各推一份状态，
+    // 页面重开（postHello）即可在 toast 里看到断播前的最后日志与计数。
+    private val engineLogLock = Object()
+    private val engineLogRing = ArrayDeque<String>()
+    private var engineOkCount = 0
+    private var engineFailCount = 0
+    private var engineBatchCount = 0
+    private var stallSinceMs: Long = 0L
+    private var stallLogged = false
+
+    private fun engineCounters(): String {
+        val ok: Int
+        val f: Int
+        val b: Int
+        synchronized(engineLogLock) {
+            ok = engineOkCount
+            f = engineFailCount
+            b = engineBatchCount
+        }
+        return "批次 " + b + " 成功 " + ok + " 失败 " + f +
+            " 队列剩 " + queueAheadSongs.size + " 跑道 " + armedItems.size +
+            " 源 " + configSources.size
+    }
 
     private fun lxEngine(): LxEngine {
         var e = engine
@@ -202,6 +244,10 @@ class KeepAliveService : Service() {
     }
 
     private fun engineLog(msg: String) {
+        synchronized(engineLogLock) {
+            engineLogRing.addLast(msg)
+            while (engineLogRing.size > 14) engineLogRing.removeFirst()
+        }
         try {
             val f = java.io.File(filesDir, "lx_engine.log")
             if (f.length() > 256 * 1024) f.delete()
@@ -233,7 +279,7 @@ class KeepAliveService : Service() {
         if (armedItems.size > 1) return
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastArmAtMs < 15000) return
-        if (now - lastEngineAtMs < 10000) return
+        if (armedItems.isNotEmpty() && now - lastEngineAtMs < 10000) return
         val armedKeys = armedItems.map { it.key }.toSet()
         val ordered =
             if (queueMode == "shuffle") queueAheadSongs.shuffled() else queueAheadSongs
@@ -248,16 +294,21 @@ class KeepAliveService : Service() {
         if (todo.isEmpty()) return
         engineBusy = true
         lastEngineAtMs = now
+        synchronized(engineLogLock) { engineBatchCount++ }
         resolveExec.execute {
+            var okN = 0
+            var fN = 0
             try {
                 for (song in todo) {
                     val url = LxResolver.resolve(
                         song, configSources, configQuality, configAutoDown, lxEngine()
                     ) { m -> engineLog(m) }
                     if (url.isNullOrEmpty()) {
+                        fN++
                         engineLog("引擎解析失败：" + song.optString("name"))
                         continue
                     }
+                    okN++
                     val item = ArmedItem(
                         url, LxResolver.keyOfJson(song),
                         song.optString("name"), song.optString("artist"),
@@ -275,6 +326,11 @@ class KeepAliveService : Service() {
                             url.substringAfter("://").substringBefore("/")
                     )
                 }
+                synchronized(engineLogLock) {
+                    engineOkCount += okN
+                    engineFailCount += fN
+                }
+                engineLog("引擎批次完成 " + engineCounters())
             } catch (_: Exception) {
             } finally {
                 tickHandler.post { engineBusy = false }
@@ -1207,6 +1263,23 @@ class KeepAliveService : Service() {
                 if (armedItems.size != before) syncUpcomingToPlayer()
             }
             ACTION_HELLO -> {
+                // 3.3.1 诊断：页面（重）加载时把引擎日志尾巴与计数推给它，
+                // toast 里能直接看到断播前最后几步发生了什么
+                try {
+                    val tail: List<String>
+                    synchronized(engineLogLock) { tail = ArrayList(engineLogRing) }
+                    if (tail.isNotEmpty()) {
+                        pushSync(
+                            JSONObject().put("t", "enginelog")
+                                .put("msg", "引擎状态 " + engineCounters())
+                        )
+                        pushSync(
+                            JSONObject().put("t", "enginelog")
+                                .put("msg", tail.takeLast(4).joinToString(" ⏐ "))
+                        )
+                    }
+                } catch (_: Exception) {
+                }
                 if (nativeActive) syncAnchorFromPlayer()
                 pushSync(
                     JSONObject()

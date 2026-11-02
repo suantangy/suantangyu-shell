@@ -252,9 +252,16 @@ object LxResolver {
         engine: LxEngine?,
         log: (String) -> Unit
     ): String? {
+        // 3.3.1：单曲解析总时限 90 秒（脚本源慢调用由引擎 30 秒/次封顶，
+        // 这里再封整曲上限，防一首坏歌把单线程解析队列拖死、后面全断）
+        val deadline = System.currentTimeMillis() + 90000L
         val tiers = if (autoDown) qualityFallbacks(wantQ) else listOf(wantQ)
         for (q in tiers) {
-            val url = resolveAtQuality(song, q, sources, engine, log)
+            if (System.currentTimeMillis() > deadline) {
+                log("引擎：单曲解析超时跳过 " + song.optString("name"))
+                return null
+            }
+            val url = resolveAtQuality(song, q, sources, engine, log, deadline)
             if (url != null) return url
         }
         return null
@@ -265,7 +272,8 @@ object LxResolver {
         q: String,
         sources: List<SrcCfg>,
         engine: LxEngine?,
-        log: (String) -> Unit
+        log: (String) -> Unit,
+        deadline: Long = Long.MAX_VALUE
     ): String? {
         val mid = cleanPlayMid(song)
         if (mid.isEmpty()) return null
@@ -274,6 +282,7 @@ object LxResolver {
             s.platforms.isEmpty() || s.platforms.contains("all") || s.platforms.contains(songPlat)
         }
         for (src in chain) {
+            if (System.currentTimeMillis() > deadline) return null
             val r = try {
                 resolveBySource(src, song, q, mid, engine, log)
             } catch (e: Exception) {
