@@ -5,7 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -271,6 +276,16 @@ class KeepAliveService : Service() {
     private var userHold = false
     /** 本首已被看门狗反毒化恢复过一次（防与其它意图拉锯） */
     private var poisonRescued = false
+
+    // —— 3.1.16 探针：服务内常驻 WebView 的熄屏存活测试（结构方案一的前置验证）——
+    // 在前台服务进程里养一个不挂窗口的 WebView：每 5 秒心跳一次、每 30 秒
+    // 真发一次网络请求，全部落盘，亮/熄屏打标记。测完 MainActivity 读文件
+    // 弹窗汇总熄屏段内心跳最大间隔：间隔小 = 服务 WebView 的 JS 没被冻，
+    // 方案一（解析页常驻补仓）成立；间隔大到分钟级 = 此路不通。
+    private var probeWebView: WebView? = null
+    private var probeReceiver: BroadcastReceiver? = null
+    private val probeLock = Any()
+    @Volatile private var probeLastBeatElapsed = 0L
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
@@ -1128,9 +1143,88 @@ class KeepAliveService : Service() {
             @Suppress("DEPRECATION")
             startForeground(NOTIFY_ID, notification)
         }
+        startProbe()
+    }
+
+    private fun probeFile(): File = File(filesDir, "probe_beats.log")
+
+    private fun probeLog(line: String) {
+        try {
+            synchronized(probeLock) {
+                val f = probeFile()
+                if (f.length() > 512 * 1024) f.writeText("")
+                f.appendText(line + "\n")
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun startProbe() {
+        try {
+            probeLog("START ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
+            val wv = WebView(applicationContext)
+            wv.settings.javaScriptEnabled = true
+            try {
+                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+            } catch (_: Exception) {
+            }
+            wv.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun beat(n: Int, fetchMs: Long, fetchOk: Boolean) {
+                    val now = SystemClock.elapsedRealtime()
+                    val gap = if (probeLastBeatElapsed > 0) now - probeLastBeatElapsed else 0
+                    probeLastBeatElapsed = now
+                    probeLog("BEAT $now ${System.currentTimeMillis()} $n $gap $fetchMs $fetchOk")
+                }
+            }, "BaoProbe")
+            val html = "<html><head><meta charset=\"utf-8\"></head><body><script>" +
+                "var n = 0, lastFetch = 0, fetchMs = -1, fetchOk = false;" +
+                "setInterval(function () {" +
+                "  n++;" +
+                "  var now = Date.now();" +
+                "  if (now - lastFetch >= 30000) {" +
+                "    lastFetch = now;" +
+                "    var t0 = now;" +
+                "    fetch('https://m.858600.xyz/api/shell-release', {mode: 'no-cors', cache: 'no-store'})" +
+                "      .then(function () { fetchMs = Date.now() - t0; fetchOk = true; })" +
+                "      .catch(function () { fetchMs = Date.now() - t0; fetchOk = false; });" +
+                "  }" +
+                "  try { BaoProbe.beat(n, fetchMs, fetchOk); } catch (e) {}" +
+                "}, 5000);" +
+                "</script></body></html>"
+            wv.loadDataWithBaseURL("https://m.858600.xyz/", html, "text/html", "utf-8", null)
+            probeWebView = wv
+            val recv = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) {
+                    when (i?.action) {
+                        Intent.ACTION_SCREEN_OFF ->
+                            probeLog("SCREEN_OFF ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
+                        Intent.ACTION_SCREEN_ON ->
+                            probeLog("SCREEN_ON ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
+                    }
+                }
+            }
+            registerReceiver(recv, IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            })
+            probeReceiver = recv
+        } catch (_: Exception) {
+        }
     }
 
     override fun onDestroy() {
+        try {
+            probeReceiver?.let { unregisterReceiver(it) }
+        } catch (_: Exception) {
+        }
+        probeReceiver = null
+        try {
+            probeWebView?.destroy()
+        } catch (_: Exception) {
+        }
+        probeWebView = null
+        probeLog("STOP ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
         cancelPendingAdvance()
         stopWatchdog()
         try {

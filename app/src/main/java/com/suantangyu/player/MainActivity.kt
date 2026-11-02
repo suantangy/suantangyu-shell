@@ -13,6 +13,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import java.io.File
 import android.view.View
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -287,6 +290,105 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(
             this, Intent(this, KeepAliveService::class.java)
         )
+
+        maybeShowProbeResult()
+    }
+
+    /** 3.1.16 探针读数：汇总服务 WebView 的熄屏心跳（见 KeepAliveService.startProbe） */
+    private fun maybeShowProbeResult() {
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                val f = File(filesDir, "probe_beats.log")
+                if (!f.exists() || f.length() == 0L) return@postDelayed
+                val prefs = getSharedPreferences("probe", MODE_PRIVATE)
+                if (prefs.getLong("shown_mtime", -1L) == f.lastModified()) return@postDelayed
+                var segStart = -1L
+                var segBeats = 0
+                var segMaxGap = 0L
+                var segEnd = -1L
+                var bestDur = 0L
+                var bestBeats = 0
+                var bestMaxGap = 0L
+                var lastFetchMs = -1L
+                var lastFetchOk = false
+                var anyBeat = false
+                fun closeSeg(endElapsed: Long) {
+                    if (segStart >= 0) {
+                        val dur = endElapsed - segStart
+                        if (dur > bestDur) {
+                            bestDur = dur
+                            bestBeats = segBeats
+                            bestMaxGap = segMaxGap
+                        }
+                    }
+                    segStart = -1
+                    segBeats = 0
+                    segMaxGap = 0
+                }
+                f.forEachLine { line ->
+                    val p = line.split(" ")
+                    when (p[0]) {
+                        "SCREEN_OFF" -> {
+                            val e = p.getOrNull(1)?.toLongOrNull()
+                            if (e != null) {
+                                closeSeg(e)
+                                segStart = e
+                                segEnd = e
+                            }
+                        }
+                        "SCREEN_ON", "STOP" -> {
+                            val e = p.getOrNull(1)?.toLongOrNull()
+                            if (e != null) closeSeg(e)
+                        }
+                        "BEAT" -> if (p.size >= 7) {
+                            anyBeat = true
+                            lastFetchMs = p[5].toLongOrNull() ?: -1
+                            lastFetchOk = p[6] == "true"
+                            if (segStart >= 0) {
+                                segBeats++
+                                val gap = p[4].toLongOrNull() ?: 0
+                                if (gap > segMaxGap) segMaxGap = gap
+                                segEnd = p[1].toLongOrNull() ?: segEnd
+                            }
+                        }
+                    }
+                }
+                if (segStart >= 0 && segEnd > segStart) closeSeg(segEnd)
+                if (!anyBeat) return@postDelayed
+                val msg = StringBuilder()
+                if (bestDur >= 5 * 60 * 1000L) {
+                    msg.append("最长熄屏段：约 ").append(bestDur / 60000).append(" 分钟\n")
+                    msg.append("这段内心跳 ").append(bestBeats).append(" 次（每 5 秒一次）\n")
+                    msg.append("最大间隔：").append(String.format("%.1f", bestMaxGap / 1000.0)).append(" 秒\n")
+                    msg.append(
+                        if (bestMaxGap <= 15000) "→ JS 基本没被冻，方案一（解析页常驻补仓）可行"
+                        else if (bestMaxGap <= 60000) "→ 有节流但没冻死，截图发我细看"
+                        else "→ 间隔到分钟级，这个 WebView 也被冻了，此路不通"
+                    )
+                } else {
+                    msg.append("还没测到 ≥5 分钟的熄屏段。\n放着歌熄屏 30 分钟以上，再打开 App 看这里。")
+                }
+                if (lastFetchMs >= 0) {
+                    msg.append("\n最近一次网络请求：").append(if (lastFetchOk) "成功" else "失败")
+                        .append("（").append(lastFetchMs).append("ms）")
+                }
+                prefs.edit().putLong("shown_mtime", f.lastModified()).apply()
+                AlertDialog.Builder(this)
+                    .setTitle("解析 WebView 熄屏探针")
+                    .setMessage(msg.toString())
+                    .setPositiveButton("知道了", null)
+                    .setNegativeButton("清除重测") { _, _ ->
+                        try {
+                            f.delete()
+                        } catch (_: Exception) {
+                        }
+                        prefs.edit().remove("shown_mtime").apply()
+                        Toast.makeText(this, "探针数据已清除", Toast.LENGTH_SHORT).show()
+                    }
+                    .show()
+            } catch (_: Exception) {
+            }
+        }, 1200)
     }
 
     override fun onDestroy() {
