@@ -5,13 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.webkit.JavascriptInterface
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -32,13 +26,6 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
-import androidx.media3.database.StandaloneDatabaseProvider
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.CacheWriter
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
-import androidx.media3.datasource.cache.SimpleCache
-import java.io.File
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import org.json.JSONObject
@@ -83,10 +70,10 @@ class KeepAliveService : Service() {
         // phase-2.5 预置续播（网页提前把后续曲目交给服务，播完自动接播）
         const val ACTION_ARM_NEXT = "com.suantangyu.player.ARM_NEXT"
         const val ACTION_DISARM_NEXT = "com.suantangyu.player.DISARM_NEXT"
-        // 3.2.0 服务解析
+        // 3.3.0 原生解析：网页把音源配置与后续队列交给服务，服务用 QuickJS
+        // 引擎自己解析回填预置跑道，界面页熄屏冻结时连播不再断链
+        const val ACTION_SOURCES_CONFIG = "com.suantangyu.player.SOURCES_CONFIG"
         const val ACTION_QUEUE_AHEAD = "com.suantangyu.player.QUEUE_AHEAD"
-        const val ACTION_RESOLVED_URLS = "com.suantangyu.player.RESOLVED_URLS"
-        const val ACTION_RESOLVER_READY = "com.suantangyu.player.RESOLVER_READY"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -123,6 +110,11 @@ class KeepAliveService : Service() {
                         } catch (_: Exception) {
                         }
                     }
+                    // 3.3.0：跑道见底且网页不补仓时，壳自己解析后续歌曲回填
+                    try {
+                        maybeEngineResolve()
+                    } catch (_: Exception) {
+                    }
                     if (playing && positionMs / 1000 != prevSec) {
                         updateSessionState()
                         updateNotification()
@@ -147,7 +139,6 @@ class KeepAliveService : Service() {
                 }
             } catch (_: Exception) {
             }
-            maybeRequestResolve()
             tickHandler.postDelayed(this, 1000)
         }
     }
@@ -180,12 +171,116 @@ class KeepAliveService : Service() {
     private data class ArmedItem(
         val url: String, val key: String, val title: String,
         val artist: String, val cover: String, val repeat: Boolean,
-        /** 3.2.0：true 表示这条是服务解析回填的（界面页整单预置会整表替换掉，
-         * 队列清单换新时按册剪除也只剪这种） */
         val viaResolver: Boolean = false
     )
 
     private val armedItems = mutableListOf<ArmedItem>()
+
+    // —— 3.3.0 原生解析（QuickJS）：网页交来音源配置（SOURCES_CONFIG）与后续
+    // 队列清单（QUEUE_AHEAD）；预置跑道见底且网页迟迟不补仓（熄屏冻结）时，
+    // 壳在解析线程里自己解析后续歌曲回填跑道。引擎日志同时落盘与推给网页
+    // （enginelog 同步，网页以 toast 呈现），便于真机定位。
+    private var lastArmAtMs: Long = 0L
+    private var lastEngineAtMs: Long = 0L
+    private var engineBusy: Boolean = false
+    private var configSources: List<LxResolver.SrcCfg> = emptyList()
+    private var configQuality: String = "master"
+    private var configAutoDown: Boolean = true
+    private var lastSourcesConfigJson: String = ""
+    private var queueAheadSongs: List<org.json.JSONObject> = emptyList()
+    private var queueMode: String = "seq"
+    private var engine: LxEngine? = null
+    private val resolveExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    private fun lxEngine(): LxEngine {
+        var e = engine
+        if (e == null) {
+            e = LxEngine { m -> engineLog(m) }
+            engine = e
+        }
+        return e
+    }
+
+    private fun engineLog(msg: String) {
+        try {
+            val f = java.io.File(filesDir, "lx_engine.log")
+            if (f.length() > 256 * 1024) f.delete()
+            f.appendText(msg + "\n")
+        } catch (_: Exception) {
+        }
+        try {
+            pushSync(JSONObject().put("t", "enginelog").put("msg", msg))
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 队列清单推进：某首已成为当前曲时，它及之前的条目从清单摘除 */
+    private fun dropQueueAheadThrough(key: String) {
+        if (key.isEmpty() || queueAheadSongs.isEmpty()) return
+        val idx = queueAheadSongs.indexOfFirst { LxResolver.keyOfJson(it) == key }
+        if (idx < 0) return
+        queueAheadSongs = ArrayList(queueAheadSongs.drop(idx + 1))
+    }
+
+    /**
+     * 跑道见底时点名解析：armedItems 只剩 ≤1 且网页超过 15s 没补仓（多半是
+     * 熄屏冻结），壳自己解析清单前 3 首回填。网页活着时它总在切歌瞬间补仓，
+     * 条件天然不成立，不会与网页抢解析。
+     */
+    private fun maybeEngineResolve() {
+        if (!nativeActive || !playing || engineBusy) return
+        if (configSources.isEmpty() || queueAheadSongs.isEmpty()) return
+        if (armedItems.size > 1) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastArmAtMs < 15000) return
+        if (now - lastEngineAtMs < 10000) return
+        val armedKeys = armedItems.map { it.key }.toSet()
+        val ordered =
+            if (queueMode == "shuffle") queueAheadSongs.shuffled() else queueAheadSongs
+        val todo = ArrayList<org.json.JSONObject>()
+        for (s in ordered) {
+            if (todo.size >= 3) break
+            val k = LxResolver.keyOfJson(s)
+            if (k.isEmpty() || armedKeys.contains(k)) continue
+            if (s.optString("name").isEmpty()) continue
+            todo.add(s)
+        }
+        if (todo.isEmpty()) return
+        engineBusy = true
+        lastEngineAtMs = now
+        resolveExec.execute {
+            try {
+                for (song in todo) {
+                    val url = LxResolver.resolve(
+                        song, configSources, configQuality, configAutoDown, lxEngine()
+                    ) { m -> engineLog(m) }
+                    if (url.isNullOrEmpty()) {
+                        engineLog("引擎解析失败：" + song.optString("name"))
+                        continue
+                    }
+                    val item = ArmedItem(
+                        url, LxResolver.keyOfJson(song),
+                        song.optString("name"), song.optString("artist"),
+                        song.optString("cover").ifEmpty { song.optString("img") },
+                        false, true
+                    )
+                    tickHandler.post {
+                        if (armedItems.size < 8 && armedItems.none { it.key == item.key }) {
+                            armedItems.add(item)
+                            syncUpcomingToPlayer()
+                        }
+                    }
+                    engineLog(
+                        "引擎解析成功：" + song.optString("name") + " → " +
+                            url.substringAfter("://").substringBefore("/")
+                    )
+                }
+            } catch (_: Exception) {
+            } finally {
+                tickHandler.post { engineBusy = false }
+            }
+        }
+    }
     /** 最近一次由预置接播的曲目 key/url（hello 时告诉网页，网页据此对齐） */
     private var lastAdvancedKey: String = ""
     private var lastAdvancedUrl: String = ""
@@ -237,72 +332,6 @@ class KeepAliveService : Service() {
     private var watchdogEndedStall = 0
     /** 最近一次预置接播的时刻（elapsedRealtime）；0 = 无 */
     private var lastAdvanceAtMs = 0L
-
-    // —— 3.1.11 报错自救：播放器报错后停进 IDLE，旧行为只把 error 同步
-    // 给网页；熄屏时网页冻住收不到，就永久停死。降级播放拿到的多是兜底
-    // 档/换源签发的地址，403/过期高发，所以这个洞在降级时最明显。自救
-    // 逻辑见 scheduleErrorRescue：宽限等网页接管，无人接管才跳预置。
-    /** 连续自救跳歌次数（真出声或网页接管即清零）；上限防坏地址连环跳 */
-    private var errorRescueCount = 0
-    // 3.1.15：页面预置做深到 5 首后放宽——跑道里连着几首坏地址时能一路
-    // 跳过去，不再跳两次就见底（真出声/网页接管仍会清零计数）
-    private val MAX_ERROR_RESCUE = 4
-    /** 最近一次 onPlayerError 的时刻与当时在播地址（看门狗兜底判定用） */
-    private var lastErrorAtMs = 0L
-    private var lastErrorUrl: String = ""
-    private var pendingErrorRescue: Runnable? = null
-
-    // —— 3.1.13 预缓存：播放走 SimpleCache（200MB LRU 滚动淘汰），预置
-    // 一到就用 CacheWriter 后台把每首开头约 1.5MB 拉进缓存——起播头一
-    // 段直接读本地，不再赌切歌瞬间那条兜底 CDN 的实时速度（形态②病
-    // 根）。只下开头不下整首：省流量；中后段仍边播边下、边下边进缓存。
-    private var httpFactory: DefaultHttpDataSource.Factory? = null
-    private var audioCache: SimpleCache? = null
-    private val PRELOAD_BYTES = 1_500_000L
-    private val prefetchExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-            Thread(r, "audio-prefetch").apply { isDaemon = true }
-        }
-    private val prefetchSeen =
-        java.util.Collections.synchronizedSet(mutableSetOf<String>())
-
-    // —— 3.1.13 卡住不终局：跑道见底、缓冲卡死且无货可跳时不再 stop()
-    // 定终局（旧兜底还没记 lastErrorAtMs，停进 IDLE 后看门狗各分支全
-    // 绕开、永不自恢复）。改为进入孤儿重试：记账、保住播放意图、约每
-    // 30s 整条重拉一次并补发 error 喊网页；网络恢复或网页解冻任一发
-    // 生即可自活，真出声/网页接管/用户暂停即退出。
-    private var orphanStall = false
-    private var orphanLastRetryMs = 0L
-    private var orphanPos = 0L
-
-    // —— 3.1.14 防 pause 毒化：当前曲是否已真正出过声。页面切歌前摇的
-    // pause/stop 在深冻下迟到无上限，30s 保护窗（3.1.12）仍被击穿——
-    // 改为不看时间：首次出声前，页面来的 pause/stop 一律不认（那永远
-    // 是它自己的前摇，不是用户意图）。用户暂停走通知/耳机/锁屏（直
-    // 达播放器并打 userHold 标）与出声后的页面暂停，均不受影响。
-    private var soundedCurrent = false
-    /** 用户亲手暂停（会话回调/通知按钮）的标记，看门狗反毒化判定用 */
-    private var userHold = false
-    /** 本首已被看门狗反毒化恢复过一次（防与其它意图拉锯） */
-    private var poisonRescued = false
-
-    // —— 3.2.0 服务解析：服务进程里常驻一个解析模式的播放器页面实例 ——
-    // 界面页熄屏被可见性冻结、补仓为零（2026-11-02 实测：省电无限制也解
-    // 不了）；服务 WebView 无 Activity 绑定，同环境下只是定时器节流（最大
-    // 心跳间隔 55.4s），解析链推得动。界面页把后续队列清单交壳存档
-    // （ACTION_QUEUE_AHEAD），跑道见低时壳点名解析实例解析
-    // （window.__baoResolveRequest），结果经 ACTION_RESOLVED_URLS 按 key
-    // 合并回预置（viaResolver 标记；界面页苏醒后的整单预置仍优先）。
-    private var resolverWebView: WebView? = null
-    @Volatile private var resolverReady = false
-    private var queueAheadSongs = mutableListOf<JSONObject>()
-    private var queueAheadMode = "list"
-    private var queueAheadQuality = "flac"
-    private var resolving = false
-    private var resolveReqId = 0
-    private var resolveReqAtMs = 0L
-    private var resolveTimeouts = 0
-    private var resolverReloadAtMs = 0L
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
@@ -333,37 +362,6 @@ class KeepAliveService : Service() {
         }
     }
 
-    /**
-     * 整条重拉当前项（换一条新连接，只作用于当前项，队列里的预置项原
-     * 样保留；mediaId 沿用当前项，接播记账的 key 身份不断）；队列为空
-     * 时整条重装。phase-3.1 起播阶梯与 3.1.13 孤儿重试共用此救法——
-     * 3.0 的 stop+seek+prepare 在多项列表下实测救不回卡住的起播。
-     */
-    private fun reloadCurrentItem(keepPos: Long) {
-        val p = player ?: return
-        try {
-            if (p.mediaItemCount == 0) {
-                if (nativeUrl.isEmpty()) return
-                p.setMediaItem(
-                    MediaItem.Builder().setUri(nativeUrl).setMediaId(nativeUrl).build()
-                )
-                p.prepare()
-                p.play()
-                return
-            }
-            val idx = p.currentMediaItemIndex
-            val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { nativeUrl }
-            p.replaceMediaItem(
-                idx,
-                MediaItem.Builder().setUri(nativeUrl).setMediaId(mid).build()
-            )
-            if (keepPos > 2000) p.seekTo(keepPos)
-            if (p.playbackState == Player.STATE_IDLE) p.prepare()
-            p.play()
-        } catch (_: Exception) {
-        }
-    }
-
     private fun watchdogTick() {
         val p = player
         if (!nativeActive || p == null || nativeUrl.isEmpty()) {
@@ -380,7 +378,6 @@ class KeepAliveService : Service() {
         if (p.isPlaying || pos > watchdogLastPos + 250) {
             watchdogStall = 0
             watchdogEndedStall = 0
-            orphanStall = false
             watchdogLastPos = pos
             return
         }
@@ -397,19 +394,8 @@ class KeepAliveService : Service() {
         }
         // 用户暂停（无播放意图）不干预
         if (!wantPlay) {
-            // 3.1.14 反毒化兜底：当前曲还没出声、又不是用户亲手暂停，
-            // 却没有播放意图——意图是被非用户路径按掉的（入口拦截漏网
-            // 时在此兜底）。每首只恢复一次，防拉锯。
-            if (nativeActive && !soundedCurrent && !userHold && !poisonRescued) {
-                poisonRescued = true
-                try {
-                    p.play()
-                } catch (_: Exception) {
-                }
-            }
             watchdogStall = 0
             watchdogEndedStall = 0
-            orphanStall = false
             return
         }
         // phase-3：ENDED 后无人接播也归看门狗管。此前这条链断了没人察觉——
@@ -438,43 +424,6 @@ class KeepAliveService : Service() {
             return
         }
         watchdogEndedStall = 0
-        // 3.1.11 报错自救兜底：onPlayerError 调度的自救若没跑成（宽限内
-        // 状态抖动被拦下等），IDLE 且有近期报错、手里还有预置时在这里
-        // 补跳一次（计数与 onPlayerError 路共用，连跳上限不变）。
-        if (st == Player.STATE_IDLE && armedItems.isNotEmpty() &&
-            errorRescueCount < MAX_ERROR_RESCUE &&
-            lastErrorAtMs > 0L &&
-            SystemClock.elapsedRealtime() - lastErrorAtMs < 30_000L
-        ) {
-            errorRescueCount++
-            cancelPendingAdvance()
-            doArmedAdvance()
-            return
-        }
-        // 3.1.13 孤儿重试进行中（跑道见底卡死）：期间网页若醒来补上了
-        // 预置且自救额度还在，优先跳歌续播；否则约每 30s 整条重拉一
-        // 次并补发 error 喊网页，直到出声/接管/用户暂停（上方分支与
-        // 健康分支已处理退出）。不再像旧行为那样停死等人亮屏。
-        if (orphanStall) {
-            if (armedItems.isNotEmpty() && errorRescueCount < MAX_ERROR_RESCUE) {
-                orphanStall = false
-                errorRescueCount++
-                cancelPendingAdvance()
-                doArmedAdvance()
-                return
-            }
-            val nowMs = SystemClock.elapsedRealtime()
-            if (nowMs - orphanLastRetryMs >= 30_000L) {
-                orphanLastRetryMs = nowMs
-                lastErrorAtMs = nowMs
-                reloadCurrentItem(orphanPos)
-                pushSync(
-                    JSONObject().put("t", "error").put("code", -7)
-                        .put("http", 0).put("msg", "stall orphan retry")
-                )
-            }
-            return
-        }
         // 非缓冲态（已停/空闲）不归缓冲看门狗管
         if (st != Player.STATE_BUFFERING) {
             watchdogStall = 0
@@ -482,8 +431,7 @@ class KeepAliveService : Service() {
         }
         // phase-3.1：接播后的起播宽限——慢网下母带首缓冲常超 10s，原首击
         // 线会把「慢但活着」的起播也打断重拉、越救越糟。接播后 20s 内
-        // 缓冲无进展不计卡住，宽限过后走阶梯（3.1.12：重拉、再重拉、
-        // 仍不行有预置则跳歌；3.1.13：无预置改入孤儿重试、不再停掉交网页）。
+        // 缓冲无进展不计卡住，宽限过后恢复原节奏（首击重拉、再击报错）。
         if (lastAdvanceAtMs > 0L &&
             SystemClock.elapsedRealtime() - lastAdvanceAtMs < 20_000L
         ) {
@@ -491,34 +439,38 @@ class KeepAliveService : Service() {
             return
         }
         watchdogStall++
-        if (watchdogStall <= 2) {
-            // 3.1.12：卡住前两次都整条重拉（原为一次）——滴漏流换一条新
-            // 连接经常就能活，一次机会不够。只换当前项整条重拉（换一条
-            // 新连接），中途卡住的先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
+        if (watchdogStall == 1) {
+            // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
+            // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
             // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
             // 一版 43 首靠它反复救活），但只作用于当前项——队列里排着的
             // 预置项原样保留；mediaId 沿用当前项的，接播记账的 key 身份
             // 不断。3.0 的 stop+seek+prepare 在多项列表下实测没把卡住的
             // 起播救回来（《洛神》彻底没声，cheng 2026-10-23 确认）。
-            reloadCurrentItem(pos)
-        } else {
-            // 3.1.12：两次重拉仍不出声——手里有预置就跳下一首续播（计入
-            // 3.1.11 报错自救的连跳上限，防坏队列连环跳）；3.1.13：没预
-            // 置或上限已满不再 stop() 交网页（熄屏网页冻住接不了手、且
-            // 旧兜底停进 IDLE 后无人再管），改为记账进入孤儿重试慢速自
-            // 救，别让一首滴漏流堵死整条队列。
-            watchdogStall = 0
-            if (armedItems.isNotEmpty() && errorRescueCount < MAX_ERROR_RESCUE) {
-                errorRescueCount++
-                cancelPendingAdvance()
-                doArmedAdvance()
-                return
+            val keepPos = pos
+            try {
+                val idx = p.currentMediaItemIndex
+                val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { nativeUrl }
+                p.replaceMediaItem(
+                    idx,
+                    MediaItem.Builder().setUri(nativeUrl).setMediaId(mid).build()
+                )
+                if (keepPos > 2000) p.seekTo(keepPos)
+                if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                p.play()
+            } catch (_: Exception) {
             }
-            orphanStall = true
-            orphanLastRetryMs = SystemClock.elapsedRealtime()
-            orphanPos = pos
-            lastErrorAtMs = orphanLastRetryMs
-            lastErrorUrl = nativeUrl
+        } else if (watchdogStall >= 2) {
+            // 第二次仍卡：停掉播放器（网页重试须走整条装载，别在坏连接上复用），
+            // 发 error 同步交网页的重试/换源降级链处理
+            watchdogStall = 0
+            try {
+                p.stop()
+            } catch (_: Exception) {
+            }
+            playing = false
+            updateSessionState()
+            updateNotification()
             pushSync(
                 JSONObject().put("t", "error").put("code", -7)
                     .put("http", 0).put("msg", "stall watchdog: buffering made no progress")
@@ -527,20 +479,16 @@ class KeepAliveService : Service() {
     }
 
     /**
-     * 接播后保护窗：预置接播刚完成、新曲还没起播的 30s 内（3.1.12 由
-     * 10s 延长：熄屏深冻下网页解冻送达前摇可能远超 10s，越窗落到未出声
-     * 的新曲上按停后无人 resume），网页迟到的切歌前摇（pause / stop /
-     * disarm）不是用户意图，而是它自己没走完的切歌流程——照单全收会
-     * 把刚接上的新曲按停/卸载，而它随后的 PLAY_URL 又可能永远不来
-     * （phase-2.6 复测卡 0:00 的候选成因之一）。保护窗内一律忽略；
-     * 网页接管记账（PLAY_URL / ARM_NEXT 到达）即提前解除。窗口只在
-     * 「新曲未出声」（未 playing 且位置为 0）时成立，歌已响后用户暂停
-     * 不受影响。
+     * 接播后保护窗：预置接播刚完成、新曲还没起播的 10s 内，网页迟到的切歌
+     * 前摇（pause / stop / disarm）不是用户意图，而是它自己没走完的切歌流程
+     * ——照单全收会把刚接上的新曲按停/卸载，而它随后的 PLAY_URL 又可能永远
+     * 不来（phase-2.6 复测卡 0:00 的候选成因之一）。保护窗内一律忽略；
+     * 网页接管记账（PLAY_URL / ARM_NEXT 到达）即提前解除。
      */
     private fun inAdvanceGuard(): Boolean {
         if (lastAdvanceAtMs <= 0L || playing) return false
         if (positionMs > 0L) return false
-        return SystemClock.elapsedRealtime() - lastAdvanceAtMs < 30_000L
+        return SystemClock.elapsedRealtime() - lastAdvanceAtMs < 10_000L
     }
 
     private fun cancelPendingAdvance() {
@@ -552,68 +500,6 @@ class KeepAliveService : Service() {
         }
         pendingAdvance = null
         releaseGraceWakeLock()
-    }
-
-    private fun cancelErrorRescue() {
-        pendingErrorRescue?.let {
-            try {
-                graceHandler.removeCallbacks(it)
-            } catch (_: Exception) {
-            }
-        }
-        pendingErrorRescue = null
-        // 宽限锁与待接播共用一个：还有待接播挂着时别把它的锁放掉
-        if (pendingAdvance == null) releaseGraceWakeLock()
-    }
-
-    /**
-     * 3.1.11 报错自救调度：报错后先等 4s——网页醒着会自己重试/换源，
-     * PLAY_URL 一到即取消自救并清零计数（cancelErrorRescue 在该指令处
-     * 调用）；4s 后仍无人接管、手里有预置，才由服务自己跳到下一首
-     * 预置续播（走 doArmedAdvance 的统一接播记账，网页醒来照常对齐）。
-     * 等待期间持宽限 WakeLock，防 CPU 睡死把计时冻住（同宽限接播）。
-     */
-    private fun scheduleErrorRescue() {
-        if (errorRescueCount >= MAX_ERROR_RESCUE) return
-        if (armedItems.isEmpty()) return
-        val wantPlay = try {
-            player?.playWhenReady
-        } catch (_: Exception) {
-            null
-        }
-        if (wantPlay != true) return
-        cancelErrorRescue()
-        acquireGraceWakeLock()
-        val r = Runnable { runErrorRescue() }
-        pendingErrorRescue = r
-        graceHandler.postDelayed(r, 4000)
-    }
-
-    private fun runErrorRescue() {
-        pendingErrorRescue = null
-        if (pendingAdvance == null) releaseGraceWakeLock()
-        if (!nativeActive) return
-        if (errorRescueCount >= MAX_ERROR_RESCUE) return
-        if (armedItems.isEmpty()) return
-        // 网页已接管（换了新地址重试/切歌）就不插手
-        if (nativeUrl != lastErrorUrl) return
-        val p = player ?: return
-        val wantPlay = try {
-            p.playWhenReady
-        } catch (_: Exception) {
-            false
-        }
-        if (!wantPlay) return
-        val st = try {
-            p.playbackState
-        } catch (_: Exception) {
-            Player.STATE_IDLE
-        }
-        // 网页的重试已让播放器重新缓冲/就绪，自救让路
-        if (st != Player.STATE_IDLE) return
-        errorRescueCount++
-        cancelPendingAdvance()
-        doArmedAdvance()
     }
 
     private fun scheduleArmedAdvance() {
@@ -644,6 +530,7 @@ class KeepAliveService : Service() {
             return
         }
         armedItems.removeAt(0)
+        dropQueueAheadThrough(item.key)
         applyAdvance(item, playIt = true)
     }
 
@@ -654,12 +541,6 @@ class KeepAliveService : Service() {
      * 是 phase-3 原生接播：播放器已经自己切到了这首，只补状态对齐。
      */
     private fun applyAdvance(item: ArmedItem, playIt: Boolean) {
-        // 3.1.14：新曲接管——出声标记/用户暂停标记/反毒化额度全部复位
-        soundedCurrent = false
-        userHold = false
-        poisonRescued = false
-        // 3.2.0：待解析清单的头部随接播消费（已播过的摘掉，防重复点名）
-        dropQueueAheadThrough(item.key)
         // 先把曲目信息换上，锁屏卡片立刻是对的，不必等网页醒来
         if (item.title.isNotEmpty()) title = item.title
         artist = item.artist
@@ -808,6 +689,7 @@ class KeepAliveService : Service() {
         val item = armedItems[idx]
         if (item.repeat) return
         repeat(idx + 1) { if (armedItems.isNotEmpty()) armedItems.removeAt(0) }
+        dropQueueAheadThrough(item.key)
         applyAdvance(item, playIt = false)
     }
 
@@ -819,14 +701,6 @@ class KeepAliveService : Service() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
-            // 3.1.11：真出声了，自救连跳计数清零
-            if (isPlaying) {
-                errorRescueCount = 0
-                // 3.1.13：孤儿重试自活成功，退出
-                orphanStall = false
-                // 3.1.14：本首已真正出声，页面 pause 自此恢复正常效力
-                soundedCurrent = true
-            }
             playing = isPlaying
             syncAnchorFromPlayer()
             updateSessionState()
@@ -894,94 +768,30 @@ class KeepAliveService : Service() {
                     .put("http", httpCode)
                     .put("msg", (error.message ?: "").take(120))
             )
-            // 3.1.11：记下这次报错并调度自救（宽限后网页没接管才跳预置）
-            lastErrorAtMs = SystemClock.elapsedRealtime()
-            lastErrorUrl = nativeUrl
-            scheduleErrorRescue()
         }
     }
 
-    /** UA/Referer 与网页 <audio> 直连一致的 HTTP 工厂（播放与预拉共用） */
-    @Synchronized
-    private fun ensureHttpFactory(): DefaultHttpDataSource.Factory {
-        httpFactory?.let { return it }
+    private fun ensurePlayer(): ExoPlayer {
+        player?.let { return it }
         val ua = try {
             android.webkit.WebSettings.getDefaultUserAgent(this)
         } catch (_: Exception) {
             "Mozilla/5.0 (Linux; Android)"
         }
         // 请求头尽量模拟网页 <audio> 直连时的样子，降低 CDN 因 UA/Referer 拦截的概率
-        val f = DefaultHttpDataSource.Factory()
+        val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(ua)
             .setAllowCrossProtocolRedirects(true)
             .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
             .setConnectTimeoutMs(15000)
             .setReadTimeoutMs(20000)
-        httpFactory = f
-        return f
-    }
-
-    /** 播放/预拉共用的磁盘缓存（200MB LRU 滚动淘汰） */
-    @Synchronized
-    private fun ensureAudioCache(): SimpleCache {
-        audioCache?.let { return it }
-        val c = SimpleCache(
-            File(cacheDir, "audio_cache"),
-            LeastRecentlyUsedCacheEvictor(200L * 1024 * 1024),
-            StandaloneDatabaseProvider(this)
-        )
-        audioCache = c
-        return c
-    }
-
-    /** 播放数据源：先读缓存，未命中走网络、顺手写入缓存；缓存出错则直连兜底 */
-    private fun cacheDataSourceFactory(): CacheDataSource.Factory =
-        CacheDataSource.Factory()
-            .setCache(ensureAudioCache())
-            .setUpstreamDataSourceFactory(ensureHttpFactory())
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-
-    /**
-     * 3.1.13 预缓存：预置到达时后台（单线程、按队列顺序）把每首开头约
-     * 1.5MB 拉进缓存。已缓存够/已拉过的地址跳过；失败静默——预拉只是
-     * 抢跑，拉不到不影响正常播放路径。
-     */
-    private fun prefetchArmedHeads() {
-        val urls = armedItems.filter { !it.repeat }.map { it.url }
-        for (url in urls) {
-            if (!url.startsWith("http")) continue
-            if (prefetchSeen.size > 64) prefetchSeen.clear()
-            if (!prefetchSeen.add(url)) continue
-            prefetchExecutor.execute {
-                try {
-                    val cache = ensureAudioCache()
-                    if (cache.getCachedLength(url, 0, PRELOAD_BYTES) >= PRELOAD_BYTES) {
-                        return@execute
-                    }
-                    val spec = DataSpec.Builder()
-                        .setUri(android.net.Uri.parse(url))
-                        .setPosition(0)
-                        .setLength(PRELOAD_BYTES)
-                        .build()
-                    CacheWriter(
-                        cacheDataSourceFactory().createDataSource(), spec, null, null
-                    ).cache()
-                } catch (_: Exception) {
-                }
-            }
-        }
-    }
-
-    private fun ensurePlayer(): ExoPlayer {
-        player?.let { return it }
         val attrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
         val p = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
-                // 3.1.13：播放走缓存通道——预置预拉的开头直接读本地
-                DefaultMediaSourceFactory(this).setDataSourceFactory(cacheDataSourceFactory())
+                DefaultMediaSourceFactory(this).setDataSourceFactory(httpFactory)
             )
             .setAudioAttributes(attrs, true) // 播放器自管音频焦点（抢断/恢复/降音量）
             .setHandleAudioBecomingNoisy(true) // 拔耳机自动暂停
@@ -1051,10 +861,6 @@ class KeepAliveService : Service() {
         nativeUrl = url
         nativeActive = true
         playing = false
-        // 3.1.14：新装载的曲目，出声标记等复位
-        soundedCurrent = false
-        userHold = false
-        poisonRescued = false
         positionMs = 0
         anchorPosMs = 0
         anchorAtMs = SystemClock.elapsedRealtime()
@@ -1072,14 +878,6 @@ class KeepAliveService : Service() {
 
     private fun stopNative() {
         cancelPendingAdvance()
-        cancelErrorRescue()
-        errorRescueCount = 0
-        orphanStall = false
-        soundedCurrent = false
-        userHold = false
-        poisonRescued = false
-        lastErrorAtMs = 0L
-        lastErrorUrl = ""
         stopWatchdog()
         lastAdvanceAtMs = 0L
         armedItems.clear()
@@ -1120,7 +918,6 @@ class KeepAliveService : Service() {
                 // 上一首/下一首的队列在网页手里，仍转发给网页
                 override fun onPlay() {
                     if (nativeActive) {
-                        userHold = false
                         val p = player
                         // 播完后按播放：ExoPlayer 在 ENDED 单独 play() 不重启，先跳回 0
                         if (p != null && p.playbackState == Player.STATE_ENDED) {
@@ -1134,12 +931,7 @@ class KeepAliveService : Service() {
                 }
 
                 override fun onPause() {
-                    // 3.1.14：通知/耳机/锁屏的暂停是用户亲手意图，打标后
-                    // 看门狗反毒化不会跟它抢
-                    if (nativeActive) {
-                        userHold = true
-                        player?.pause()
-                    } else sendControl("toggle")
+                    if (nativeActive) player?.pause() else sendControl("toggle")
                 }
 
                 override fun onSkipToNext() = sendControl("next")
@@ -1162,147 +954,19 @@ class KeepAliveService : Service() {
             @Suppress("DEPRECATION")
             startForeground(NOTIFY_ID, notification)
         }
-        startResolver()
-    }
-
-    private fun startResolver() {
-        createResolverWebView()
-    }
-
-    private fun createResolverWebView() {
-        try {
-            val wv = WebView(applicationContext)
-            with(wv.settings) {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                mediaPlaybackRequiresUserGesture = true
-            }
-            try {
-                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-            } catch (_: Exception) {
-            }
-            // 解析实例专用桥（resolver=true）：除 postResolvedUrls /
-            // postResolverReady 外其余方法在桥内一律不认——它的播放器页面
-            // 无论干什么都污染不到通知、会话与预置
-            wv.addJavascriptInterface(BaoBridge(applicationContext, resolver = true), "BaoBus")
-            wv.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView, url: String) {
-                    super.onPageFinished(view, url)
-                    // 主脚本已跑完（解析入口在主脚本内定义）即可接活；
-                    // 页面自己还会再发一次 postResolverReady，双保险
-                    resolverReady = true
-                }
-
-                override fun onRenderProcessGone(
-                    view: WebView,
-                    detail: android.webkit.RenderProcessGoneDetail?
-                ): Boolean {
-                    resolverReady = false
-                    if (resolverWebView === view) {
-                        tickHandler.postDelayed({
-                            if (resolverWebView === view) {
-                                try {
-                                    view.destroy()
-                                } catch (_: Exception) {
-                                }
-                                createResolverWebView()
-                            }
-                        }, 3000)
-                    }
-                    return true
-                }
-            }
-            resolverWebView = wv
-            resolverReady = false
-            wv.loadUrl("https://m.858600.xyz/?resolver=1")
-        } catch (_: Exception) {
-        }
-    }
-
-    /** 解析实例连续两次请求超时：重建它（带 5 分钟冷却，防反复重建风暴） */
-    private fun reloadResolver() {
-        val now = SystemClock.elapsedRealtime()
-        if (now - resolverReloadAtMs < 5 * 60 * 1000) return
-        resolverReloadAtMs = now
-        try {
-            resolverWebView?.destroy()
-        } catch (_: Exception) {
-        }
-        resolverWebView = null
-        resolverReady = false
-        createResolverWebView()
-    }
-
-    /** 清单里某首歌的 key（与网页 keyOf 同规则：songmid||id + "|" + name） */
-    private fun keyOfJson(o: JSONObject): String {
-        val mid = o.optString("songmid").ifEmpty { o.optString("id") }
-        return mid + "|" + o.optString("name")
-    }
-
-    /** 原生接播消费清单头部：已播过的（含当前这首）从待解析清单里摘掉 */
-    private fun dropQueueAheadThrough(key: String) {
-        if (key.isEmpty()) return
-        try {
-            val idx = queueAheadSongs.indexOfFirst { keyOfJson(it) == key }
-            if (idx >= 0) {
-                queueAheadSongs = queueAheadSongs.drop(idx + 1).toMutableList()
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    /** 跑道见低时向解析实例点名下一批（tick 每秒调；内部有在飞/节流守卫） */
-    private fun maybeRequestResolve() {
-        try {
-            if (!nativeActive || player == null) return
-            if (resolving) {
-                if (SystemClock.elapsedRealtime() - resolveReqAtMs > 90000) {
-                    resolving = false
-                    resolveTimeouts++
-                    if (resolveTimeouts >= 2) {
-                        resolveTimeouts = 0
-                        reloadResolver()
-                    }
-                } else return
-            }
-            if (!resolverReady || resolverWebView == null) return
-            if (armedItems.size > 2) return
-            if (queueAheadSongs.isEmpty()) return
-            val now = SystemClock.elapsedRealtime()
-            if (now - resolveReqAtMs < 15000) return
-            val armedKeys = armedItems.map { it.key }.toHashSet()
-            val pool = queueAheadSongs.toList()
-            val ordered = if (queueAheadMode == "shuffle") pool.shuffled() else pool
-            val batch = mutableListOf<JSONObject>()
-            for (o in ordered) {
-                if (batch.size >= 5) break
-                if (keyOfJson(o) in armedKeys) continue
-                batch.add(o)
-            }
-            if (batch.isEmpty()) return
-            val req = JSONObject()
-                .put("id", ++resolveReqId)
-                .put("quality", queueAheadQuality)
-                .put("songs", org.json.JSONArray(batch.toList()))
-            resolving = true
-            resolveReqAtMs = now
-            val js = "window.__baoResolveRequest && window.__baoResolveRequest(" +
-                JSONObject.quote(req.toString()) + ")"
-            resolverWebView?.evaluateJavascript(js, null)
-        } catch (_: Exception) {
-        }
     }
 
     override fun onDestroy() {
+        cancelPendingAdvance()
         try {
-            resolverWebView?.destroy()
+            engine?.shutdown()
         } catch (_: Exception) {
         }
-        resolverWebView = null
-        resolverReady = false
-        cancelPendingAdvance()
+        engine = null
+        try {
+            resolveExec.shutdownNow()
+        } catch (_: Exception) {
+        }
         stopWatchdog()
         try {
             tickHandler.removeCallbacks(tickRunnable)
@@ -1395,13 +1059,6 @@ class KeepAliveService : Service() {
             ACTION_PLAY_URL -> {
                 // 网页自己接上了：预置接播取消，记账权回到网页
                 cancelPendingAdvance()
-                // 3.1.11：报错自救同理取消并清零（网页的重试/切歌优先）
-                cancelErrorRescue()
-                errorRescueCount = 0
-                // 3.1.13：网页接管，孤儿重试退出
-                orphanStall = false
-                // 3.1.14：网页接管播放，用户暂停标记一并清除
-                userHold = false
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
                 lastAdvanceAtMs = 0L
@@ -1421,18 +1078,13 @@ class KeepAliveService : Service() {
                 // 真正的用户暂停发生在播放中（无待接播），不受影响；播完状态下
                 // 单独 pause 也没有实际意义，保留待接播，让 PLAY_URL 来接管。
                 if (pendingAdvance == null) cancelPendingAdvance()
-                // 3.1.14：当前曲还没真正出声前，页面 pause 一律不认——不
-                // 再只看保护窗时间：深冻下前摇迟到无上限，30s 窗（3.1.12）
-                // 仍会被击穿，按停后看门狗又把「无播放意图」当用户暂停、
-                // 全线自救罢工（3.1.11–3.1.13 复测的终端形态）。出声后
-                // 页面暂停恢复正常（走保护窗老逻辑）。
-                if (!soundedCurrent) {
-                    // 未出声：忽略这次页面 pause
-                } else if (!inAdvanceGuard()) player?.pause()
+                // 接播后保护窗内同理：网页迟到的切歌前摇 pause 会把刚接上的
+                // 新曲按停（playWhenReady=false），而它自己的 PLAY_URL 又可能
+                // 卡在解析上永远不来——新曲就此卡在 0:00 静默。保护窗内忽略。
+                if (!inAdvanceGuard()) player?.pause()
             }
             ACTION_NATIVE_RESUME -> {
                 if (nativeActive) {
-                    userHold = false
                     val p = player
                     if (p != null && p.playbackState == Player.STATE_IDLE && nativeUrl.isNotEmpty()) {
                         // 出错后播放器回到 IDLE，单独 play() 救不回来，整条重装
@@ -1475,16 +1127,14 @@ class KeepAliveService : Service() {
                 // 若 PLAY_URL 最终没来，待接播按预置接上，音乐不断档。
                 // 接播后保护窗同样适用：迟到的清 src 会把刚接上的新曲卸载，
                 // 而网页的重装请求可能永远不来——保护窗内忽略这次 stop。
-                // 3.1.14：未出声前页面 stop 同样不认（与 NATIVE_PAUSE 同一毒化路径）
-                if (pendingAdvance == null && !inAdvanceGuard() &&
-                    (!nativeActive || soundedCurrent)
-                ) stopNative()
+                if (pendingAdvance == null && !inAdvanceGuard()) stopNative()
             }
             ACTION_ARM_NEXT -> {
                 // 网页重新预置（或接管记账）：以新清单为准。
                 // 但宽限期内（已播完正等待接播）不要取消待接播计时——doArmedAdvance
                 // 在触发时才读清单，换上新清单即可；取消计时等于白等一首歌的时间。
                 if (pendingAdvance == null) cancelPendingAdvance()
+                lastArmAtMs = android.os.SystemClock.elapsedRealtime()
                 lastAdvancedKey = ""
                 lastAdvancedUrl = ""
                 lastAdvanceAtMs = 0L
@@ -1508,8 +1158,6 @@ class KeepAliveService : Service() {
                 }
                 // phase-3：新预置清单同步进播放器队列，接播改由播放器内部完成
                 syncUpcomingToPlayer()
-                // 3.1.13：预置一到就后台预拉每首开头进缓存，起播不赌实时流速
-                prefetchArmedHeads()
             }
             ACTION_DISARM_NEXT -> {
                 // 宽限期内的 disarm 同样多来自网页切歌失败后的收尾（played=false 分支），
@@ -1518,72 +1166,45 @@ class KeepAliveService : Service() {
                 if (pendingAdvance == null && !inAdvanceGuard()) {
                     cancelPendingAdvance()
                     armedItems.clear()
-                    queueAheadSongs.clear()
+                    queueAheadSongs = emptyList()
                     // 预置已撤，播放器队列里排着的后续项一并撤下，防它照旧接播
                     syncUpcomingToPlayer()
                 }
             }
+            ACTION_SOURCES_CONFIG -> {
+                val json = intent.getStringExtra("json") ?: ""
+                if (json.isNotEmpty() && json != lastSourcesConfigJson) {
+                    lastSourcesConfigJson = json
+                    try {
+                        val cfg = JSONObject(json)
+                        configQuality = cfg.optString("quality").ifEmpty { "master" }
+                        configAutoDown = cfg.optBoolean("autoDowngrade", true)
+                    } catch (_: Exception) {
+                    }
+                    configSources = LxResolver.parseSources(json)
+                    lxEngine().configure(configSources.filter { it.isScript() })
+                    engineLog("引擎：已接收音源配置 " + configSources.size + " 个源")
+                }
+            }
             ACTION_QUEUE_AHEAD -> {
-                // 界面页交来的后续队列清单（解析点名册）：换新册时顺手剪掉
-                // 解析回填、却已不在新册里的预置——队列被编辑过时，防播到
-                // 已被删掉的歌；界面页自己的预置不在此列（它整单覆盖）
+                queueMode = intent.getStringExtra("mode") ?: queueMode
+                val raw = intent.getStringExtra("json") ?: "[]"
+                val list = ArrayList<org.json.JSONObject>()
                 try {
-                    val o = JSONObject(intent.getStringExtra("json") ?: "{}")
-                    val arr = o.optJSONArray("songs")
-                    val list = mutableListOf<JSONObject>()
-                    if (arr != null) {
-                        for (i in 0 until arr.length()) {
-                            arr.optJSONObject(i)?.let { list.add(it) }
-                        }
-                    }
-                    queueAheadSongs = list
-                    queueAheadMode = o.optString("mode", "list").ifEmpty { "list" }
-                    queueAheadQuality = o.optString("quality", "flac").ifEmpty { "flac" }
-                    val keepKeys = list.map { keyOfJson(it) }.toHashSet()
-                    val before = armedItems.size
-                    armedItems.removeAll { it.viaResolver && it.key !in keepKeys }
-                    if (armedItems.size != before) syncUpcomingToPlayer()
-                } catch (_: Exception) {
-                }
-            }
-            ACTION_RESOLVED_URLS -> {
-                // 解析实例回传：只收点名册里有、且还没预置的，按回传序追加
-                // 到跑道尾（与册序一致），上限 8 首；随后同步播放器队列、
-                // 预拉开头，与界面页预置走同一套后续处理
-                resolving = false
-                try {
-                    val o = JSONObject(intent.getStringExtra("json") ?: "{}")
-                    val arr = o.optJSONArray("results")
-                    if (arr != null) {
-                        val armedKeys = armedItems.map { it.key }.toHashSet()
-                        val aheadKeys = queueAheadSongs.map { keyOfJson(it) }.toHashSet()
-                        var added = false
-                        for (i in 0 until arr.length()) {
-                            val r = arr.optJSONObject(i) ?: continue
-                            val u = r.optString("u")
-                            val k = r.optString("k")
-                            if (!u.startsWith("http")) continue
-                            if (k in armedKeys || k !in aheadKeys) continue
-                            if (armedItems.size >= 8) break
-                            armedItems.add(
-                                ArmedItem(
-                                    u, k, r.optString("t"), r.optString("a"),
-                                    r.optString("c"), false, viaResolver = true
-                                )
-                            )
-                            added = true
-                        }
-                        if (added) {
-                            resolveTimeouts = 0
-                            syncUpcomingToPlayer()
-                            prefetchArmedHeads()
-                        }
+                    val arr = org.json.JSONArray(raw)
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        list.add(o)
                     }
                 } catch (_: Exception) {
                 }
-            }
-            ACTION_RESOLVER_READY -> {
-                resolverReady = true
+                queueAheadSongs = list
+                // 队列变了：壳解析回填的预置若已不在新队列里，撤掉防播错歌
+                val before = armedItems.size
+                armedItems.removeAll {
+                    it.viaResolver && list.none { s -> LxResolver.keyOfJson(s) == it.key }
+                }
+                if (armedItems.size != before) syncUpcomingToPlayer()
             }
             ACTION_HELLO -> {
                 if (nativeActive) syncAnchorFromPlayer()
@@ -1613,16 +1234,8 @@ class KeepAliveService : Service() {
                             p.seekTo(0)
                         } catch (_: Exception) {
                         }
-                        userHold = false
                         p.play()
-                    } else if (p.isPlaying || p.playWhenReady) {
-                        // 3.1.14：通知按钮暂停 = 用户亲手意图，打标
-                        userHold = true
-                        p.pause()
-                    } else {
-                        userHold = false
-                        p.play()
-                    }
+                    } else if (p.isPlaying || p.playWhenReady) p.pause() else p.play()
                 } else {
                     sendControl("toggle")
                 }

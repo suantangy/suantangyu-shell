@@ -11,8 +11,8 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 18
-        versionName = "3.2.0"
+        versionCode = 19
+        versionName = "3.3.0"
     }
 
     // 固定签名：工作流把 Secrets 里的固定 keystore 还原成 app/debug.keystore 时，debug 构建就用它签，
@@ -56,6 +56,6 @@ dependencies {
     // phase-2 原生播放：ExoPlayer 在前台服务里解码，音频脱离 WebView
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
-    // 3.1.13 预缓存：SimpleCache 的 StandaloneDatabaseProvider
-    implementation("androidx.media3:media3-database:1.4.1")
+    // 3.3.0 原生解析：QuickJS 引擎（LX 音源脚本在服务内运行，不依赖 WebView）
+    implementation("wang.harlon.quickjs:wrapper-android:3.2.3")
 }

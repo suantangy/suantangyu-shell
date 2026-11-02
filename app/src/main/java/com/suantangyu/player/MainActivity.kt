@@ -287,7 +287,6 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(
             this, Intent(this, KeepAliveService::class.java)
         )
-
     }
 
     override fun onDestroy() {
