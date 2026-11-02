@@ -1,6 +1,9 @@
 package com.suantangyu.player
 
+import android.content.Context
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -16,7 +19,9 @@ import java.net.URL
  * 网页 → 原生的桥。网页里调用 window.BaoBus.postTrack / postState
  * （接线方法见 web/bridge-snippet.js）。
  */
-class BaoBridge(private val activity: MainActivity) {
+class BaoBridge(private val context: Context, private val resolver: Boolean = false) {
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     /** 设置页只显示壳版本：网页通过它读取壳的 versionName（3.1.1 起），网页自身版本不再显示 */
     @JavascriptInterface
@@ -27,11 +32,12 @@ class BaoBridge(private val activity: MainActivity) {
     /** 检查更新发现新版本时：用系统浏览器打开 Release 下载页（WebView 自身不处理 APK 下载） */
     @JavascriptInterface
     fun openExternalUrl(url: String) {
+        if (resolver) return
         try {
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            activity.startActivity(intent)
+            context.startActivity(intent)
         } catch (_: Exception) {
         }
     }
@@ -41,6 +47,7 @@ class BaoBridge(private val activity: MainActivity) {
      * 首次需用户在设置里给本 App 开“允许安装未知应用”，未开时只跳设置、请用户再点一次下载，不静默失败。 */
     @JavascriptInterface
     fun downloadAndInstall(apkUrl: String, releaseUrl: String) {
+        if (resolver) return
         val apk = apkUrl.trim()
         val rel = releaseUrl.trim().ifEmpty {
             // 从直链推导 Release 页：.../releases/download/<tag>/app-debug.apk → .../releases/tag/<tag>
@@ -52,24 +59,24 @@ class BaoBridge(private val activity: MainActivity) {
         }
         // 未授权安装未知应用：跳设置，用户开完回来再点一次下载
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            !activity.packageManager.canRequestPackageInstalls()
+            !context.packageManager.canRequestPackageInstalls()
         ) {
-            activity.runOnUiThread {
+            mainHandler.post {
                 try {
-                    Toast.makeText(activity, "请开启允许安装未知应用，开启后请再次点击下载", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "请开启允许安装未知应用，开启后请再次点击下载", Toast.LENGTH_LONG).show()
                     val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                        data = Uri.parse("package:" + activity.packageName)
+                        data = Uri.parse("package:" + context.packageName)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                    activity.startActivity(intent)
+                    context.startActivity(intent)
                 } catch (_: Exception) {
                     openExternalUrl(rel)
                 }
             }
             return
         }
-        activity.runOnUiThread {
-            try { Toast.makeText(activity, "正在下载更新…", Toast.LENGTH_SHORT).show() } catch (_: Exception) {}
+        mainHandler.post {
+            try { Toast.makeText(context, "正在下载更新…", Toast.LENGTH_SHORT).show() } catch (_: Exception) {}
         }
         Thread {
             // 先试传入的地址（一般是 gh-proxy 直链），失败再试去掉 gh-proxy 前缀的直连地址
@@ -79,7 +86,7 @@ class BaoBridge(private val activity: MainActivity) {
             var downloaded: File? = null
             for (candidate in candidates) {
                 try {
-                    val file = File(activity.cacheDir, "update.apk")
+                    val file = File(context.cacheDir, "update.apk")
                     if (file.exists()) file.delete()
                     val conn = URL(candidate).openConnection() as HttpURLConnection
                     conn.instanceFollowRedirects = true
@@ -104,18 +111,18 @@ class BaoBridge(private val activity: MainActivity) {
             }
             val file = downloaded
             if (file == null) {
-                activity.runOnUiThread {
-                    try { Toast.makeText(activity, "下载失败，已改用浏览器下载", Toast.LENGTH_LONG).show() } catch (_: Exception) {}
+                mainHandler.post {
+                    try { Toast.makeText(context, "下载失败，已改用浏览器下载", Toast.LENGTH_LONG).show() } catch (_: Exception) {}
                     openExternalUrl(rel)
                 }
                 return@Thread
             }
-            activity.runOnUiThread {
+            mainHandler.post {
                 try {
-                    Toast.makeText(activity, "下载完成，正在安装…", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "下载完成，正在安装…", Toast.LENGTH_SHORT).show()
                     val uri = FileProvider.getUriForFile(
                         activity,
-                        activity.packageName + ".fileprovider",
+                        context.packageName + ".fileprovider",
                         file
                     )
                     val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -123,7 +130,7 @@ class BaoBridge(private val activity: MainActivity) {
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                    activity.startActivity(intent)
+                    context.startActivity(intent)
                 } catch (_: Exception) {
                     openExternalUrl(rel)
                 }
@@ -133,44 +140,48 @@ class BaoBridge(private val activity: MainActivity) {
 
     @JavascriptInterface
     fun postTrack(title: String, artist: String, cover: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_UPDATE_TRACK
             putExtra("title", title)
             putExtra("artist", artist)
             putExtra("cover", cover)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     @JavascriptInterface
     fun postState(playing: Boolean) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_UPDATE_STATE
             putExtra("playing", playing)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     /** 播放进度（毫秒），网页每秒上报一次，服务只更新会话状态不重发通知 */
     @JavascriptInterface
     fun postProgress(positionMs: Long, durationMs: Long) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_UPDATE_PROGRESS
             putExtra("position", positionMs)
             putExtra("duration", durationMs)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     /** 锁屏歌词行；空字符串表示恢复显示歌名 */
     @JavascriptInterface
     fun postLyric(line: String, sub: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_UPDATE_LYRIC
             putExtra("line", line)
             putExtra("sub", sub)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     // —— phase-2 原生播放：网页把解析好的流地址交给服务里的 ExoPlayer 播 ——
@@ -179,17 +190,19 @@ class BaoBridge(private val activity: MainActivity) {
     /** 播放一条流（新装载并起播；同一条已在播则只同步状态，不重启） */
     @JavascriptInterface
     fun postPlayUrl(url: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_PLAY_URL
             putExtra("url", url)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     @JavascriptInterface
     fun postNativePause() {
-        activity.startService(
-            Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        context.startService(
+            Intent(context, KeepAliveService::class.java).apply {
                 action = KeepAliveService.ACTION_NATIVE_PAUSE
             }
         )
@@ -197,8 +210,9 @@ class BaoBridge(private val activity: MainActivity) {
 
     @JavascriptInterface
     fun postNativeResume() {
-        activity.startService(
-            Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        context.startService(
+            Intent(context, KeepAliveService::class.java).apply {
                 action = KeepAliveService.ACTION_NATIVE_RESUME
             }
         )
@@ -206,27 +220,30 @@ class BaoBridge(private val activity: MainActivity) {
 
     @JavascriptInterface
     fun postNativeSeek(positionMs: Long) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_NATIVE_SEEK
             putExtra("pos", positionMs)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     @JavascriptInterface
     fun postNativeRate(rate: Float) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_NATIVE_RATE
             putExtra("rate", rate)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     /** 网页清掉 src 时调用：卸载当前流 */
     @JavascriptInterface
     fun postNativeStop() {
-        activity.startService(
-            Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        context.startService(
+            Intent(context, KeepAliveService::class.java).apply {
                 action = KeepAliveService.ACTION_NATIVE_STOP
             }
         )
@@ -235,8 +252,9 @@ class BaoBridge(private val activity: MainActivity) {
     /** 网页（重）加载时调用：服务把当前原生播放状态整包同步回网页（__baoSync hello） */
     @JavascriptInterface
     fun postHello() {
-        activity.startService(
-            Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        context.startService(
+            Intent(context, KeepAliveService::class.java).apply {
                 action = KeepAliveService.ACTION_HELLO
             }
         )
@@ -248,19 +266,57 @@ class BaoBridge(private val activity: MainActivity) {
     /** 预置接播清单（JSON 数组：[{u,k,t,a,c,r}]，空数组等于取消预置） */
     @JavascriptInterface
     fun postArmNext(json: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
             action = KeepAliveService.ACTION_ARM_NEXT
             putExtra("json", json)
         }
-        activity.startService(intent)
+        context.startService(intent)
     }
 
     /** 取消预置接播（如设置了"播完本首停"） */
     @JavascriptInterface
     fun postDisarmNext() {
-        activity.startService(
-            Intent(activity, KeepAliveService::class.java).apply {
+        if (resolver) return
+        context.startService(
+            Intent(context, KeepAliveService::class.java).apply {
                 action = KeepAliveService.ACTION_DISARM_NEXT
+            }
+        )
+    }
+
+    // —— 3.2.0 服务解析：界面页把「当前之后」的队列清单交给服务存档，
+    // 熄屏界面页冻住时服务靠清单向解析实例点名要地址。解析实例不发。 ——
+
+    /** 后续队列清单（JSON：{mode, quality, songs:[歌曲描述]}；空 songs 表示无后续） */
+    @JavascriptInterface
+    fun postQueueAhead(json: String) {
+        if (resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_QUEUE_AHEAD
+            putExtra("json", json)
+        }
+        context.startService(intent)
+    }
+
+    /** 解析实例回传解析结果（JSON：{id, results:[{k,u,t,a,c}]}）；仅解析实例可用 */
+    @JavascriptInterface
+    fun postResolvedUrls(json: String) {
+        if (!resolver) return
+        val intent = Intent(context, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_RESOLVED_URLS
+            putExtra("json", json)
+        }
+        context.startService(intent)
+    }
+
+    /** 解析实例就绪；仅解析实例可用 */
+    @JavascriptInterface
+    fun postResolverReady() {
+        if (!resolver) return
+        context.startService(
+            Intent(context, KeepAliveService::class.java).apply {
+                action = KeepAliveService.ACTION_RESOLVER_READY
             }
         )
     }

@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -82,6 +83,10 @@ class KeepAliveService : Service() {
         // phase-2.5 预置续播（网页提前把后续曲目交给服务，播完自动接播）
         const val ACTION_ARM_NEXT = "com.suantangyu.player.ARM_NEXT"
         const val ACTION_DISARM_NEXT = "com.suantangyu.player.DISARM_NEXT"
+        // 3.2.0 服务解析
+        const val ACTION_QUEUE_AHEAD = "com.suantangyu.player.QUEUE_AHEAD"
+        const val ACTION_RESOLVED_URLS = "com.suantangyu.player.RESOLVED_URLS"
+        const val ACTION_RESOLVER_READY = "com.suantangyu.player.RESOLVER_READY"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -142,6 +147,7 @@ class KeepAliveService : Service() {
                 }
             } catch (_: Exception) {
             }
+            maybeRequestResolve()
             tickHandler.postDelayed(this, 1000)
         }
     }
@@ -173,7 +179,10 @@ class KeepAliveService : Service() {
     // 未能入队情形的兜底，看门狗另扩管 ENDED 无人接播（watchdogTick）。
     private data class ArmedItem(
         val url: String, val key: String, val title: String,
-        val artist: String, val cover: String, val repeat: Boolean
+        val artist: String, val cover: String, val repeat: Boolean,
+        /** 3.2.0：true 表示这条是服务解析回填的（界面页整单预置会整表替换掉，
+         * 队列清单换新时按册剪除也只剪这种） */
+        val viaResolver: Boolean = false
     )
 
     private val armedItems = mutableListOf<ArmedItem>()
@@ -277,15 +286,23 @@ class KeepAliveService : Service() {
     /** 本首已被看门狗反毒化恢复过一次（防与其它意图拉锯） */
     private var poisonRescued = false
 
-    // —— 3.1.16 探针：服务内常驻 WebView 的熄屏存活测试（结构方案一的前置验证）——
-    // 在前台服务进程里养一个不挂窗口的 WebView：每 5 秒心跳一次、每 30 秒
-    // 真发一次网络请求，全部落盘，亮/熄屏打标记。测完 MainActivity 读文件
-    // 弹窗汇总熄屏段内心跳最大间隔：间隔小 = 服务 WebView 的 JS 没被冻，
-    // 方案一（解析页常驻补仓）成立；间隔大到分钟级 = 此路不通。
-    private var probeWebView: WebView? = null
-    private var probeReceiver: BroadcastReceiver? = null
-    private val probeLock = Any()
-    @Volatile private var probeLastBeatElapsed = 0L
+    // —— 3.2.0 服务解析：服务进程里常驻一个解析模式的播放器页面实例 ——
+    // 界面页熄屏被可见性冻结、补仓为零（2026-11-02 实测：省电无限制也解
+    // 不了）；服务 WebView 无 Activity 绑定，同环境下只是定时器节流（最大
+    // 心跳间隔 55.4s），解析链推得动。界面页把后续队列清单交壳存档
+    // （ACTION_QUEUE_AHEAD），跑道见低时壳点名解析实例解析
+    // （window.__baoResolveRequest），结果经 ACTION_RESOLVED_URLS 按 key
+    // 合并回预置（viaResolver 标记；界面页苏醒后的整单预置仍优先）。
+    private var resolverWebView: WebView? = null
+    @Volatile private var resolverReady = false
+    private var queueAheadSongs = mutableListOf<JSONObject>()
+    private var queueAheadMode = "list"
+    private var queueAheadQuality = "flac"
+    private var resolving = false
+    private var resolveReqId = 0
+    private var resolveReqAtMs = 0L
+    private var resolveTimeouts = 0
+    private var resolverReloadAtMs = 0L
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             try {
@@ -641,6 +658,8 @@ class KeepAliveService : Service() {
         soundedCurrent = false
         userHold = false
         poisonRescued = false
+        // 3.2.0：待解析清单的头部随接播消费（已播过的摘掉，防重复点名）
+        dropQueueAheadThrough(item.key)
         // 先把曲目信息换上，锁屏卡片立刻是对的，不必等网页醒来
         if (item.title.isNotEmpty()) title = item.title
         artist = item.artist
@@ -1143,88 +1162,146 @@ class KeepAliveService : Service() {
             @Suppress("DEPRECATION")
             startForeground(NOTIFY_ID, notification)
         }
-        startProbe()
+        startResolver()
     }
 
-    private fun probeFile(): File = File(filesDir, "probe_beats.log")
+    private fun startResolver() {
+        createResolverWebView()
+    }
 
-    private fun probeLog(line: String) {
+    private fun createResolverWebView() {
         try {
-            synchronized(probeLock) {
-                val f = probeFile()
-                if (f.length() > 512 * 1024) f.writeText("")
-                f.appendText(line + "\n")
+            val wv = WebView(applicationContext)
+            with(wv.settings) {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                mediaPlaybackRequiresUserGesture = true
+            }
+            try {
+                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+            } catch (_: Exception) {
+            }
+            // 解析实例专用桥（resolver=true）：除 postResolvedUrls /
+            // postResolverReady 外其余方法在桥内一律不认——它的播放器页面
+            // 无论干什么都污染不到通知、会话与预置
+            wv.addJavascriptInterface(BaoBridge(applicationContext, resolver = true), "BaoBus")
+            wv.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    super.onPageFinished(view, url)
+                    // 主脚本已跑完（解析入口在主脚本内定义）即可接活；
+                    // 页面自己还会再发一次 postResolverReady，双保险
+                    resolverReady = true
+                }
+
+                override fun onRenderProcessGone(
+                    view: WebView,
+                    detail: android.webkit.RenderProcessGoneDetail?
+                ): Boolean {
+                    resolverReady = false
+                    if (resolverWebView === view) {
+                        tickHandler.postDelayed({
+                            if (resolverWebView === view) {
+                                try {
+                                    view.destroy()
+                                } catch (_: Exception) {
+                                }
+                                createResolverWebView()
+                            }
+                        }, 3000)
+                    }
+                    return true
+                }
+            }
+            resolverWebView = wv
+            resolverReady = false
+            wv.loadUrl("https://m.858600.xyz/?resolver=1")
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 解析实例连续两次请求超时：重建它（带 5 分钟冷却，防反复重建风暴） */
+    private fun reloadResolver() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - resolverReloadAtMs < 5 * 60 * 1000) return
+        resolverReloadAtMs = now
+        try {
+            resolverWebView?.destroy()
+        } catch (_: Exception) {
+        }
+        resolverWebView = null
+        resolverReady = false
+        createResolverWebView()
+    }
+
+    /** 清单里某首歌的 key（与网页 keyOf 同规则：songmid||id + "|" + name） */
+    private fun keyOfJson(o: JSONObject): String {
+        val mid = o.optString("songmid").ifEmpty { o.optString("id") }
+        return mid + "|" + o.optString("name")
+    }
+
+    /** 原生接播消费清单头部：已播过的（含当前这首）从待解析清单里摘掉 */
+    private fun dropQueueAheadThrough(key: String) {
+        if (key.isEmpty()) return
+        try {
+            val idx = queueAheadSongs.indexOfFirst { keyOfJson(it) == key }
+            if (idx >= 0) {
+                queueAheadSongs = queueAheadSongs.drop(idx + 1).toMutableList()
             }
         } catch (_: Exception) {
         }
     }
 
-    private fun startProbe() {
+    /** 跑道见低时向解析实例点名下一批（tick 每秒调；内部有在飞/节流守卫） */
+    private fun maybeRequestResolve() {
         try {
-            probeLog("START ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
-            val wv = WebView(applicationContext)
-            wv.settings.javaScriptEnabled = true
-            try {
-                wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-            } catch (_: Exception) {
-            }
-            wv.addJavascriptInterface(object {
-                @JavascriptInterface
-                fun beat(n: Int, fetchMs: Long, fetchOk: Boolean) {
-                    val now = SystemClock.elapsedRealtime()
-                    val gap = if (probeLastBeatElapsed > 0) now - probeLastBeatElapsed else 0
-                    probeLastBeatElapsed = now
-                    probeLog("BEAT $now ${System.currentTimeMillis()} $n $gap $fetchMs $fetchOk")
-                }
-            }, "BaoProbe")
-            val html = "<html><head><meta charset=\"utf-8\"></head><body><script>" +
-                "var n = 0, lastFetch = 0, fetchMs = -1, fetchOk = false;" +
-                "setInterval(function () {" +
-                "  n++;" +
-                "  var now = Date.now();" +
-                "  if (now - lastFetch >= 30000) {" +
-                "    lastFetch = now;" +
-                "    var t0 = now;" +
-                "    fetch('https://m.858600.xyz/api/shell-release', {mode: 'no-cors', cache: 'no-store'})" +
-                "      .then(function () { fetchMs = Date.now() - t0; fetchOk = true; })" +
-                "      .catch(function () { fetchMs = Date.now() - t0; fetchOk = false; });" +
-                "  }" +
-                "  try { BaoProbe.beat(n, fetchMs, fetchOk); } catch (e) {}" +
-                "}, 5000);" +
-                "</script></body></html>"
-            wv.loadDataWithBaseURL("https://m.858600.xyz/", html, "text/html", "utf-8", null)
-            probeWebView = wv
-            val recv = object : BroadcastReceiver() {
-                override fun onReceive(c: Context?, i: Intent?) {
-                    when (i?.action) {
-                        Intent.ACTION_SCREEN_OFF ->
-                            probeLog("SCREEN_OFF ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
-                        Intent.ACTION_SCREEN_ON ->
-                            probeLog("SCREEN_ON ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
+            if (!nativeActive || player == null) return
+            if (resolving) {
+                if (SystemClock.elapsedRealtime() - resolveReqAtMs > 90000) {
+                    resolving = false
+                    resolveTimeouts++
+                    if (resolveTimeouts >= 2) {
+                        resolveTimeouts = 0
+                        reloadResolver()
                     }
-                }
+                } else return
             }
-            registerReceiver(recv, IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_OFF)
-                addAction(Intent.ACTION_SCREEN_ON)
-            })
-            probeReceiver = recv
+            if (!resolverReady || resolverWebView == null) return
+            if (armedItems.size > 2) return
+            if (queueAheadSongs.isEmpty()) return
+            val now = SystemClock.elapsedRealtime()
+            if (now - resolveReqAtMs < 15000) return
+            val armedKeys = armedItems.map { it.key }.toHashSet()
+            val pool = queueAheadSongs.toList()
+            val ordered = if (queueAheadMode == "shuffle") pool.shuffled() else pool
+            val batch = mutableListOf<JSONObject>()
+            for (o in ordered) {
+                if (batch.size >= 5) break
+                if (keyOfJson(o) in armedKeys) continue
+                batch.add(o)
+            }
+            if (batch.isEmpty()) return
+            val req = JSONObject()
+                .put("id", ++resolveReqId)
+                .put("quality", queueAheadQuality)
+                .put("songs", org.json.JSONArray(batch.toList()))
+            resolving = true
+            resolveReqAtMs = now
+            val js = "window.__baoResolveRequest && window.__baoResolveRequest(" +
+                JSONObject.quote(req.toString()) + ")"
+            resolverWebView?.evaluateJavascript(js, null)
         } catch (_: Exception) {
         }
     }
 
     override fun onDestroy() {
         try {
-            probeReceiver?.let { unregisterReceiver(it) }
+            resolverWebView?.destroy()
         } catch (_: Exception) {
         }
-        probeReceiver = null
-        try {
-            probeWebView?.destroy()
-        } catch (_: Exception) {
-        }
-        probeWebView = null
-        probeLog("STOP ${SystemClock.elapsedRealtime()} ${System.currentTimeMillis()}")
+        resolverWebView = null
+        resolverReady = false
         cancelPendingAdvance()
         stopWatchdog()
         try {
@@ -1441,9 +1518,72 @@ class KeepAliveService : Service() {
                 if (pendingAdvance == null && !inAdvanceGuard()) {
                     cancelPendingAdvance()
                     armedItems.clear()
+                    queueAheadSongs.clear()
                     // 预置已撤，播放器队列里排着的后续项一并撤下，防它照旧接播
                     syncUpcomingToPlayer()
                 }
+            }
+            ACTION_QUEUE_AHEAD -> {
+                // 界面页交来的后续队列清单（解析点名册）：换新册时顺手剪掉
+                // 解析回填、却已不在新册里的预置——队列被编辑过时，防播到
+                // 已被删掉的歌；界面页自己的预置不在此列（它整单覆盖）
+                try {
+                    val o = JSONObject(intent.getStringExtra("json") ?: "{}")
+                    val arr = o.optJSONArray("songs")
+                    val list = mutableListOf<JSONObject>()
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            arr.optJSONObject(i)?.let { list.add(it) }
+                        }
+                    }
+                    queueAheadSongs = list
+                    queueAheadMode = o.optString("mode", "list").ifEmpty { "list" }
+                    queueAheadQuality = o.optString("quality", "flac").ifEmpty { "flac" }
+                    val keepKeys = list.map { keyOfJson(it) }.toHashSet()
+                    val before = armedItems.size
+                    armedItems.removeAll { it.viaResolver && it.key !in keepKeys }
+                    if (armedItems.size != before) syncUpcomingToPlayer()
+                } catch (_: Exception) {
+                }
+            }
+            ACTION_RESOLVED_URLS -> {
+                // 解析实例回传：只收点名册里有、且还没预置的，按回传序追加
+                // 到跑道尾（与册序一致），上限 8 首；随后同步播放器队列、
+                // 预拉开头，与界面页预置走同一套后续处理
+                resolving = false
+                try {
+                    val o = JSONObject(intent.getStringExtra("json") ?: "{}")
+                    val arr = o.optJSONArray("results")
+                    if (arr != null) {
+                        val armedKeys = armedItems.map { it.key }.toHashSet()
+                        val aheadKeys = queueAheadSongs.map { keyOfJson(it) }.toHashSet()
+                        var added = false
+                        for (i in 0 until arr.length()) {
+                            val r = arr.optJSONObject(i) ?: continue
+                            val u = r.optString("u")
+                            val k = r.optString("k")
+                            if (!u.startsWith("http")) continue
+                            if (k in armedKeys || k !in aheadKeys) continue
+                            if (armedItems.size >= 8) break
+                            armedItems.add(
+                                ArmedItem(
+                                    u, k, r.optString("t"), r.optString("a"),
+                                    r.optString("c"), false, viaResolver = true
+                                )
+                            )
+                            added = true
+                        }
+                        if (added) {
+                            resolveTimeouts = 0
+                            syncUpcomingToPlayer()
+                            prefetchArmedHeads()
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            ACTION_RESOLVER_READY -> {
+                resolverReady = true
             }
             ACTION_HELLO -> {
                 if (nativeActive) syncAnchorFromPlayer()
