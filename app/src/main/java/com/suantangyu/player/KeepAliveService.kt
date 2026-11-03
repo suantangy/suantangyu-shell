@@ -215,6 +215,9 @@ class KeepAliveService : Service() {
     private val engineLogLock = Object()
     private val engineLogRing = ArrayDeque<String>()
     private var engineOkCount = 0
+    // 3.3.5 出错自救：连续跳过计数（真出声即清零）与待执行标记（同一次错误只排一次）
+    private var errSkipCount = 0
+    private var errRescuePending = false
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -758,6 +761,7 @@ class KeepAliveService : Service() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
             playing = isPlaying
+            if (isPlaying) errSkipCount = 0
             syncAnchorFromPlayer()
             updateSessionState()
             updateNotification()
@@ -824,6 +828,60 @@ class KeepAliveService : Service() {
                     .put("http", httpCode)
                     .put("msg", (error.message ?: "").take(120))
             )
+            // 3.3.5：错误留痕进引擎日志 + 壳内自救。解析成功不等于流能播，
+            // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
+            if (!errRescuePending) {
+                errRescuePending = true
+                engineLog(
+                    "引擎：播放出错 " + title + " code=" + error.errorCode +
+                        (if (httpCode > 0) " http=" + httpCode else "")
+                )
+                tickHandler.postDelayed({
+                    errRescuePending = false
+                    errorSkipRescue()
+                }, 1200)
+            }
+        }
+    }
+
+    /** 出错自救：跳过死掉的这首、接上下一首，永不停摆（落雪式处理）；
+     * 连续跳 3 次仍出错才停手并留断播点记录。用户已暂停时不自作主张。 */
+    private fun errorSkipRescue() {
+        val p = player ?: return
+        if (!nativeActive) return
+        if (!p.playWhenReady) return
+        errSkipCount++
+        if (errSkipCount > 3) {
+            engineLog("引擎：断播点（连续出错） " + engineCounters())
+            return
+        }
+        val idx = try {
+            p.currentMediaItemIndex
+        } catch (_: Exception) {
+            0
+        }
+        val count = try {
+            p.mediaItemCount
+        } catch (_: Exception) {
+            0
+        }
+        when {
+            idx + 1 < count -> {
+                engineLog("引擎：出错跳过，接下一首（第" + errSkipCount + "次）")
+                try {
+                    p.seekTo(idx + 1, 0)
+                    p.prepare()
+                    p.play()
+                } catch (_: Exception) {
+                }
+            }
+            armedItems.isNotEmpty() -> {
+                engineLog("引擎：出错跳过，跑道接管（第" + errSkipCount + "次）")
+                doArmedAdvance()
+            }
+            else -> {
+                engineLog("引擎：出错且无下一首可接 " + engineCounters())
+            }
         }
     }
 
