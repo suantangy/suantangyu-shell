@@ -303,14 +303,18 @@ class MainActivity : AppCompatActivity() {
             if (!f.exists() || f.length() == 0L) return
             val lines = f.readLines(Charsets.UTF_8).filter { it.isNotBlank() }
             if (lines.isEmpty()) return
-            val stall = lines.lastOrNull { it.contains("断播点") } ?: return
+            // 3.3.4 放宽触发：不只断播——有新的批次结果也弹一次，
+            // 多轮复测时好成绩的计数也要能看清（同一条尾巴不重复弹）
+            val mark = lines.lastOrNull {
+                it.contains("断播点") || it.contains("批次完成")
+            } ?: return
             val prefs = getSharedPreferences("diag", Context.MODE_PRIVATE)
-            val sig = stall + "@" + f.length()
-            if (prefs.getString("stall_sig", "") == sig) return
-            prefs.edit().putString("stall_sig", sig).apply()
+            val sig = mark + "@" + f.length()
+            if (prefs.getString("tail_sig", "") == sig) return
+            prefs.edit().putString("tail_sig", sig).apply()
             val tailText = lines.takeLast(18).joinToString("\n")
             AlertDialog.Builder(this)
-                .setTitle("引擎日志 · 断播记录")
+                .setTitle("引擎日志")
                 .setMessage(tailText)
                 .setPositiveButton("复制日志") { _, _ ->
                     try {
