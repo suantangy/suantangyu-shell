@@ -220,6 +220,9 @@ class KeepAliveService : Service() {
     // 3.3.5 出错自救：连续跳过计数（真出声即清零）与待执行标记（同一次错误只排一次）
     private var errSkipCount = 0
     private var errRescuePending = false
+    // 3.3.7 同曲原地重试状态：按 URL 记账，每首最多重试 2 次（真出声/换曲清零）
+    private var errRetryUrl = ""
+    private var errRetryCount = 0
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -281,7 +284,13 @@ class KeepAliveService : Service() {
      * 条件天然不成立，不会与网页抢解析。
      */
     private fun maybeEngineResolve() {
-        if (!nativeActive || !playing || engineBusy) return
+        val wantPlay = playing ||
+            (try {
+                player?.playWhenReady
+            } catch (_: Exception) {
+                null
+            } == true)
+        if (!nativeActive || !wantPlay || engineBusy) return
         if (configSources.isEmpty() || queueAheadSongs.isEmpty()) return
         if (armedItems.size > 1) return
         val now = android.os.SystemClock.elapsedRealtime()
@@ -765,7 +774,11 @@ class KeepAliveService : Service() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
             playing = isPlaying
-            if (isPlaying) errSkipCount = 0
+            if (isPlaying) {
+                errSkipCount = 0
+                errRetryCount = 0
+                errRetryUrl = ""
+            }
             syncAnchorFromPlayer()
             updateSessionState()
             updateNotification()
@@ -837,14 +850,22 @@ class KeepAliveService : Service() {
             if (!errRescuePending) {
                 errRescuePending = true
                 engineErrCount++
+                val host = try {
+                    java.net.URI(nativeUrl).host ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
                 engineLog(
                     "引擎：播放出错 " + title + " code=" + error.errorCode +
-                        (if (httpCode > 0) " http=" + httpCode else "")
+                        (if (httpCode > 0) " http=" + httpCode else "") +
+                        (if (host.isNotEmpty()) " host=" + host else "")
                 )
+                // 同一首已重试过一次 → 这次多等一会儿，连接故障窗多半以秒计
+                val delay = if (nativeUrl == errRetryUrl && errRetryCount >= 1) 5000L else 1500L
                 tickHandler.postDelayed({
                     errRescuePending = false
                     errorSkipRescue()
-                }, 1200)
+                }, delay)
             }
         }
     }
@@ -855,7 +876,28 @@ class KeepAliveService : Service() {
         val p = player ?: return
         if (!nativeActive) return
         if (!p.playWhenReady) return
+        val curUrl = nativeUrl
+        // 第一级：同一首原地重试。code=2001 这类连接层故障多是时间窗问题，
+        // 歌本身没坏，重拉同一条流多半就活——跳歌是最后手段，不是第一反应
+        if (curUrl.isEmpty() || curUrl != errRetryUrl || errRetryCount < 2) {
+            if (curUrl != errRetryUrl) {
+                errRetryUrl = curUrl
+                errRetryCount = 0
+            }
+            errRetryCount++
+            engineLog("引擎：出错原地重试 " + title + "（第" + errRetryCount + "次）")
+            try {
+                p.seekTo(p.currentMediaItemIndex, 0)
+                p.prepare()
+                p.play()
+            } catch (_: Exception) {
+            }
+            return
+        }
+        // 第二级：重试两次仍败 → 跳过这首（计数口径与 3.3.5 相同）
         errSkipCount++
+        errRetryUrl = ""
+        errRetryCount = 0
         if (errSkipCount > 3) {
             engineLog("引擎：断播点（连续出错） " + engineCounters())
             return
