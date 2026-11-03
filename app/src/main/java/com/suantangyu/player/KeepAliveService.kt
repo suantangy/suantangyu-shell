@@ -227,6 +227,14 @@ class KeepAliveService : Service() {
     // 描述符按 key 留存（QUEUE_AHEAD 交来时存），重解析同曲时取用
     private var errReresolvedUrl = ""
     private val descriptorByKey = LinkedHashMap<String, org.json.JSONObject>()
+    // 3.4.0 阶梯补全（cheng 议定）：同平台地址上限 2 个；每集只换源一次；
+    // 换源新曲 key 记账（算同一集延续）；待网页同步的换源记录（hello 时重推）
+    private var errAddrCount = 1
+    private var errEpisodeKey = ""
+    private var errQqNewKey = ""
+    private var errQqUsed = false
+    private var pendingSwapFor = ""
+    private var pendingSwapSong: org.json.JSONObject? = null
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -783,6 +791,10 @@ class KeepAliveService : Service() {
                 errRetryCount = 0
                 errRetryUrl = ""
                 errReresolvedUrl = ""
+                errAddrCount = 1
+                errEpisodeKey = ""
+                errQqNewKey = ""
+                errQqUsed = false
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -900,14 +912,21 @@ class KeepAliveService : Service() {
             }
             return
         }
-        // 第二级：引擎重解析同一首、换一条新链——酷我节点不止一个，
-        // 新链可能落到活着的节点（car-er 死了，car-bj/car-lv 未必）
-        if (curUrl.isNotEmpty() && errReresolvedUrl != curUrl) {
-            val curKey = try {
-                p.currentMediaItem?.mediaId ?: ""
-            } catch (_: Exception) {
-                ""
-            }
+        // 集号对齐：切到别的歌 → 地址计数/换源记账重新起算；
+        // 换源换上的新曲（errQqNewKey）算同一集延续，不重置
+        val curKey = try {
+            p.currentMediaItem?.mediaId ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+        if (curKey.isNotEmpty() && curKey != errEpisodeKey && curKey != errQqNewKey) {
+            errEpisodeKey = curKey
+            errAddrCount = 1
+            errQqUsed = false
+        }
+        // 第二级：引擎重解析同一首、换一条新链（同平台地址上限 2 个，cheng 定；
+        // 同址/无链不再直接跳过——进第 3 步换源，QQ 是另一个平台，不受同址结论牵连）
+        if (curUrl.isNotEmpty() && errReresolvedUrl != curUrl && errAddrCount < 2) {
             val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
             if (desc != null && configSources.isNotEmpty()) {
                 errReresolvedUrl = curUrl
@@ -928,6 +947,7 @@ class KeepAliveService : Service() {
                             return@post
                         }
                         if (newUrl.isNotEmpty() && newUrl != curUrl) {
+                            errAddrCount++
                             val host2 = try {
                                 java.net.URI(newUrl).host ?: ""
                             } catch (_: Exception) {
@@ -947,19 +967,178 @@ class KeepAliveService : Service() {
                                 pp.prepare()
                                 pp.play()
                             } catch (_: Exception) {
-                                doSkipAfterError(pp)
+                                tryQqSwapOrSkip(pp, curKey, curUrl)
                             }
                         } else {
                             engineLog("引擎：重解析无新链 " + title)
-                            doSkipAfterError(pp)
+                            tryQqSwapOrSkip(pp, curKey, curUrl)
                         }
                     }
                 }
                 return
             }
         }
-        // 第三级：跳过这首（最后兜底）
-        doSkipAfterError(p)
+        // 第三级：换源（非 QQ 曲换 QQ；QQ 曲在 QQ 内换版本）；再下级才是跳过
+        tryQqSwapOrSkip(p, curKey, curUrl)
+    }
+
+    /** 第三级换源：非 QQ 曲搜 QQ 同名换上；QQ 曲在 QQ 内换一个不同版本。
+     * 搜索/解析在解析线程跑，换链回主线程执行；无果则落到跳过兜底。
+     * 每集只换一次；没描述符的歌不走这级（亮屏点播由网页自己的链救）。 */
+    private fun tryQqSwapOrSkip(p: ExoPlayer, curKey: String, curUrl: String) {
+        val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
+        if (desc == null || configSources.isEmpty() || errQqUsed) {
+            doSkipAfterError(p)
+            return
+        }
+        errQqUsed = true
+        val name = desc.optString("name").ifEmpty { title }
+        val singer = desc.optString("artist")
+        val plat = desc.optString("source").ifEmpty { "qq" }
+        engineLog("引擎：换源搜索 " + name)
+        resolveExec.execute {
+            val alt = searchQqAlt(desc, name, singer, plat)
+            val newUrl = if (alt != null) {
+                try {
+                    LxResolver.resolve(
+                        alt, configSources, configQuality, configAutoDown,
+                        lxEngine()
+                    ) { m -> engineLog(m) }?.toString() ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+            } else {
+                ""
+            }
+            tickHandler.post {
+                val pp = player
+                if (pp == null || !nativeActive || nativeUrl != curUrl) {
+                    return@post
+                }
+                if (alt != null && newUrl.isNotEmpty()) {
+                    val newKey = LxResolver.keyOfJson(alt)
+                    descriptorByKey[newKey] = alt
+                    val host3 = try {
+                        java.net.URI(newUrl).host ?: ""
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    engineLog("引擎：换源成功 " + alt.optString("name") + " → " + host3)
+                    pendingSwapFor = curKey
+                    pendingSwapSong = alt
+                    errQqNewKey = newKey
+                    try {
+                        pushSync(
+                            JSONObject().put("t", "qqswap")
+                                .put("forKey", curKey)
+                                .put("song", alt)
+                        )
+                    } catch (_: Exception) {
+                    }
+                    title = alt.optString("name").ifEmpty { title }
+                    artist = alt.optString("artist").ifEmpty { artist }
+                    try {
+                        updateNotification()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        val idx3 = pp.currentMediaItemIndex
+                        pp.replaceMediaItem(
+                            idx3,
+                            mediaItemFor(
+                                ArmedItem(
+                                    newUrl, newKey,
+                                    alt.optString("name"), alt.optString("artist"),
+                                    alt.optString("cover"), false, true
+                                )
+                            )
+                        )
+                        nativeUrl = newUrl
+                        pp.seekTo(idx3, 0)
+                        pp.prepare()
+                        pp.play()
+                    } catch (_: Exception) {
+                        doSkipAfterError(pp)
+                    }
+                } else {
+                    engineLog("引擎：换源无果 " + name)
+                    doSkipAfterError(pp)
+                }
+            }
+        }
+    }
+
+    /** QQ 搜索挑一首可换的：非 QQ 曲取第一条可用结果；QQ 曲取第一个不同
+     * songmid 的版本（同版本在第 2 步已重解析过，换了等于没换，故不取）。 */
+    private fun searchQqAlt(
+        orig: org.json.JSONObject, name: String, singer: String, plat: String
+    ): org.json.JSONObject? {
+        val kw = (name + " " + singer).trim()
+        if (kw.isEmpty()) return null
+        val url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=" +
+            android.net.Uri.encode(kw) +
+            "&format=json&p=1&n=10&new_json=1&cr=1&t=0"
+        val data = try {
+            LxHttp.fetchJson(
+                url,
+                headers = mapOf("Referer" to "https://y.qq.com/"),
+                timeoutSec = 8
+            )
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val list = data.optJSONObject("data")?.optJSONObject("song")
+            ?.optJSONArray("list") ?: return null
+        val origMid = orig.optString("songmid")
+        for (i in 0 until list.length()) {
+            val item = list.optJSONObject(i) ?: continue
+            val built = buildQqDescriptor(item) ?: continue
+            if (plat != "qq") return built
+            if (built.optString("songmid") != origMid) return built
+        }
+        return null
+    }
+
+    /** QQ 搜索结果 → 描述符（与网页 normSong 同字段；封面由 albummid 拼） */
+    private fun buildQqDescriptor(item: org.json.JSONObject): org.json.JSONObject? {
+        val mid = item.optString("songmid").ifEmpty { item.optString("mid") }
+        val nm = item.optString("songname").ifEmpty { item.optString("name") }
+        if (mid.isEmpty() || nm.isEmpty()) return null
+        val singers = item.optJSONArray("singer")
+        val names = ArrayList<String>()
+        if (singers != null) {
+            for (j in 0 until singers.length()) {
+                val sn = singers.optJSONObject(j)?.optString("name") ?: ""
+                if (sn.isNotEmpty()) names.add(sn)
+            }
+        }
+        val artistStr = names.joinToString("/")
+        val amid = item.optString("albummid")
+        val album = item.optString("albumname")
+        val cover = if (amid.isNotEmpty()) {
+            "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + amid + ".jpg"
+        } else {
+            ""
+        }
+        val o = org.json.JSONObject()
+        o.put("source", "qq")
+        o.put("songmid", mid)
+        o.put("mid", mid)
+        o.put("id", mid)
+        o.put("name", nm)
+        o.put("songname", nm)
+        o.put("artist", artistStr)
+        o.put("singer", artistStr)
+        o.put("singername", artistStr)
+        o.put("album", album)
+        o.put("albumName", album)
+        o.put("albumname", album)
+        o.put("albummid", amid)
+        o.put("albumMid", amid)
+        o.put("cover", cover)
+        o.put("img", cover)
+        o.put("interval", item.optString("interval"))
+        return o
     }
 
     /** 跳过出错的这首、接上下一首；连续跳 3 首仍败才停手记断播点 */
@@ -1485,6 +1664,30 @@ class KeepAliveService : Service() {
                                 } catch (_: Exception) {
                                 }
                             }, 5500)
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+                // 3.4.0：换源记录重推——页面冻住时 qqswap 没送达的话，
+                // 借这次 hello 补推给刚醒的页面（页面按 forKey 核对，不符自会忽略）；
+                // 当前曲已不是换源那首/原曲时，记录作废清掉
+                try {
+                    val ps = pendingSwapSong
+                    if (ps != null) {
+                        val curId = try {
+                            player?.currentMediaItem?.mediaId ?: ""
+                        } catch (_: Exception) {
+                            ""
+                        }
+                        if (curId == errQqNewKey || curId == pendingSwapFor) {
+                            pushSync(
+                                JSONObject().put("t", "qqswap")
+                                    .put("forKey", pendingSwapFor)
+                                    .put("song", ps)
+                            )
+                        } else if (curId.isNotEmpty()) {
+                            pendingSwapSong = null
+                            pendingSwapFor = ""
                         }
                     }
                 } catch (_: Exception) {
