@@ -865,8 +865,9 @@ class KeepAliveService : Service() {
                         (if (httpCode > 0) " http=" + httpCode else "") +
                         (if (host.isNotEmpty()) " host=" + host else "")
                 )
-                // 同一首已重试过一次 → 这次多等一会儿，连接故障窗多半以秒计
-                val delay = if (nativeUrl == errRetryUrl && errRetryCount >= 1) 5000L else 1500L
+                // 3.3.9（cheng 定）：两次重试等待统一 1.5s——故障窗以分钟计，
+                // 等再久也熬不过去，只徒增静默；1.5s 足够接住短暂抖动
+                val delay = 1500L
                 tickHandler.postDelayed({
                     errRescuePending = false
                     errorSkipRescue()
