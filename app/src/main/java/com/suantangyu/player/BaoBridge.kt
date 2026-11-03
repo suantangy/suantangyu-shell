@@ -287,4 +287,14 @@ class BaoBridge(private val activity: MainActivity) {
         }
         activity.startService(intent)
     }
+
+    /** 当前曲描述符（3.4.2）：预告清单不含当前曲，这里单独上报补上盲区 */
+    @JavascriptInterface
+    fun postCurrentSong(json: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_CURRENT_SONG
+            putExtra("json", json)
+        }
+        activity.startService(intent)
+    }
 }

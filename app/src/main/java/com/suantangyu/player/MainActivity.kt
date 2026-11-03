@@ -317,7 +317,8 @@ class MainActivity : AppCompatActivity() {
             // 否则一首歌走完第 2、3 级的痕迹会被窗口挤掉、无从定案（cheng 2026-11-03 点头）
             val keyLines = lines.filter {
                 it.contains("播放出错") || it.contains("出错跳过") || it.contains("断播点") ||
-                    it.contains("重解析出新链") || it.contains("换源成功") || it.contains("换源无果")
+                    it.contains("重解析出新链") || it.contains("换源成功") || it.contains("换源无果") ||
+                    it.contains("无描述符")
             }.takeLast(8)
             val tailText = if (keyLines.isNotEmpty()) {
                 keyLines.joinToString("\n") + "\n————\n" +

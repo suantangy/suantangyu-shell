@@ -74,6 +74,7 @@ class KeepAliveService : Service() {
         // 引擎自己解析回填预置跑道，界面页熄屏冻结时连播不再断链
         const val ACTION_SOURCES_CONFIG = "com.suantangyu.player.SOURCES_CONFIG"
         const val ACTION_QUEUE_AHEAD = "com.suantangyu.player.QUEUE_AHEAD"
+        const val ACTION_CURRENT_SONG = "com.suantangyu.player.CURRENT_SONG"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -987,7 +988,13 @@ class KeepAliveService : Service() {
      * 每集只换一次；没描述符的歌不走这级（亮屏点播由网页自己的链救）。 */
     private fun tryQqSwapOrSkip(p: ExoPlayer, curKey: String, curUrl: String) {
         val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
-        if (desc == null || configSources.isEmpty() || errQqUsed) {
+        if (desc == null) {
+            // 没档案就没法重解析/换源——把原因记明，别再静默跳过（3.4.2）
+            engineLog("引擎：无描述符，阶梯跳过 " + title)
+            doSkipAfterError(p)
+            return
+        }
+        if (configSources.isEmpty() || errQqUsed) {
             doSkipAfterError(p)
             return
         }
@@ -1627,6 +1634,25 @@ class KeepAliveService : Service() {
                     it.viaResolver && list.none { s -> LxResolver.keyOfJson(s) == it.key }
                 }
                 if (armedItems.size != before) syncUpcomingToPlayer()
+            }
+            ACTION_CURRENT_SONG -> {
+                // 3.4.2：当前曲描述符登记（预告清单只含后续曲，当前曲是盲区——
+                // 点播直达/进程重开接管的当前曲没描述符时，出错阶梯第 2/3 级被静默跳过）
+                try {
+                    val o = org.json.JSONObject(intent.getStringExtra("json") ?: "{}")
+                    val k = LxResolver.keyOfJson(o)
+                    if (k.isNotEmpty()) {
+                        // remove+put 刷新位置，免得长会话里被 96 上限淘汰掉正在播的这首
+                        descriptorByKey.remove(k)
+                        descriptorByKey[k] = o
+                        while (descriptorByKey.size > 96) {
+                            val kit = descriptorByKey.keys.iterator()
+                            if (!kit.hasNext()) break
+                            descriptorByKey.remove(kit.next())
+                        }
+                    }
+                } catch (_: Exception) {
+                }
             }
             ACTION_HELLO -> {
                 // 3.3.1 诊断：页面（重）加载时把引擎日志尾巴与计数推给它，
