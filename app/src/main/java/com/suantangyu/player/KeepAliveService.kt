@@ -223,6 +223,10 @@ class KeepAliveService : Service() {
     // 3.3.7 同曲原地重试状态：按 URL 记账，每首最多重试 2 次（真出声/换曲清零）
     private var errRetryUrl = ""
     private var errRetryCount = 0
+    // 3.3.8 重解析记账：已为哪条 URL 重解析过（每首只重解析一次）；
+    // 描述符按 key 留存（QUEUE_AHEAD 交来时存），重解析同曲时取用
+    private var errReresolvedUrl = ""
+    private val descriptorByKey = LinkedHashMap<String, org.json.JSONObject>()
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -778,6 +782,7 @@ class KeepAliveService : Service() {
                 errSkipCount = 0
                 errRetryCount = 0
                 errRetryUrl = ""
+                errReresolvedUrl = ""
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -894,10 +899,76 @@ class KeepAliveService : Service() {
             }
             return
         }
-        // 第二级：重试两次仍败 → 跳过这首（计数口径与 3.3.5 相同）
+        // 第二级：引擎重解析同一首、换一条新链——酷我节点不止一个，
+        // 新链可能落到活着的节点（car-er 死了，car-bj/car-lv 未必）
+        if (curUrl.isNotEmpty() && errReresolvedUrl != curUrl) {
+            val curKey = try {
+                p.currentMediaItem?.mediaId ?: ""
+            } catch (_: Exception) {
+                ""
+            }
+            val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
+            if (desc != null && configSources.isNotEmpty()) {
+                errReresolvedUrl = curUrl
+                engineLog("引擎：出错重解析 " + title)
+                resolveExec.execute {
+                    val nu = try {
+                        LxResolver.resolve(
+                            desc, configSources, configQuality, configAutoDown,
+                            lxEngine()
+                        ) { m -> engineLog(m) }
+                    } catch (_: Exception) {
+                        null
+                    }
+                    val newUrl = nu?.toString() ?: ""
+                    tickHandler.post {
+                        val pp = player
+                        if (pp == null || !nativeActive || nativeUrl != curUrl) {
+                            return@post
+                        }
+                        if (newUrl.isNotEmpty() && newUrl != curUrl) {
+                            val host2 = try {
+                                java.net.URI(newUrl).host ?: ""
+                            } catch (_: Exception) {
+                                ""
+                            }
+                            engineLog("引擎：重解析出新链 " + title + " → " + host2)
+                            try {
+                                val idx2 = pp.currentMediaItemIndex
+                                pp.replaceMediaItem(
+                                    idx2,
+                                    mediaItemFor(
+                                        ArmedItem(newUrl, curKey, title, artist, "", false, true)
+                                    )
+                                )
+                                nativeUrl = newUrl
+                                pp.seekTo(idx2, 0)
+                                pp.prepare()
+                                pp.play()
+                            } catch (_: Exception) {
+                                doSkipAfterError(pp)
+                            }
+                        } else {
+                            engineLog("引擎：重解析无新链 " + title)
+                            doSkipAfterError(pp)
+                        }
+                    }
+                }
+                return
+            }
+        }
+        // 第三级：跳过这首（最后兜底）
+        doSkipAfterError(p)
+    }
+
+    /** 跳过出错的这首、接上下一首；连续跳 3 首仍败才停手记断播点 */
+    private fun doSkipAfterError(p: ExoPlayer) {
+        if (!nativeActive) return
+        if (!p.playWhenReady) return
         errSkipCount++
         errRetryUrl = ""
         errRetryCount = 0
+        errReresolvedUrl = ""
         if (errSkipCount > 3) {
             engineLog("引擎：断播点（连续出错） " + engineCounters())
             return
@@ -1360,6 +1431,16 @@ class KeepAliveService : Service() {
                 } catch (_: Exception) {
                 }
                 queueAheadSongs = list
+                // 3.3.8：描述符按 key 留存，出错重解析同一首时用（上限 96 防膨胀）
+                for (s in list) {
+                    val k = LxResolver.keyOfJson(s)
+                    if (k.isNotEmpty()) descriptorByKey[k] = s
+                }
+                while (descriptorByKey.size > 96) {
+                    val kit = descriptorByKey.keys.iterator()
+                    if (!kit.hasNext()) break
+                    descriptorByKey.remove(kit.next())
+                }
                 // 队列变了：壳解析回填的预置若已不在新队列里，撤掉防播错歌
                 val before = armedItems.size
                 armedItems.removeAll {
