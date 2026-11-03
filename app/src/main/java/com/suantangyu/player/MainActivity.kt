@@ -306,13 +306,22 @@ class MainActivity : AppCompatActivity() {
             // 3.3.4 放宽触发：不只断播——有新的批次结果也弹一次，
             // 多轮复测时好成绩的计数也要能看清（同一条尾巴不重复弹）
             val mark = lines.lastOrNull {
-                it.contains("断播点") || it.contains("批次完成")
+                it.contains("断播点") || it.contains("批次完成") || it.contains("播放出错")
             } ?: return
             val prefs = getSharedPreferences("diag", Context.MODE_PRIVATE)
             val sig = mark + "@" + f.length()
             if (prefs.getString("tail_sig", "") == sig) return
             prefs.edit().putString("tail_sig", sig).apply()
-            val tailText = lines.takeLast(18).joinToString("\n")
+            // 3.3.6：关键行（出错/跳过/断播点）置顶汇总，不被逐曲脚本日志冲出窗口
+            val keyLines = lines.filter {
+                it.contains("播放出错") || it.contains("出错跳过") || it.contains("断播点")
+            }.takeLast(8)
+            val tailText = if (keyLines.isNotEmpty()) {
+                keyLines.joinToString("\n") + "\n————\n" +
+                    lines.takeLast(10).joinToString("\n")
+            } else {
+                lines.takeLast(18).joinToString("\n")
+            }
             AlertDialog.Builder(this)
                 .setTitle("引擎日志")
                 .setMessage(tailText)

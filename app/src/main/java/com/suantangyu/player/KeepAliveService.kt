@@ -215,6 +215,8 @@ class KeepAliveService : Service() {
     private val engineLogLock = Object()
     private val engineLogRing = ArrayDeque<String>()
     private var engineOkCount = 0
+    // 3.3.6：播放出错计数（被自救盖过去的断也要有明账，进计数行）
+    private var engineErrCount = 0
     // 3.3.5 出错自救：连续跳过计数（真出声即清零）与待执行标记（同一次错误只排一次）
     private var errSkipCount = 0
     private var errRescuePending = false
@@ -227,14 +229,16 @@ class KeepAliveService : Service() {
         val ok: Int
         val f: Int
         val b: Int
+        val e: Int
         synchronized(engineLogLock) {
             ok = engineOkCount
             f = engineFailCount
             b = engineBatchCount
+            e = engineErrCount
         }
         return "批次 " + b + " 成功 " + ok + " 失败 " + f +
             " 队列剩 " + queueAheadSongs.size + " 跑道 " + armedItems.size +
-            " 源 " + configSources.size
+            " 源 " + configSources.size + " 出错 " + e
     }
 
     private fun lxEngine(): LxEngine {
@@ -832,6 +836,7 @@ class KeepAliveService : Service() {
             // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
             if (!errRescuePending) {
                 errRescuePending = true
+                engineErrCount++
                 engineLog(
                     "引擎：播放出错 " + title + " code=" + error.errorCode +
                         (if (httpCode > 0) " http=" + httpCode else "")
