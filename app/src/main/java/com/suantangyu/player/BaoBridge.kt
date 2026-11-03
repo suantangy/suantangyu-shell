@@ -288,7 +288,7 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
-    /** 后台日志（3.5.0）：网页「后台日志」面板打开时现读日志文件尾（最近 220 行） */
+    /** 后台日志（3.5.0）：网页「后台日志」面板打开时现读日志文件尾（3.5.1 起最近 600 行） */
     @JavascriptInterface
     fun getEngineLog(): String {
         return try {
@@ -296,7 +296,7 @@ class BaoBridge(private val activity: MainActivity) {
             if (!f.exists()) {
                 ""
             } else {
-                f.readLines(Charsets.UTF_8).takeLast(220).joinToString("\n")
+                f.readLines(Charsets.UTF_8).takeLast(600).joinToString("\n")
             }
         } catch (_: Exception) {
             ""

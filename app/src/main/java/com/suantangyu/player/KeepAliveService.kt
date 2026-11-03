@@ -280,7 +280,27 @@ class KeepAliveService : Service() {
         }
         try {
             val f = java.io.File(filesDir, "lx_engine.log")
-            if (f.length() > 256 * 1024) f.delete()
+            // 3.5.1：上限提到 1MB；写满时滚动保留——只丢最老的一段
+            // （删到剩约 768KB），不再整文件删光（旧实现 256KB 写满即
+            // 整表删除，前半夜的记录会整段消失，查案时日志像断了一截）
+            if (f.length() > 1024 * 1024) {
+                try {
+                    val lines = f.readLines(Charsets.UTF_8)
+                    var bytes = lines.sumOf { it.toByteArray(Charsets.UTF_8).size + 1 }
+                    var drop = 0
+                    while (drop < lines.size && bytes > 768 * 1024) {
+                        bytes -= lines[drop].toByteArray(Charsets.UTF_8).size + 1
+                        drop++
+                    }
+                    if (drop > 0) {
+                        f.writeText(
+                            lines.drop(drop).joinToString("\n") + "\n",
+                            Charsets.UTF_8
+                        )
+                    }
+                } catch (_: Exception) {
+                }
+            }
             f.appendText(line + "\n")
         } catch (_: Exception) {
         }
@@ -1579,8 +1599,21 @@ class KeepAliveService : Service() {
                                 o.optBoolean("r", false) || o.optInt("r", 0) == 1
                             )
                         )
+                        // 3.5.1：预置自带完整档案（字段 s）就按预置自己的编号
+                        // 入册——档案跟着歌走，出错阶梯不再依赖队列上报窗口
+                        val dk = o.optString("k")
+                        val ds = o.optJSONObject("s")
+                        if (dk.isNotEmpty() && ds != null) {
+                            descriptorByKey.remove(dk)
+                            descriptorByKey[dk] = ds
+                        }
                     }
                 } catch (_: Exception) {
+                }
+                while (descriptorByKey.size > 96) {
+                    val kit = descriptorByKey.keys.iterator()
+                    if (!kit.hasNext()) break
+                    descriptorByKey.remove(kit.next())
                 }
                 // phase-3：新预置清单同步进播放器队列，接播改由播放器内部完成
                 syncUpcomingToPlayer()
@@ -1628,7 +1661,12 @@ class KeepAliveService : Service() {
                 // 3.3.8：描述符按 key 留存，出错重解析同一首时用（上限 96 防膨胀）
                 for (s in list) {
                     val k = LxResolver.keyOfJson(s)
-                    if (k.isNotEmpty()) descriptorByKey[k] = s
+                    if (k.isNotEmpty()) {
+                        // 3.5.1：remove+put 刷新位置——还在窗口里的歌保持年轻，
+                        // 免得长队列滑动时被 96 上限从队头挤掉
+                        descriptorByKey.remove(k)
+                        descriptorByKey[k] = s
+                    }
                 }
                 while (descriptorByKey.size > 96) {
                     val kit = descriptorByKey.keys.iterator()
