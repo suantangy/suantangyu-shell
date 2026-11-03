@@ -313,8 +313,11 @@ class MainActivity : AppCompatActivity() {
             if (prefs.getString("tail_sig", "") == sig) return
             prefs.edit().putString("tail_sig", sig).apply()
             // 3.3.6：关键行（出错/跳过/断播点）置顶汇总，不被逐曲脚本日志冲出窗口
+            // 3.4.1：阶梯动作行也进关键行——重解析出新链/换源成功/换源无果，
+            // 否则一首歌走完第 2、3 级的痕迹会被窗口挤掉、无从定案（cheng 2026-11-03 点头）
             val keyLines = lines.filter {
-                it.contains("播放出错") || it.contains("出错跳过") || it.contains("断播点")
+                it.contains("播放出错") || it.contains("出错跳过") || it.contains("断播点") ||
+                    it.contains("重解析出新链") || it.contains("换源成功") || it.contains("换源无果")
             }.takeLast(8)
             val tailText = if (keyLines.isNotEmpty()) {
                 keyLines.joinToString("\n") + "\n————\n" +
