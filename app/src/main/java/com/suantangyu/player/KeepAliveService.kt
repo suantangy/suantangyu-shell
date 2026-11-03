@@ -267,18 +267,25 @@ class KeepAliveService : Service() {
     }
 
     private fun engineLog(msg: String) {
+        // 3.5.0：每行带时间戳（HH:mm:ss）——复盘时能对出事发时段与时长（cheng 定）
+        val line = try {
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date()) + " " + msg
+        } catch (_: Exception) {
+            msg
+        }
         synchronized(engineLogLock) {
-            engineLogRing.addLast(msg)
+            engineLogRing.addLast(line)
             while (engineLogRing.size > 14) engineLogRing.removeFirst()
         }
         try {
             val f = java.io.File(filesDir, "lx_engine.log")
             if (f.length() > 256 * 1024) f.delete()
-            f.appendText(msg + "\n")
+            f.appendText(line + "\n")
         } catch (_: Exception) {
         }
         try {
-            pushSync(JSONObject().put("t", "enginelog").put("msg", msg))
+            pushSync(JSONObject().put("t", "enginelog").put("msg", line))
         } catch (_: Exception) {
         }
     }
@@ -1655,41 +1662,30 @@ class KeepAliveService : Service() {
                 }
             }
             ACTION_HELLO -> {
-                // 3.3.1 诊断：页面（重）加载时把引擎日志尾巴与计数推给它，
-                // toast 里能直接看到断播前最后几步发生了什么
+                // 3.5.0：hello 不再倒日志尾巴——完整日志在网页「后台日志」面板里看；
+                // 这里只在有「新的」断播点时推一条提醒（按行内容去重，同一条不重复推）
                 try {
                     var tail: List<String>
                     synchronized(engineLogLock) { tail = ArrayList(engineLogRing) }
-                    if (tail.isEmpty()) {
-                        // 进程若被划掉重开，内存环是空的——日志文件还在，从文件取尾巴
+                    if (tail.none { it.contains("断播点") }) {
                         try {
                             val f = java.io.File(filesDir, "lx_engine.log")
                             if (f.exists()) {
-                                tail = f.readLines(Charsets.UTF_8).takeLast(8)
+                                tail = f.readLines(Charsets.UTF_8).takeLast(60)
                             }
                         } catch (_: Exception) {
                         }
                     }
-                    if (tail.isEmpty()) {
-                        pushSync(
-                            JSONObject().put("t", "enginelog")
-                                .put("msg", "引擎：暂无日志")
+                    val stall = tail.lastOrNull { it.contains("断播点") }
+                    if (stall != null) {
+                        val prefs = getSharedPreferences(
+                            "diag", android.content.Context.MODE_PRIVATE
                         )
-                    } else {
-                        pushSync(
-                            JSONObject().put("t", "enginelog")
-                                .put("msg", tail.last())
-                        )
-                        if (tail.size > 1) {
-                            val rest = tail.dropLast(1).takeLast(3).joinToString(" ⏐ ")
-                            tickHandler.postDelayed({
-                                try {
-                                    pushSync(
-                                        JSONObject().put("t", "enginelog").put("msg", rest)
-                                    )
-                                } catch (_: Exception) {
-                                }
-                            }, 5500)
+                        if (prefs.getString("stall_push_sig", "") != stall) {
+                            prefs.edit().putString("stall_push_sig", stall).apply()
+                            pushSync(
+                                JSONObject().put("t", "enginelog").put("msg", stall)
+                            )
                         }
                     }
                 } catch (_: Exception) {

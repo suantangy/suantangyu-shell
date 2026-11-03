@@ -166,10 +166,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         instance = this
-        // 3.3.3 诊断可读性：冷启动后若日志里有未展示过的断播记录，
-        // 弹一个可滚动、可复制的日志窗——toast 一行塞不下、看不清
-        Handler(Looper.getMainLooper()).postDelayed({ maybeShowStallLog() }, 2500)
-
         // —— 沉浸式：内容延伸到系统栏之下，系统栏透明（顶部全屏，不再有黑条） ——
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = Color.TRANSPARENT
@@ -293,54 +289,6 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(
             this, Intent(this, KeepAliveService::class.java)
         )
-    }
-
-    /** 断播日志窗：只在日志尾含新的「断播点」记录时弹，平时不打扰 */
-    private fun maybeShowStallLog() {
-        try {
-            if (isFinishing || isDestroyed) return
-            val f = java.io.File(filesDir, "lx_engine.log")
-            if (!f.exists() || f.length() == 0L) return
-            val lines = f.readLines(Charsets.UTF_8).filter { it.isNotBlank() }
-            if (lines.isEmpty()) return
-            // 3.3.4 放宽触发：不只断播——有新的批次结果也弹一次，
-            // 多轮复测时好成绩的计数也要能看清（同一条尾巴不重复弹）
-            val mark = lines.lastOrNull {
-                it.contains("断播点") || it.contains("批次完成") || it.contains("播放出错")
-            } ?: return
-            val prefs = getSharedPreferences("diag", Context.MODE_PRIVATE)
-            val sig = mark + "@" + f.length()
-            if (prefs.getString("tail_sig", "") == sig) return
-            prefs.edit().putString("tail_sig", sig).apply()
-            // 3.3.6：关键行（出错/跳过/断播点）置顶汇总，不被逐曲脚本日志冲出窗口
-            // 3.4.1：阶梯动作行也进关键行——重解析出新链/换源成功/换源无果，
-            // 否则一首歌走完第 2、3 级的痕迹会被窗口挤掉、无从定案（cheng 2026-11-03 点头）
-            val keyLines = lines.filter {
-                it.contains("播放出错") || it.contains("出错跳过") || it.contains("断播点") ||
-                    it.contains("重解析出新链") || it.contains("换源成功") || it.contains("换源无果") ||
-                    it.contains("无描述符")
-            }.takeLast(8)
-            val tailText = if (keyLines.isNotEmpty()) {
-                keyLines.joinToString("\n") + "\n————\n" +
-                    lines.takeLast(10).joinToString("\n")
-            } else {
-                lines.takeLast(18).joinToString("\n")
-            }
-            AlertDialog.Builder(this)
-                .setTitle("引擎日志")
-                .setMessage(tailText)
-                .setPositiveButton("复制日志") { _, _ ->
-                    try {
-                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        cm.setPrimaryClip(ClipData.newPlainText("lx_engine", tailText))
-                        android.widget.Toast.makeText(this, "已复制，粘贴发我就行", android.widget.Toast.LENGTH_SHORT).show()
-                    } catch (_: Exception) {
-                    }
-                }
-                .setNegativeButton("知道了", null)
-                .show()
-        } catch (_: Exception) {
-        }
     }
 
     override fun onDestroy() {

@@ -288,6 +288,21 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
+    /** 后台日志（3.5.0）：网页「后台日志」面板打开时现读日志文件尾（最近 220 行） */
+    @JavascriptInterface
+    fun getEngineLog(): String {
+        return try {
+            val f = java.io.File(activity.filesDir, "lx_engine.log")
+            if (!f.exists()) {
+                ""
+            } else {
+                f.readLines(Charsets.UTF_8).takeLast(220).joinToString("\n")
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     /** 当前曲描述符（3.4.2）：预告清单不含当前曲，这里单独上报补上盲区 */
     @JavascriptInterface
     fun postCurrentSong(json: String) {
