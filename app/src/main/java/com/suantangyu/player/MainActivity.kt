@@ -2,7 +2,10 @@ package com.suantangyu.player
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -163,6 +166,9 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         instance = this
+        // 3.3.3 诊断可读性：冷启动后若日志里有未展示过的断播记录，
+        // 弹一个可滚动、可复制的日志窗——toast 一行塞不下、看不清
+        Handler(Looper.getMainLooper()).postDelayed({ maybeShowStallLog() }, 2500)
 
         // —— 沉浸式：内容延伸到系统栏之下，系统栏透明（顶部全屏，不再有黑条） ——
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -287,6 +293,37 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(
             this, Intent(this, KeepAliveService::class.java)
         )
+    }
+
+    /** 断播日志窗：只在日志尾含新的「断播点」记录时弹，平时不打扰 */
+    private fun maybeShowStallLog() {
+        try {
+            if (isFinishing || isDestroyed) return
+            val f = java.io.File(filesDir, "lx_engine.log")
+            if (!f.exists() || f.length() == 0L) return
+            val lines = f.readLines(Charsets.UTF_8).filter { it.isNotBlank() }
+            if (lines.isEmpty()) return
+            val stall = lines.lastOrNull { it.contains("断播点") } ?: return
+            val prefs = getSharedPreferences("diag", Context.MODE_PRIVATE)
+            val sig = stall + "@" + f.length()
+            if (prefs.getString("stall_sig", "") == sig) return
+            prefs.edit().putString("stall_sig", sig).apply()
+            val tailText = lines.takeLast(18).joinToString("\n")
+            AlertDialog.Builder(this)
+                .setTitle("引擎日志 · 断播记录")
+                .setMessage(tailText)
+                .setPositiveButton("复制日志") { _, _ ->
+                    try {
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("lx_engine", tailText))
+                        android.widget.Toast.makeText(this, "已复制，粘贴发我就行", android.widget.Toast.LENGTH_SHORT).show()
+                    } catch (_: Exception) {
+                    }
+                }
+                .setNegativeButton("知道了", null)
+                .show()
+        } catch (_: Exception) {
+        }
     }
 
     override fun onDestroy() {
