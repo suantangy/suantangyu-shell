@@ -1017,7 +1017,22 @@ class KeepAliveService : Service() {
         val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
         if (desc == null) {
             // 没档案就没法重解析/换源——把原因记明，别再静默跳过（3.4.2）
-            engineLog("引擎：无描述符，阶梯跳过 " + title)
+            // 3.5.2 诊断抓现行：把当时的编号原文、档案总数、同名档案的编号
+            // 一并记下——下次复发一锤定音：reg 在而 key 不同 = 两边编号分歧；
+            // reg 不在 = 根本没入册（被挤掉或从未登记），map 大小佐证挤掉说
+            var regKey = ""
+            for (k in descriptorByKey.keys) {
+                if (k.endsWith("|" + title)) {
+                    regKey = k
+                    break
+                }
+            }
+            engineLog(
+                "引擎：无描述符，阶梯跳过 " + title +
+                    " key=" + curKey +
+                    " map=" + descriptorByKey.size +
+                    (if (regKey.isNotEmpty()) " reg=" + regKey else "")
+            )
             doSkipAfterError(p)
             return
         }
