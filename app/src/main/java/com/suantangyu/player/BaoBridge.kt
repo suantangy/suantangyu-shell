@@ -186,6 +186,18 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
+    /** 3.5.3：同 postPlayUrl，但带上歌曲编号——壳建播放项时拿编号当身份证，
+     * 阶梯才查得到这首歌的档案（只传网址时网页起播的歌阶梯全瞎，3.5.2 抓现行） */
+    @JavascriptInterface
+    fun postPlayUrlK(url: String, key: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_PLAY_URL
+            putExtra("url", url)
+            putExtra("key", key)
+        }
+        activity.startService(intent)
+    }
+
     @JavascriptInterface
     fun postNativePause() {
         activity.startService(

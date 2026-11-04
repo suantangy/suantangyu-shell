@@ -175,6 +175,7 @@ class KeepAliveService : Service() {
     // 结束/出错全部以播放器为准，再经 __baoSync 同步回网页驱动它的 UI 与切歌逻辑。
     private var player: ExoPlayer? = null
     private var nativeUrl: String = ""
+    private var nativeKey: String = "" // 当前曲编号（建项/重装沿用，阶梯查档案的凭据）
     /** 播放器里装着网页交给我们的流（此后页面上报的 state/progress 只是回声，忽略） */
     private var nativeActive: Boolean = false
     private var pendingRate: Float = 1f
@@ -224,13 +225,10 @@ class KeepAliveService : Service() {
     // 3.3.7 同曲原地重试状态：按 URL 记账，每首最多重试 2 次（真出声/换曲清零）
     private var errRetryUrl = ""
     private var errRetryCount = 0
-    // 3.3.8 重解析记账：已为哪条 URL 重解析过（每首只重解析一次）；
-    // 描述符按 key 留存（QUEUE_AHEAD 交来时存），重解析同曲时取用
-    private var errReresolvedUrl = ""
+    // 描述符按 key 留存（QUEUE_AHEAD/点播/预置交来时存），阶梯换源时取用
     private val descriptorByKey = LinkedHashMap<String, org.json.JSONObject>()
-    // 3.4.0 阶梯补全（cheng 议定）：同平台地址上限 2 个；每集只换源一次；
-    // 换源新曲 key 记账（算同一集延续）；待网页同步的换源记录（hello 时重推）
-    private var errAddrCount = 1
+    // 3.4.0 阶梯（cheng 议定；3.5.3 瘦身：重解析台阶实测 6/6 无新链、撤）：
+    // 每集只换源一次；换源新曲 key 记账（算同一集延续）；待网页同步的换源记录
     private var errEpisodeKey = ""
     private var errQqNewKey = ""
     private var errQqUsed = false
@@ -670,11 +668,12 @@ class KeepAliveService : Service() {
         lastAdvancedUrl = item.url
         lastAdvanceAtMs = SystemClock.elapsedRealtime()
         if (playIt) {
-            playNative(item.url)
+            playNative(item.url, item.key)
             // 宽限接播是整表装载，剩下的预置曲目重新排进播放器队列
             syncUpcomingToPlayer()
         } else {
             nativeUrl = item.url
+            nativeKey = item.key
             positionMs = 0
             anchorPosMs = 0
             anchorAtMs = SystemClock.elapsedRealtime()
@@ -818,8 +817,6 @@ class KeepAliveService : Service() {
                 errSkipCount = 0
                 errRetryCount = 0
                 errRetryUrl = ""
-                errReresolvedUrl = ""
-                errAddrCount = 1
                 errEpisodeKey = ""
                 errQqNewKey = ""
                 errQqUsed = false
@@ -940,7 +937,7 @@ class KeepAliveService : Service() {
             }
             return
         }
-        // 集号对齐：切到别的歌 → 地址计数/换源记账重新起算；
+        // 集号对齐：切到别的歌 → 换源记账重新起算；
         // 换源换上的新曲（errQqNewKey）算同一集延续，不重置
         val curKey = try {
             p.currentMediaItem?.mediaId ?: ""
@@ -949,72 +946,41 @@ class KeepAliveService : Service() {
         }
         if (curKey.isNotEmpty() && curKey != errEpisodeKey && curKey != errQqNewKey) {
             errEpisodeKey = curKey
-            errAddrCount = 1
             errQqUsed = false
         }
-        // 第二级：引擎重解析同一首、换一条新链（同平台地址上限 2 个，cheng 定；
-        // 同址/无链不再直接跳过——进第 3 步换源，QQ 是另一个平台，不受同址结论牵连）
-        if (curUrl.isNotEmpty() && errReresolvedUrl != curUrl && errAddrCount < 2) {
-            val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
-            if (desc != null && configSources.isNotEmpty()) {
-                errReresolvedUrl = curUrl
-                engineLog("引擎：出错重解析 " + title)
-                resolveExec.execute {
-                    val nu = try {
-                        LxResolver.resolve(
-                            desc, configSources, configQuality, configAutoDown,
-                            lxEngine()
-                        ) { m -> engineLog(m) }
-                    } catch (_: Exception) {
-                        null
-                    }
-                    val newUrl = nu?.toString() ?: ""
-                    tickHandler.post {
-                        val pp = player
-                        if (pp == null || !nativeActive || nativeUrl != curUrl) {
-                            return@post
-                        }
-                        if (newUrl.isNotEmpty() && newUrl != curUrl) {
-                            errAddrCount++
-                            val host2 = try {
-                                java.net.URI(newUrl).host ?: ""
-                            } catch (_: Exception) {
-                                ""
-                            }
-                            engineLog("引擎：重解析出新链 " + title + " → " + host2)
-                            try {
-                                val idx2 = pp.currentMediaItemIndex
-                                pp.replaceMediaItem(
-                                    idx2,
-                                    mediaItemFor(
-                                        ArmedItem(newUrl, curKey, title, artist, "", false, true)
-                                    )
-                                )
-                                nativeUrl = newUrl
-                                pp.seekTo(idx2, 0)
-                                pp.prepare()
-                                pp.play()
-                            } catch (_: Exception) {
-                                tryQqSwapOrSkip(pp, curKey, curUrl)
-                            }
-                        } else {
-                            engineLog("引擎：重解析无新链 " + title)
-                            tryQqSwapOrSkip(pp, curKey, curUrl)
-                        }
-                    }
-                }
-                return
-            }
-        }
-        // 第三级：换源（非 QQ 曲换 QQ；QQ 曲在 QQ 内换版本）；再下级才是跳过
+        // 第二级：换源（非 QQ 曲换 QQ；QQ 曲在 QQ 内换版本）；再下级才是跳过
         tryQqSwapOrSkip(p, curKey, curUrl)
     }
 
-    /** 第三级换源：非 QQ 曲搜 QQ 同名换上；QQ 曲在 QQ 内换一个不同版本。
+    /** 第二级换源：非 QQ 曲搜 QQ 同名换上；QQ 曲在 QQ 内换一个不同版本。
      * 搜索/解析在解析线程跑，换链回主线程执行；无果则落到跳过兜底。
      * 每集只换一次；没描述符的歌不走这级（亮屏点播由网页自己的链救）。 */
     private fun tryQqSwapOrSkip(p: ExoPlayer, curKey: String, curUrl: String) {
-        val desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
+        var desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
+        if (desc == null) {
+            // 3.5.3 兜底：编号对不上时按同名档案再找一次——典型是网页经
+            // postPlayUrl 起播的歌、播放项编号只剩网址（3.5.2 抓现行），
+            // 档案明明在册就不该瞎；同名多条时优先歌手对得上的那条
+            var foundKey = ""
+            var byName: org.json.JSONObject? = null
+            for ((k, v) in descriptorByKey) {
+                if (k.endsWith("|" + title)) {
+                    if (byName == null) {
+                        byName = v
+                        foundKey = k
+                    }
+                    if (v.optString("artist") == artist) {
+                        byName = v
+                        foundKey = k
+                        break
+                    }
+                }
+            }
+            if (byName != null) {
+                desc = byName
+                engineLog("引擎：按名找回档案 " + title + "（key=" + foundKey + "）")
+            }
+        }
         if (desc == null) {
             // 没档案就没法重解析/换源——把原因记明，别再静默跳过（3.4.2）
             // 3.5.2 诊断抓现行：把当时的编号原文、档案总数、同名档案的编号
@@ -1103,6 +1069,7 @@ class KeepAliveService : Service() {
                             )
                         )
                         nativeUrl = newUrl
+                        nativeKey = newKey
                         pp.seekTo(idx3, 0)
                         pp.prepare()
                         pp.play()
@@ -1197,7 +1164,6 @@ class KeepAliveService : Service() {
         errSkipCount++
         errRetryUrl = ""
         errRetryCount = 0
-        errReresolvedUrl = ""
         if (errSkipCount > 3) {
             engineLog("引擎：断播点（连续出错） " + engineCounters())
             return
@@ -1301,7 +1267,7 @@ class KeepAliveService : Service() {
         )
     }
 
-    private fun playNative(url: String) {
+    private fun playNative(url: String, key: String = "") {
         val p = ensurePlayer()
         if (nativeActive && url == nativeUrl && p.playbackState != Player.STATE_IDLE) {
             // 同一条流已装载（多半是网页重载后回来接管）：不重启，只起播+同步；
@@ -1320,6 +1286,7 @@ class KeepAliveService : Service() {
             return
         }
         nativeUrl = url
+        nativeKey = key
         nativeActive = true
         playing = false
         positionMs = 0
@@ -1329,7 +1296,7 @@ class KeepAliveService : Service() {
             p.setPlaybackSpeed(pendingRate)
         } catch (_: Exception) {
         }
-        p.setMediaItem(MediaItem.Builder().setUri(url).setMediaId(url).build())
+        p.setMediaItem(MediaItem.Builder().setUri(url).setMediaId(key.ifEmpty { url }).build())
         p.prepare()
         p.play()
         startWatchdog()
@@ -1350,6 +1317,7 @@ class KeepAliveService : Service() {
         } catch (_: Exception) {
         }
         nativeUrl = ""
+        nativeKey = ""
         nativeActive = false
         if (playing) {
             playing = false
@@ -1529,7 +1497,7 @@ class KeepAliveService : Service() {
                 if (url.isNotEmpty() && armedItems.firstOrNull()?.url == url) {
                     armedItems.removeAt(0)
                 }
-                if (url.isNotEmpty()) playNative(url)
+                if (url.isNotEmpty()) playNative(url, intent.getStringExtra("key").orEmpty())
             }
             ACTION_NATIVE_PAUSE -> {
                 // 宽限期（已播完、等接播）内到达的 pause 多半是网页切歌前摇：
@@ -1549,7 +1517,7 @@ class KeepAliveService : Service() {
                     val p = player
                     if (p != null && p.playbackState == Player.STATE_IDLE && nativeUrl.isNotEmpty()) {
                         // 出错后播放器回到 IDLE，单独 play() 救不回来，整条重装
-                        playNative(nativeUrl)
+                        playNative(nativeUrl, nativeKey)
                     } else if (p != null && p.playbackState == Player.STATE_ENDED) {
                         // 播完后网页/用户再按播放：先跳回 0 再播（ENDED 单独 play() 不重启）
                         cancelPendingAdvance()
