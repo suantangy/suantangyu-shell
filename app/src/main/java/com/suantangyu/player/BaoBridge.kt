@@ -325,6 +325,25 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
+    /** 单脑第 1 步（3.7.0）：页面上下首改为给脑子发指令（脑子未就绪时壳回退遥控页面） */
+    @JavascriptInterface
+    fun cmdNext() {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_CMD
+            putExtra("cmd", "next")
+        }
+        activity.startService(intent)
+    }
+
+    @JavascriptInterface
+    fun cmdPrev() {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_CMD
+            putExtra("cmd", "prev")
+        }
+        activity.startService(intent)
+    }
+
     /** 单脑第 0 步（3.6.0）：完整队列快照，壳只收存做影子对账，不参与播放 */
     @JavascriptInterface
     fun postQueueSnapshot(json: String) {

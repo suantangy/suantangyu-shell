@@ -77,6 +77,7 @@ class KeepAliveService : Service() {
         const val ACTION_CURRENT_SONG = "com.suantangyu.player.CURRENT_SONG"
         // 单脑第 0 步（3.6.0）：完整队列快照（影子队列，只收存对账）
         const val ACTION_QUEUE_SNAPSHOT = "com.suantangyu.player.QUEUE_SNAPSHOT"
+        const val ACTION_BRAIN_CMD = "com.suantangyu.player.BRAIN_CMD"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -219,6 +220,8 @@ class KeepAliveService : Service() {
     private var queueMode: String = "seq"
     private var engine: LxEngine? = null
     private val resolveExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // 3.7.0：换源专用车道——2026-11-04 实测换源解析被补仓批次堵了 33 秒才轮上，物理隔离
+    private val swapExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     // 3.3.1 诊断：引擎日志内存环 + 计数器。断播点与 hello 时各推一份状态，
     // 页面重开（postHello）即可在 toast 里看到断播前的最后日志与计数。
     private val engineLogLock = Object()
@@ -344,7 +347,16 @@ class KeepAliveService : Service() {
         if (armedItems.isNotEmpty() && now - lastEngineAtMs < 10000) return
         val armedKeys = armedItems.map { it.key }.toSet()
         val ordered =
-            if (queueMode == "shuffle") queueAheadSongs.shuffled() else queueAheadSongs
+            if (queueMode == "shuffle" && brainActive) {
+                // 单脑第 1 步：随机补仓优先没播过的，一轮不重复从补仓就开始守
+                val fresh = queueAheadSongs.filter {
+                    !brainPlayed.contains(LxResolver.keyOfJson(it))
+                }
+                val rest = queueAheadSongs.filter {
+                    brainPlayed.contains(LxResolver.keyOfJson(it))
+                }
+                fresh.shuffled() + rest.shuffled()
+            } else if (queueMode == "shuffle") queueAheadSongs.shuffled() else queueAheadSongs
         val todo = ArrayList<org.json.JSONObject>()
         for (s in ordered) {
             if (todo.size >= 3) break
@@ -388,7 +400,7 @@ class KeepAliveService : Service() {
                             // 且跑道非空就直接接播队首；阶梯正在救当前曲时不抢。
                             val pp = player
                             if (nativeActive && pp != null && pp.playWhenReady &&
-                                !errRescuePending &&
+                                !errRescuePending && swapNotInFlight() &&
                                 (pp.playbackState == Player.STATE_IDLE ||
                                     pp.playbackState == Player.STATE_ENDED)
                             ) {
@@ -545,14 +557,16 @@ class KeepAliveService : Service() {
             watchdogEndedStall++
             if (watchdogEndedStall == 1 && armedItems.isNotEmpty()) {
                 cancelPendingAdvance()
-                doArmedAdvance()
+                advanceAfterEnd()
             } else if (watchdogEndedStall == 1 || watchdogEndedStall >= 3) {
-                if (armedItems.isEmpty()) {
+                if (armedItems.isEmpty() && brainActive) {
+                    brainEndedAdvance()
+                } else if (armedItems.isEmpty()) {
                     acquireGraceWakeLock()
                     pushSync(JSONObject().put("t", "ended"))
                 } else {
                     cancelPendingAdvance()
-                    doArmedAdvance()
+                    advanceAfterEnd()
                 }
                 if (watchdogEndedStall >= 3) watchdogEndedStall = 1
             }
@@ -563,7 +577,7 @@ class KeepAliveService : Service() {
         // 里已有歌（无论谁放的），此前无人接播、只能干等网页醒来。此处与
         // 补仓落袋的停摆接播互为兜底：还想播、跑道非空、播放器空闲 → 接播。
         if (st == Player.STATE_IDLE && wantPlay && !errRescuePending &&
-            armedItems.isNotEmpty()
+            swapNotInFlight() && armedItems.isNotEmpty()
         ) {
             val first = armedItems.firstOrNull()
             if (first != null) {
@@ -710,6 +724,7 @@ class KeepAliveService : Service() {
         lastAdvancedKey = item.key
         lastAdvancedUrl = item.url
         lastAdvanceAtMs = SystemClock.elapsedRealtime()
+        noteBrainStarted(item.key)
         if (playIt) {
             playNative(item.url, item.key)
             // 宽限接播是整表装载，剩下的预置曲目重新排进播放器队列
@@ -902,7 +917,10 @@ class KeepAliveService : Service() {
                     // （armed 为空时 scheduleArmedAdvance 直接 return）。
                     // 代价：醒着的页面自己的 next 会被抢先一步，PLAY_URL /
                     // ARM_NEXT 到达仍可接管（接播保护窗 + 接管记账不变）。
-                    if (armedItems.isNotEmpty()) {
+                    if (brainActive) {
+                        // 单脑第 1 步：播完接续归脑子算（跑道命中/现解析都在脑内闭环）
+                        brainEndedAdvance()
+                    } else if (armedItems.isNotEmpty()) {
                         cancelPendingAdvance()
                         doArmedAdvance()
                     } else {
@@ -1052,6 +1070,7 @@ class KeepAliveService : Service() {
         }
         errQqUsed = true
         errSwapSettled = false
+        errSwapStartMs = android.os.SystemClock.elapsedRealtime()
         val name = desc.optString("name").ifEmpty { title }
         val singer = desc.optString("artist")
         val plat = desc.optString("source").ifEmpty { "qq" }
@@ -1068,7 +1087,7 @@ class KeepAliveService : Service() {
                 doSkipAfterError(pp)
             }
         }, 5000L)
-        resolveExec.execute {
+        swapExec.execute {
             val remainMs = 5000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)
             val alt = searchQqAlt(desc, name, singer, plat, (remainMs / 1000L).toInt().coerceIn(2, 8))
             val newUrl = if (alt != null) {
@@ -1329,6 +1348,7 @@ class KeepAliveService : Service() {
     }
 
     private fun playNative(url: String, key: String = "") {
+        if (key.isNotEmpty()) noteBrainStarted(key)
         val p = ensurePlayer()
         if (nativeActive && url == nativeUrl && p.playbackState != Player.STATE_IDLE) {
             // 同一条流已装载（多半是网页重载后回来接管）：不重启，只起播+同步；
@@ -1396,6 +1416,7 @@ class KeepAliveService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        restoreBrainState()
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
@@ -1767,6 +1788,7 @@ class KeepAliveService : Service() {
                         shadowQueueKeys = keys
                         shadowCurKey = o.optString("curKey")
                         shadowMode = o.optString("mode")
+                        feedBrainFromSnapshot(o)
                         val known = HashSet<String>()
                         known.addAll(descriptorByKey.keys)
                         for (item in armedItems) {
@@ -1784,6 +1806,14 @@ class KeepAliveService : Service() {
                         engineLog(line)
                     } catch (_: Exception) {
                     }
+                }
+            }
+            ACTION_BRAIN_CMD -> {
+                // 单脑第 1 步：页面上下首指令。脑子未就绪（没喂过 v2 快照）时
+                // 回退老路遥控页面，保证按钮永远有效
+                when (intent.getStringExtra("cmd")) {
+                    "next" -> if (brainActive) brainManualNext() else sendControl("next")
+                    "prev" -> if (brainActive) brainManualPrev() else sendControl("prev")
                 }
             }
             ACTION_HELLO -> {
@@ -1888,7 +1918,305 @@ class KeepAliveService : Service() {
      * 通知栏按钮 / 锁屏 / 灵动岛 / 线控 → 网页的 window.__baoCtl。
      * Activity 活着就直调（不经过广播）；极端情况下 Activity 已死才走广播兜底。
      */
+
+    // ================= 单脑第 1 步（3.7.0）：脑子接管切歌 =================
+    // 队列/当前键/模式/已播名单由服务独占（快照 v2 喂入、落盘可恢复）；
+    // 切歌（播完接续、通知栏上下首、页面上下首指令）一律脑内计算，
+    // 跑道退化为脑内队列的渲染：命中跑道直接接播，未命中现解析。
+    private var brainQueue: ArrayList<org.json.JSONObject> = ArrayList()
+    private var brainQueueKeys: ArrayList<String> = ArrayList()
+    private var brainCurKey: String = ""
+    private var brainMode: String = "list"
+    private var brainPlayed: LinkedHashSet<String> = LinkedHashSet()
+    private var brainHistory: ArrayList<String> = ArrayList()
+    private var brainActive: Boolean = false
+    private var brainAdvanceBusy: Boolean = false
+    private var brainSaveRunnable: Runnable? = null
+    private var errSwapStartMs: Long = 0L // 换源开工时刻（踢子守卫判在飞用）
+
+    private fun feedBrainFromSnapshot(o: org.json.JSONObject) {
+        if (o.optInt("v", 1) < 2) return
+        val arr = o.optJSONArray("queue") ?: return
+        val qs = ArrayList<org.json.JSONObject>()
+        val ks = ArrayList<String>()
+        for (i in 0 until arr.length()) {
+            val sj = arr.optJSONObject(i) ?: continue
+            val k = LxResolver.keyOfJson(sj)
+            if (k.isEmpty()) continue
+            qs.add(sj)
+            ks.add(k)
+        }
+        if (qs.isEmpty()) return
+        brainQueue = qs
+        brainQueueKeys = ks
+        brainMode = o.optString("mode").ifEmpty { "list" }
+        if (brainCurKey.isEmpty()) brainCurKey = o.optString("curKey")
+        brainActive = true
+        persistBrainSoon()
+    }
+
+    /** 脑子认定的当前键：原生在播键优先（且须在队列内），否则用脑内记账 */
+    private fun brainCurrentKey(): String {
+        val nk = nativeKey
+        if (nk.isNotEmpty() && brainQueueKeys.contains(nk)) return nk
+        if (brainCurKey.isNotEmpty() && brainQueueKeys.contains(brainCurKey)) return brainCurKey
+        return nk
+    }
+
+    /** 每有一首真正开始播（页面起播/原生接播/脑内切歌/换源成功都经此）记一笔 */
+    private fun noteBrainStarted(key: String) {
+        if (key.isEmpty()) return
+        brainCurKey = key
+        brainPlayed.add(key)
+        if (brainHistory.lastOrNull() != key) {
+            brainHistory.add(key)
+            while (brainHistory.size > 200) brainHistory.removeAt(0)
+        }
+        persistBrainSoon()
+    }
+
+    private fun computeBrainNextKey(manual: Boolean): String? {
+        if (brainQueueKeys.isEmpty()) return null
+        val cur = brainCurrentKey()
+        val idx = brainQueueKeys.indexOf(cur)
+        if (brainMode == "single" && !manual) {
+            return if (idx >= 0) cur else brainQueueKeys.first()
+        }
+        if (brainMode == "shuffle" && brainQueueKeys.size > 1) {
+            var cands = brainQueueKeys.filter { it != cur && !brainPlayed.contains(it) }
+            if (cands.isEmpty()) {
+                engineLog("引擎：脑切歌 随机名单新一轮")
+                brainPlayed.clear()
+                if (cur.isNotEmpty()) brainPlayed.add(cur)
+                cands = brainQueueKeys.filter { it != cur }
+            }
+            if (cands.isEmpty()) return cur
+            return cands.random()
+        }
+        if (idx < 0) return brainQueueKeys.first()
+        return brainQueueKeys[(idx + 1) % brainQueueKeys.size]
+    }
+
+    private fun computeBrainPrevKey(): String? {
+        if (brainQueueKeys.isEmpty()) return null
+        val cur = brainCurrentKey()
+        if (brainMode == "shuffle") {
+            // 落雪式：按已播历史往回走（随机模式的上一首是「刚听过的那首」）
+            val pos = brainHistory.lastIndexOf(cur)
+            if (pos > 0) {
+                for (i in pos - 1 downTo 0) {
+                    val k = brainHistory[i]
+                    if (k != cur && brainQueueKeys.contains(k)) return k
+                }
+            }
+        }
+        val idx = brainQueueKeys.indexOf(cur)
+        if (idx < 0) return brainQueueKeys.last()
+        return brainQueueKeys[(idx - 1 + brainQueueKeys.size) % brainQueueKeys.size]
+    }
+
+    private fun brainNameOf(key: String): String {
+        val i = brainQueueKeys.indexOf(key)
+        if (i >= 0) return brainQueue[i].optString("name")
+        val d = descriptorByKey[key]
+        if (d != null) return d.optString("name")
+        return key.substringAfter("|")
+    }
+
+    /** 脑内切歌执行：跑道命中直接接播；未命中用脑内描述符现解析；解析失败顺延下一候选（最多 3 跳） */
+    private fun executeBrainAdvance(targetKey: String, cause: String, depth: Int) {
+        val fromKey = brainCurrentKey()
+        engineLog("引擎：脑切歌 " + cause + " → " + brainNameOf(targetKey) + "（" + brainMode + "）")
+        cancelPendingAdvance()
+        if (targetKey.isNotEmpty() && targetKey == fromKey) {
+            // 单曲重播 / 队列只剩这首：跳回 0 点重播，照旧发 repeat 同步
+            try {
+                player?.seekTo(0)
+                player?.play()
+            } catch (_: Exception) {
+            }
+            pushSync(
+                JSONObject().put("t", "advanced").put("key", targetKey)
+                    .put("url", nativeUrl).put("repeat", true)
+            )
+            noteBrainStarted(targetKey)
+            return
+        }
+        val ai = armedItems.indexOfFirst { it.key == targetKey }
+        if (ai >= 0) {
+            val item = armedItems[ai]
+            repeat(ai + 1) { if (armedItems.isNotEmpty()) armedItems.removeAt(0) }
+            dropQueueAheadThrough(targetKey)
+            applyAdvance(item, playIt = true)
+            return
+        }
+        val di = brainQueueKeys.indexOf(targetKey)
+        val desc = if (di >= 0) brainQueue[di] else descriptorByKey[targetKey]
+        if (desc == null || configSources.isEmpty()) {
+            // 无描述符/无音源：退回旧路兜底（跑道队首或宽限等页面）
+            if (armedItems.isNotEmpty()) doArmedAdvance() else scheduleArmedAdvance()
+            return
+        }
+        if (brainAdvanceBusy) return
+        brainAdvanceBusy = true
+        resolveExec.execute {
+            val url = try {
+                LxResolver.resolve(
+                    desc, configSources, configQuality, configAutoDown, lxEngine()
+                ) { m -> engineLog(m) }
+            } catch (_: Exception) {
+                null
+            }
+            tickHandler.post {
+                brainAdvanceBusy = false
+                if (!nativeActive) return@post
+                // 期间用户/页面已换歌：这一跳作废，别把人家的新歌顶掉
+                if (brainCurrentKey() != fromKey) return@post
+                if (!url.isNullOrEmpty()) {
+                    val item = ArmedItem(
+                        url, targetKey,
+                        desc.optString("name"), desc.optString("artist"),
+                        desc.optString("cover").ifEmpty { desc.optString("img") },
+                        false, true
+                    )
+                    dropQueueAheadThrough(targetKey)
+                    applyAdvance(item, playIt = true)
+                } else {
+                    engineLog("引擎：脑切歌解析失败 " + brainNameOf(targetKey))
+                    if (depth < 3) {
+                        val savedCur = brainCurKey
+                        brainCurKey = targetKey
+                        val nxt = computeBrainNextKey(true)
+                        brainCurKey = savedCur
+                        if (nxt != null && nxt != targetKey) {
+                            executeBrainAdvance(nxt, cause, depth + 1)
+                        } else if (armedItems.isNotEmpty()) {
+                            doArmedAdvance()
+                        }
+                    } else if (armedItems.isNotEmpty()) {
+                        doArmedAdvance()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun brainEndedAdvance() {
+        if (brainAdvanceBusy) return
+        val t = computeBrainNextKey(false)
+        if (t == null) {
+            if (armedItems.isNotEmpty()) doArmedAdvance() else scheduleArmedAdvance()
+            return
+        }
+        executeBrainAdvance(t, "ended", 0)
+    }
+
+    private fun brainManualNext() {
+        val t = computeBrainNextKey(true) ?: return
+        executeBrainAdvance(t, "next", 0)
+    }
+
+    private fun brainManualPrev() {
+        val t = computeBrainPrevKey() ?: return
+        executeBrainAdvance(t, "prev", 0)
+    }
+
+    /** 播完接播的统一入口：脑子活着归脑子算，没活着走 3.6 以前的老路 */
+    private fun advanceAfterEnd() {
+        if (brainActive) brainEndedAdvance() else doArmedAdvance()
+    }
+
+    /**
+     * 3.5.5 踢子守卫补丁（3.7.0）：换源未收账且开工未满 12 秒 = 救援在飞，
+     * 两处停摆接播都不许抢（2026-11-04 晚实测 4 次换源全被踢子抢先跳走，
+     * 根因是 errRescuePending 在阶梯派出后 1.5 秒即清、踢子看不见换源）。
+     * 12 秒上限防收账旗异常卡死把踢子永久锁死（换源自身预算才 5 秒）。
+     */
+    private fun swapNotInFlight(): Boolean {
+        if (errSwapSettled) return true
+        if (errSwapStartMs <= 0L) return true
+        return SystemClock.elapsedRealtime() - errSwapStartMs > 12000L
+    }
+
+    private fun persistBrainSoon() {
+        brainSaveRunnable?.let {
+            try {
+                tickHandler.removeCallbacks(it)
+            } catch (_: Exception) {
+            }
+        }
+        val r = Runnable { saveBrainState() }
+        brainSaveRunnable = r
+        try {
+            tickHandler.postDelayed(r, 500)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun saveBrainState() {
+        if (!brainActive) return
+        try {
+            val o = JSONObject()
+            o.put("queue", org.json.JSONArray(brainQueue))
+            o.put("curKey", brainCurKey)
+            o.put("mode", brainMode)
+            o.put("played", org.json.JSONArray(ArrayList(brainPlayed)))
+            o.put("history", org.json.JSONArray(brainHistory))
+            o.put("savedAt", System.currentTimeMillis())
+            java.io.File(filesDir, "brain_state.json")
+                .writeText(o.toString(), Charsets.UTF_8)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 服务重启恢复账本：只恢复队列/当前/模式/已播名单，不自动起播（播放意图随 hello/起播回来） */
+    private fun restoreBrainState() {
+        try {
+            val f = java.io.File(filesDir, "brain_state.json")
+            if (!f.exists()) return
+            val o = JSONObject(f.readText(Charsets.UTF_8))
+            val arr = o.optJSONArray("queue") ?: return
+            val qs = ArrayList<org.json.JSONObject>()
+            val ks = ArrayList<String>()
+            for (i in 0 until arr.length()) {
+                val sj = arr.optJSONObject(i) ?: continue
+                val k = LxResolver.keyOfJson(sj)
+                if (k.isEmpty()) continue
+                qs.add(sj)
+                ks.add(k)
+            }
+            if (qs.isEmpty()) return
+            brainQueue = qs
+            brainQueueKeys = ks
+            brainCurKey = o.optString("curKey")
+            brainMode = o.optString("mode").ifEmpty { "list" }
+            brainPlayed = LinkedHashSet()
+            val pa = o.optJSONArray("played")
+            if (pa != null) {
+                for (i in 0 until pa.length()) brainPlayed.add(pa.optString(i))
+            }
+            brainHistory = ArrayList()
+            val ha = o.optJSONArray("history")
+            if (ha != null) {
+                for (i in 0 until ha.length()) brainHistory.add(ha.optString(i))
+            }
+            brainActive = true
+            val nm = if (brainCurKey.isNotEmpty()) brainNameOf(brainCurKey) else ""
+            val curPart = if (nm.isNotEmpty()) " 当前 " + nm else ""
+            engineLog("引擎：脑状态恢复 队列 " + qs.size + " 首" + curPart)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun sendControl(action: String) {
+        // 单脑第 1 步：脑子活着时上下首由脑内计算，不再遥控页面
+        // （页面冻住时通知栏/锁屏按钮照样有效，这正是本步要切断的缝）
+        if ((action == "next" || action == "prev") && brainActive && nativeActive) {
+            tickHandler.post {
+                if (action == "next") brainManualNext() else brainManualPrev()
+            }
+            return
+        }
         val js = "window.__baoCtl && window.__baoCtl('$action')"
         val inst = MainActivity.instance
         if (inst != null) {
