@@ -250,11 +250,13 @@ object LxResolver {
         wantQ: String,
         autoDown: Boolean,
         engine: LxEngine?,
+        budgetMs: Long = 90000L,
         log: (String) -> Unit
     ): String? {
-        // 3.3.1：单曲解析总时限 90 秒（脚本源慢调用由引擎 30 秒/次封顶，
-        // 这里再封整曲上限，防一首坏歌把单线程解析队列拖死、后面全断）
-        val deadline = System.currentTimeMillis() + 90000L
+        // 3.3.1：单曲解析总时限（默认 90 秒，脚本源慢调用由引擎 30 秒/次封顶，
+        // 这里再封整曲上限，防一首坏歌把单线程解析队列拖死、后面全断）；
+        // 3.5.4：换源路径传小预算（5 秒总限的剩余量），到点就收，不再逐档磨
+        val deadline = System.currentTimeMillis() + budgetMs
         val tiers = if (autoDown) qualityFallbacks(wantQ) else listOf(wantQ)
         for (q in tiers) {
             if (System.currentTimeMillis() > deadline) {

@@ -232,6 +232,7 @@ class KeepAliveService : Service() {
     private var errEpisodeKey = ""
     private var errQqNewKey = ""
     private var errQqUsed = false
+    private var errSwapSettled = true // 换源收账标记（3.5.4：超时看门狗与完成回调抢答用）
     private var pendingSwapFor = ""
     private var pendingSwapSong: org.json.JSONObject? = null
     private var engineFailCount = 0
@@ -820,6 +821,7 @@ class KeepAliveService : Service() {
                 errEpisodeKey = ""
                 errQqNewKey = ""
                 errQqUsed = false
+                errSwapSettled = true
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -1007,17 +1009,32 @@ class KeepAliveService : Service() {
             return
         }
         errQqUsed = true
+        errSwapSettled = false
         val name = desc.optString("name").ifEmpty { title }
         val singer = desc.optString("artist")
         val plat = desc.optString("source").ifEmpty { "qq" }
         engineLog("引擎：换源搜索 " + name)
+        // 3.5.4（cheng 定）：换源全程 5 秒封顶——到点还没成，记超时并跳过，
+        // 不让喘不过气的接口把静默拖到分钟级；迟到的结果由收账标记 +
+        // nativeUrl 守卫丢弃（已跳走的不复活；断播点没跳成的仍可被迟到救兵救）
+        val swapStartMs = android.os.SystemClock.elapsedRealtime()
+        tickHandler.postDelayed({
+            val pp = player
+            if (!errSwapSettled && pp != null && nativeActive && pp.playWhenReady && nativeUrl == curUrl) {
+                errSwapSettled = true
+                engineLog("引擎：换源无果 " + name + "（5 秒超时）")
+                doSkipAfterError(pp)
+            }
+        }, 5000L)
         resolveExec.execute {
-            val alt = searchQqAlt(desc, name, singer, plat)
+            val remainMs = 5000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)
+            val alt = searchQqAlt(desc, name, singer, plat, (remainMs / 1000L).toInt().coerceIn(2, 8))
             val newUrl = if (alt != null) {
                 try {
                     LxResolver.resolve(
                         alt, configSources, configQuality, configAutoDown,
-                        lxEngine()
+                        lxEngine(),
+                        (5000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)).coerceAtLeast(1000L)
                     ) { m -> engineLog(m) }?.toString() ?: ""
                 } catch (_: Exception) {
                     ""
@@ -1030,6 +1047,7 @@ class KeepAliveService : Service() {
                 if (pp == null || !nativeActive || nativeUrl != curUrl) {
                     return@post
                 }
+                errSwapSettled = true
                 if (alt != null && newUrl.isNotEmpty()) {
                     val newKey = LxResolver.keyOfJson(alt)
                     descriptorByKey[newKey] = alt
@@ -1087,7 +1105,8 @@ class KeepAliveService : Service() {
     /** QQ 搜索挑一首可换的：非 QQ 曲取第一条可用结果；QQ 曲取第一个不同
      * songmid 的版本（同版本在第 2 步已重解析过，换了等于没换，故不取）。 */
     private fun searchQqAlt(
-        orig: org.json.JSONObject, name: String, singer: String, plat: String
+        orig: org.json.JSONObject, name: String, singer: String, plat: String,
+        timeoutSec: Int = 8
     ): org.json.JSONObject? {
         val kw = (name + " " + singer).trim()
         if (kw.isEmpty()) return null
@@ -1098,7 +1117,7 @@ class KeepAliveService : Service() {
             LxHttp.fetchJson(
                 url,
                 headers = mapOf("Referer" to "https://y.qq.com/"),
-                timeoutSec = 8
+                timeoutSec = timeoutSec
             )
         } catch (_: Exception) {
             null
