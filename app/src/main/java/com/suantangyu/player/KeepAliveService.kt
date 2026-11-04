@@ -75,6 +75,8 @@ class KeepAliveService : Service() {
         const val ACTION_SOURCES_CONFIG = "com.suantangyu.player.SOURCES_CONFIG"
         const val ACTION_QUEUE_AHEAD = "com.suantangyu.player.QUEUE_AHEAD"
         const val ACTION_CURRENT_SONG = "com.suantangyu.player.CURRENT_SONG"
+        // 单脑第 0 步（3.6.0）：完整队列快照（影子队列，只收存对账）
+        const val ACTION_QUEUE_SNAPSHOT = "com.suantangyu.player.QUEUE_SNAPSHOT"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -209,6 +211,11 @@ class KeepAliveService : Service() {
     private var configAutoDown: Boolean = true
     private var lastSourcesConfigJson: String = ""
     private var queueAheadSongs: List<org.json.JSONObject> = emptyList()
+    // 单脑第 0 步（3.6.0）：影子队列快照（只存不用）与原文去重
+    private var shadowSnapshotJson: String = ""
+    private var shadowQueueKeys: Set<String> = emptySet()
+    private var shadowCurKey: String = ""
+    private var shadowMode: String = ""
     private var queueMode: String = "seq"
     private var engine: LxEngine? = null
     private val resolveExec = java.util.concurrent.Executors.newSingleThreadExecutor()
@@ -1734,6 +1741,49 @@ class KeepAliveService : Service() {
                         }
                     }
                 } catch (_: Exception) {
+                }
+            }
+            ACTION_QUEUE_SNAPSHOT -> {
+                // 单脑第 0 步（3.6.0）：影子队列——完整队列快照只收存对账，
+                // 不参与任何播放决策（第 1 步起才由脑子接管）。与自家账本
+                // （档案表 ∪ 跑道 ∪ 当前原生键）对一次，偏差打进引擎日志：
+                // 看的是缺失能否随下一份快照归零、当前键是否一致。
+                val raw = intent.getStringExtra("json") ?: ""
+                if (raw.isNotEmpty() && raw != shadowSnapshotJson) {
+                    shadowSnapshotJson = raw
+                    try {
+                        val o = org.json.JSONObject(raw)
+                        val arr = o.optJSONArray("queue")
+                        val keys = HashSet<String>()
+                        var n = 0
+                        if (arr != null) {
+                            n = arr.length()
+                            for (i in 0 until arr.length()) {
+                                val sj = arr.optJSONObject(i) ?: continue
+                                val k = LxResolver.keyOfJson(sj)
+                                if (k.isNotEmpty()) keys.add(k)
+                            }
+                        }
+                        shadowQueueKeys = keys
+                        shadowCurKey = o.optString("curKey")
+                        shadowMode = o.optString("mode")
+                        val known = HashSet<String>()
+                        known.addAll(descriptorByKey.keys)
+                        for (item in armedItems) {
+                            if (item.key.isNotEmpty()) known.add(item.key)
+                        }
+                        if (nativeKey.isNotEmpty()) known.add(nativeKey)
+                        val missing = known.filter { !keys.contains(it) }
+                        val agree = if (nativeKey.isEmpty()) "—"
+                            else if (shadowCurKey == nativeKey) "是" else "否"
+                        var line = "引擎：影子队列 同步 " + n + " 首 已知 " + known.size +
+                            " 缺失 " + missing.size + " 当前一致 " + agree
+                        if (missing.isNotEmpty()) {
+                            line += " 缺失例：" + missing.first().substringAfter("|")
+                        }
+                        engineLog(line)
+                    } catch (_: Exception) {
+                    }
                 }
             }
             ACTION_HELLO -> {

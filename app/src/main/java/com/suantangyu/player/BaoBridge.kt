@@ -324,4 +324,14 @@ class BaoBridge(private val activity: MainActivity) {
         }
         activity.startService(intent)
     }
+
+    /** 单脑第 0 步（3.6.0）：完整队列快照，壳只收存做影子对账，不参与播放 */
+    @JavascriptInterface
+    fun postQueueSnapshot(json: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_QUEUE_SNAPSHOT
+            putExtra("json", json)
+        }
+        activity.startService(intent)
+    }
 }
