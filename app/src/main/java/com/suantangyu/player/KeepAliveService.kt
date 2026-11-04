@@ -374,6 +374,23 @@ class KeepAliveService : Service() {
                         if (armedItems.size < 8 && armedItems.none { it.key == item.key }) {
                             armedItems.add(item)
                             syncUpcomingToPlayer()
+                            // 3.5.5：停摆接播——歌补回来了、播放器却已停摆
+                            // （看门狗停机到 IDLE、或 ENDED 后无人接）时，只放上
+                            // 跑道没人踢就永远没声（2026-11-04 Nevada 断播：
+                            // 补仓全数落袋、跑道 3 首，无人接播）。有播放意图
+                            // 且跑道非空就直接接播队首；阶梯正在救当前曲时不抢。
+                            val pp = player
+                            if (nativeActive && pp != null && pp.playWhenReady &&
+                                !errRescuePending &&
+                                (pp.playbackState == Player.STATE_IDLE ||
+                                    pp.playbackState == Player.STATE_ENDED)
+                            ) {
+                                val first = armedItems.firstOrNull()
+                                if (first != null) {
+                                    engineLog("引擎：停摆接播 " + first.title + "（补仓落袋时播放器已停摆）")
+                                    doArmedAdvance()
+                                }
+                            }
                         }
                     }
                     engineLog(
@@ -535,6 +552,20 @@ class KeepAliveService : Service() {
             return
         }
         watchdogEndedStall = 0
+        // 3.5.5：IDLE 停摆兜底——看门狗第二击把播放器停到 IDLE 后，若跑道
+        // 里已有歌（无论谁放的），此前无人接播、只能干等网页醒来。此处与
+        // 补仓落袋的停摆接播互为兜底：还想播、跑道非空、播放器空闲 → 接播。
+        if (st == Player.STATE_IDLE && wantPlay && !errRescuePending &&
+            armedItems.isNotEmpty()
+        ) {
+            val first = armedItems.firstOrNull()
+            if (first != null) {
+                engineLog("引擎：停摆接播 " + first.title + "（看门狗巡检发现播放器空闲）")
+                cancelPendingAdvance()
+                doArmedAdvance()
+            }
+            return
+        }
         // 非缓冲态（已停/空闲）不归缓冲看门狗管
         if (st != Player.STATE_BUFFERING) {
             watchdogStall = 0
@@ -551,6 +582,9 @@ class KeepAliveService : Service() {
         }
         watchdogStall++
         if (watchdogStall == 1) {
+            // 3.5.5：看门狗动作留痕——此前两击都不写引擎日志，缓冲挂死在
+            // 日志里毫无踪影（2026-11-04 Nevada 断播复盘的记录盲区）
+            engineLog("引擎：看门狗重拉 " + title + "（缓冲无进展）")
             // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
             // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
             // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
@@ -575,6 +609,7 @@ class KeepAliveService : Service() {
             // 第二次仍卡：停掉播放器（网页重试须走整条装载，别在坏连接上复用），
             // 发 error 同步交网页的重试/换源降级链处理
             watchdogStall = 0
+            engineLog("引擎：看门狗停机 " + title + "（缓冲无进展，错误已交网页）")
             try {
                 p.stop()
             } catch (_: Exception) {
