@@ -518,7 +518,7 @@ class KeepAliveService : Service() {
                 val dlUri = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
                 val stem = filename.substringBeforeLast('.', filename)
                 val likeArg = stem
-                    .replace("\", "\\").replace("%", "\%").replace("_", "\_") + ".%"
+                    .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ".%"
                 contentResolver.query(
                     dlUri,
                     arrayOf(
@@ -526,7 +526,7 @@ class KeepAliveService : Service() {
                         android.provider.MediaStore.Downloads.RELATIVE_PATH,
                         android.provider.MediaStore.Downloads.DISPLAY_NAME
                     ),
-                    android.provider.MediaStore.Downloads.DISPLAY_NAME + " LIKE ? ESCAPE '\'",
+                    android.provider.MediaStore.Downloads.DISPLAY_NAME + " LIKE ? ESCAPE '\\'",
                     arrayOf(likeArg),
                     null
                 )?.use { c ->
