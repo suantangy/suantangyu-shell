@@ -414,6 +414,27 @@ class KeepAliveService : Service() {
                 url.contains("m4a", true) || url.contains(".mp4", true) -> "m4a"
                 else -> "mp3"
             }
+            // 3.9.4 只升不降：本地已存着更好的（localFileForKey 已排除标记坏的
+            // 和文件丢失的），这次只拿到更差的就不许覆盖——3.9.3 的「新来换旧」
+            // 少了这道门，cheng 实测：第一次存的无损被第二次的普通版顶掉了
+            val oldLocal = localFileForKey(key)
+            if (oldLocal != null) {
+                fun qRank(e: String) = when (e.lowercase()) {
+                    "flac" -> 0
+                    "m4a" -> 1
+                    else -> 2
+                }
+                val oldExt = oldLocal.name.substringAfterLast('.', "")
+                if (qRank(ext) > qRank(oldExt)) {
+                    engineLog("引擎：下载未覆盖 " + name + "（本地已是无损版，这次只有普通版）")
+                    pushSync(
+                        JSONObject().put("t", "dl").put("key", key)
+                            .put("ok", true).put("kept", true)
+                            .put("size", oldLocal.length())
+                    )
+                    return
+                }
+            }
             val fname = dlMd5(key) + "." + ext
             val dest = java.io.File(dlDir(), fname)
             part = java.io.File(dlDir(), fname + ".part")
