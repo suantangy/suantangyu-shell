@@ -379,6 +379,7 @@ class KeepAliveService : Service() {
     private fun localFileForKey(key: String): java.io.File? {
         if (key.isEmpty()) return null
         val e = dlIndexLoad().optJSONObject(key) ?: return null
+        if (e.optBoolean("bad")) return null // 播放失败已标记：不再试本地，免得每点必先摔一跤
         val fn = e.optString("file")
         if (fn.isEmpty()) return null
         val f = java.io.File(dlDir(), fn)
@@ -1145,15 +1146,21 @@ class KeepAliveService : Service() {
                     .put("http", httpCode)
                     .put("msg", (error.message ?: "").take(120))
             )
-            // 3.9.0：本地文件播出错 = 文件损坏——网络阶梯（重试/换源）治不了
-            // 本地文件：删文件摘索引、打行留痕，回在线路径把当前曲重走一遍，
-            // 一次性自愈不进阶梯；删后 localFileForKey 落空，天然防重复进此分支
+            // 本地文件播出错：不进网络阶梯（重试/换源治不了本地文件），回在线
+            // 路径把当前曲重走一遍。但只标记不删——出错未必是文件坏了（3.9.0
+            // 的 file:// 拒收就是播放器配置问题、文件是好的，误删是二次伤害）；
+            // 标记后本地查询自动跳过这首，重新下载会覆盖条目、标记自愈
             if (nativeUrl.startsWith("file:") && nativeKey.isNotEmpty() &&
                 localFileForKey(nativeKey) != null
             ) {
                 val healKey = nativeKey
-                deleteLocalDownload(healKey)
-                engineLog("引擎：本地文件损坏，已删除 " + title)
+                try {
+                    val idx = dlIndexLoad()
+                    idx.optJSONObject(healKey)?.put("bad", true)
+                    dlIndexSave()
+                } catch (_: Exception) {
+                }
+                engineLog("引擎：本地文件播放失败，已标记跳过 " + title)
                 brainStartKey = healKey
                 tickHandler.postDelayed({
                     brainOpGen++
@@ -1508,9 +1515,15 @@ class KeepAliveService : Service() {
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
+        // 数据源必须按协议分发：DefaultDataSource 认 file:// 等本地协议，
+        // http(s) 才走上面的 httpFactory（UA/Referer/超时全不变）。此前直接把
+        // httpFactory 设给媒体源工厂，file:// 被 HttpDataSource 当场拒收——
+        // 3.9.0 原生下载的本地文件就是这样播不了的（2026-11-05 美人鱼抓现行）
+        val dataSourceFactory =
+            androidx.media3.datasource.DefaultDataSource.Factory(this, httpFactory)
         val p = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
-                DefaultMediaSourceFactory(this).setDataSourceFactory(httpFactory)
+                DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
             )
             .setAudioAttributes(attrs, true) // 播放器自管音频焦点（抢断/恢复/降音量）
             .setHandleAudioBecomingNoisy(true) // 拔耳机自动暂停
