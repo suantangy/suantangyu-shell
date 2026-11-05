@@ -437,12 +437,21 @@ class KeepAliveService : Service() {
             if (dest.exists()) dest.delete()
             if (!part.renameTo(dest)) throw Exception("改名失败")
             val idx = dlIndexLoad()
+            // 3.9.3：换格式重下时旧文件要删——文件名带扩展名，.flac 换成 .mp3
+            // 后旧那份没人管会成孤儿白占盘（2026-11-05 黄昏实测 35MB 孤儿）
+            val oldDlFile = idx.optJSONObject(key)?.optString("file") ?: ""
             idx.put(
                 key, JSONObject()
                     .put("file", fname).put("size", size)
                     .put("name", name).put("artist", artist)
                     .put("ts", System.currentTimeMillis())
             )
+            if (oldDlFile.isNotEmpty() && oldDlFile != fname) {
+                try {
+                    java.io.File(dlDir(), oldDlFile).delete()
+                } catch (_: Exception) {
+                }
+            }
             // 上限 80 与网页名单同数：只增不删会吃满盘，超限按时间删最老
             while (idx.length() > 80) {
                 var oldestKey: String? = null
@@ -469,7 +478,7 @@ class KeepAliveService : Service() {
             ok = true
             engineLog(
                 "引擎：下载完成 " + name + "（" +
-                    String.format("%.1f", size / 1048576.0) + " MB）"
+                    String.format("%.1f", size / 1048576.0) + " MB）key=" + key
             )
             exportDownloadCopy(dest, filename, ext, name)
         } catch (e: Exception) {
@@ -502,27 +511,36 @@ class KeepAliveService : Service() {
                 "m4a" -> "audio/mp4"
                 else -> "audio/mpeg"
             }
-            // 3.9.2：同名旧副本先删再导——重复下载同一首，系统「下载/酸汤鱼音乐」
-            // 里永远只留一份（此前每次导出都新增一条、系统自动改名带 (1)，
-            // cheng 2026-11-05 在文件管理器里实见两份后定的）
+            // 导出前按「歌」清旧：同主干名（歌名 - 歌手，不看扩展名）的旧副本
+            // 先删再导——系统「下载/酸汤鱼音乐」里一首永远只留一份。3.9.2 只按
+            // 同名删，管不住 flac/mp3 换格式后并排两份（cheng 2026-11-05 实见）
             try {
                 val dlUri = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                val stem = filename.substringBeforeLast('.', filename)
+                val likeArg = stem
+                    .replace("\", "\\").replace("%", "\%").replace("_", "\_") + ".%"
                 contentResolver.query(
                     dlUri,
                     arrayOf(
                         android.provider.MediaStore.Downloads._ID,
-                        android.provider.MediaStore.Downloads.RELATIVE_PATH
+                        android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                        android.provider.MediaStore.Downloads.DISPLAY_NAME
                     ),
-                    android.provider.MediaStore.Downloads.DISPLAY_NAME + "=?",
-                    arrayOf(filename),
+                    android.provider.MediaStore.Downloads.DISPLAY_NAME + " LIKE ? ESCAPE '\'",
+                    arrayOf(likeArg),
                     null
                 )?.use { c ->
                     val idCol = c.getColumnIndex(android.provider.MediaStore.Downloads._ID)
                     val pathCol =
                         c.getColumnIndex(android.provider.MediaStore.Downloads.RELATIVE_PATH)
+                    val nameCol =
+                        c.getColumnIndex(android.provider.MediaStore.Downloads.DISPLAY_NAME)
                     while (c.moveToNext()) {
                         val rp = if (pathCol >= 0) c.getString(pathCol) ?: "" else ""
-                        if (rp.trimEnd('/') == "Download/酸汤鱼音乐" && idCol >= 0) {
+                        val dn = if (nameCol >= 0) c.getString(nameCol) ?: "" else ""
+                        if (rp.trimEnd('/') == "Download/酸汤鱼音乐" && idCol >= 0 &&
+                            dn.substringBeforeLast('.', dn) == stem
+                        ) {
                             contentResolver.delete(
                                 android.content.ContentUris.withAppendedId(dlUri, c.getLong(idCol)),
                                 null, null
@@ -2304,7 +2322,7 @@ class KeepAliveService : Service() {
     /** 脑内切歌执行：跑道命中直接接播；未命中用脑内描述符现解析；解析失败顺延下一候选（最多 3 跳） */
     private fun executeBrainAdvance(targetKey: String, cause: String, depth: Int) {
         val fromKey = brainCurrentKey()
-        engineLog("引擎：脑切歌 " + cause + " → " + brainNameOf(targetKey) + "（" + brainMode + "）")
+        engineLog("引擎：脑切歌 " + cause + " → " + brainNameOf(targetKey) + "（" + brainMode + "）" + if (cause == "start") " key=" + targetKey else "")
         cancelPendingAdvance()
         // 「目标即当前」捷径只在原生确实装着这首时成立：冷启动时脑内当前键是被
         // 快照预种的，播放器里什么都没有，走捷径会把点播变成一次假对齐（第 2 步实读抓出）
@@ -2336,7 +2354,7 @@ class KeepAliveService : Service() {
                 d2?.optString("artist") ?: "",
                 cov, false, true
             )
-            engineLog("引擎：本地播放 " + item.title)
+            engineLog("引擎：本地播放 " + item.title + " key=" + item.key)
             if (cause == "start" && targetKey == brainStartKey) brainStartKey = ""
             armedItems.removeAll { it.key == targetKey }
             dropQueueAheadThrough(targetKey)
