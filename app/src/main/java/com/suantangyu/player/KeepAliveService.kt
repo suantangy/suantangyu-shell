@@ -2176,7 +2176,7 @@ class KeepAliveService : Service() {
                 try {
                     if (brainQueue.isNotEmpty() && brainCurKey.isNotEmpty()) {
                         val qa = JSONArray()
-                        for (qs in brainQueue) qa.put(JSONObject(qs))
+                        for (qs in brainQueue) qa.put(qs)
                         pushSync(
                             JSONObject().put("t", "restore")
                                 .put("queue", qa)
