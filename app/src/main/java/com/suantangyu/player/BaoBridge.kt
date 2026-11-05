@@ -344,6 +344,18 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
+    /** 单脑第 2 步（3.8.0）：网页点播改发「播这一首」指令，解析与起播归脑子；
+     *  脑子明确办不了时会回推 startfailed，网页再走老路自救 */
+    @JavascriptInterface
+    fun cmdPlayKey(key: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_CMD
+            putExtra("cmd", "playkey")
+            putExtra("key", key)
+        }
+        activity.startService(intent)
+    }
+
     /** 单脑第 0 步（3.6.0）：完整队列快照，壳只收存做影子对账，不参与播放 */
     @JavascriptInterface
     fun postQueueSnapshot(json: String) {

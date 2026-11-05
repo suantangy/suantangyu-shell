@@ -1814,6 +1814,7 @@ class KeepAliveService : Service() {
                 when (intent.getStringExtra("cmd")) {
                     "next" -> if (brainActive) brainManualNext() else sendControl("next")
                     "prev" -> if (brainActive) brainManualPrev() else sendControl("prev")
+                    "playkey" -> brainPlayKey(intent.getStringExtra("key").orEmpty())
                 }
             }
             ACTION_HELLO -> {
@@ -1931,6 +1932,9 @@ class KeepAliveService : Service() {
     private var brainHistory: ArrayList<String> = ArrayList()
     private var brainActive: Boolean = false
     private var brainAdvanceBusy: Boolean = false
+    private var brainStartBusy: Boolean = false
+    private var brainOpGen: Int = 0 // 意图代次：新意图一来，旧解析落地作废（与落雪 gettingUrlId 同构）
+    private var brainStartKey: String = "" // 正在办的起播键（终点回执 startfailed 按它回）
     private var brainSaveRunnable: Runnable? = null
     private var errSwapStartMs: Long = 0L // 换源开工时刻（踢子守卫判在飞用）
 
@@ -2028,7 +2032,9 @@ class KeepAliveService : Service() {
         val fromKey = brainCurrentKey()
         engineLog("引擎：脑切歌 " + cause + " → " + brainNameOf(targetKey) + "（" + brainMode + "）")
         cancelPendingAdvance()
-        if (targetKey.isNotEmpty() && targetKey == fromKey) {
+        // 「目标即当前」捷径只在原生确实装着这首时成立：冷启动时脑内当前键是被
+        // 快照预种的，播放器里什么都没有，走捷径会把点播变成一次假对齐（第 2 步实读抓出）
+        if (targetKey.isNotEmpty() && targetKey == fromKey && nativeActive && nativeKey == targetKey) {
             // 单曲重播 / 队列只剩这首：跳回 0 点重播，照旧发 repeat 同步
             try {
                 player?.seekTo(0)
@@ -2053,13 +2059,25 @@ class KeepAliveService : Service() {
         val di = brainQueueKeys.indexOf(targetKey)
         val desc = if (di >= 0) brainQueue[di] else descriptorByKey[targetKey]
         if (desc == null || configSources.isEmpty()) {
-            // 无描述符/无音源：退回旧路兜底（跑道队首或宽限等页面）
-            if (armedItems.isNotEmpty()) doArmedAdvance() else scheduleArmedAdvance()
+            // 无描述符/无音源：退回旧路兜底（跑道队首或宽限等页面）；
+            // 起播无跑道可退时必须给终点回执，不许把点播晾在静默里
+            if (armedItems.isNotEmpty()) doArmedAdvance()
+            else if (cause == "start") failBrainStart(brainNameOf(targetKey))
+            else scheduleArmedAdvance()
             return
         }
-        if (brainAdvanceBusy) return
-        brainAdvanceBusy = true
-        resolveExec.execute {
+        // 单脑第 2 步：起播（cause=start）走 swapExec 优先车道，不排补仓的队；
+        // 其余切歌仍走 resolveExec。两条车道各自 busy，落地回主线程串行执行。
+        val isStart = cause == "start"
+        if (isStart) {
+            brainStartBusy = true
+        } else {
+            if (brainAdvanceBusy) return
+            brainAdvanceBusy = true
+        }
+        val gen = brainOpGen
+        val exec = if (isStart) swapExec else resolveExec
+        exec.execute {
             val url = try {
                 LxResolver.resolve(
                     desc, configSources, configQuality, configAutoDown, lxEngine()
@@ -2068,11 +2086,15 @@ class KeepAliveService : Service() {
                 null
             }
             tickHandler.post {
-                brainAdvanceBusy = false
-                if (!nativeActive) return@post
+                if (isStart) brainStartBusy = false else brainAdvanceBusy = false
+                // 意图代次已变（用户又点了别的）：整跳作废，终点由新意图负责
+                if (gen != brainOpGen) return@post
+                // 起播在原生未激活时正是冷启动常态（全天第一首），不能按切歌的作废规矩丢掉
+                if (!nativeActive && !isStart) return@post
                 // 期间用户/页面已换歌：这一跳作废，别把人家的新歌顶掉
                 if (brainCurrentKey() != fromKey) return@post
                 if (!url.isNullOrEmpty()) {
+                    if (isStart && targetKey == brainStartKey) brainStartKey = ""
                     val item = ArmedItem(
                         url, targetKey,
                         desc.optString("name"), desc.optString("artist"),
@@ -2092,9 +2114,13 @@ class KeepAliveService : Service() {
                             executeBrainAdvance(nxt, cause, depth + 1)
                         } else if (armedItems.isNotEmpty()) {
                             doArmedAdvance()
+                        } else if (cause == "start") {
+                            failBrainStart(brainNameOf(if (brainStartKey.isNotEmpty()) brainStartKey else targetKey))
                         }
                     } else if (armedItems.isNotEmpty()) {
                         doArmedAdvance()
+                    } else if (cause == "start") {
+                        failBrainStart(brainNameOf(if (brainStartKey.isNotEmpty()) brainStartKey else targetKey))
                     }
                 }
             }
@@ -2112,13 +2138,52 @@ class KeepAliveService : Service() {
     }
 
     private fun brainManualNext() {
+        brainOpGen++
         val t = computeBrainNextKey(true) ?: return
         executeBrainAdvance(t, "next", 0)
     }
 
     private fun brainManualPrev() {
+        brainOpGen++
         val t = computeBrainPrevKey() ?: return
         executeBrainAdvance(t, "prev", 0)
+    }
+
+    /**
+     * 单脑第 2 步：网页点播起播入口。三分支——无档案回执失败（网页走老路）、
+     * 点的正是当前在播这首只补对齐同步不重启、其余按编号起播。
+     * 起播的每一跳都必须落到终点（成功 advanced 或 failBrainStart 回执），
+     * 不许把点播晾在静默里；被新意图代次作废的跳不推终点，新意图自带终点。
+     */
+    private fun brainPlayKey(key: String) {
+        if (key.isEmpty()) return
+        val di = brainQueueKeys.indexOf(key)
+        val desc = if (di >= 0) brainQueue[di] else descriptorByKey[key]
+        if (desc == null) {
+            engineLog("引擎：脑起播无档案 " + key.substringAfter("|"))
+            pushSync(JSONObject().put("t", "startfailed").put("key", key))
+            return
+        }
+        if (key == brainCurrentKey() && nativeActive) {
+            pushSync(
+                JSONObject().put("t", "advanced").put("key", key)
+                    .put("url", nativeUrl).put("repeat", false)
+            )
+            return
+        }
+        brainOpGen++
+        brainStartKey = key
+        executeBrainAdvance(key, "start", 0)
+    }
+
+    /** 起播终点回执：脑子明确办不了，网页收到后走老路自救 */
+    private fun failBrainStart(name: String) {
+        val k = brainStartKey
+        brainStartKey = ""
+        engineLog("引擎：脑起播失败 " + name + "（无可用接续）")
+        if (k.isNotEmpty()) {
+            pushSync(JSONObject().put("t", "startfailed").put("key", k))
+        }
     }
 
     /** 播完接播的统一入口：脑子活着归脑子算，没活着走 3.6 以前的老路 */
