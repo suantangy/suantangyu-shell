@@ -365,4 +365,35 @@ class BaoBridge(private val activity: MainActivity) {
         }
         activity.startService(intent)
     }
+
+    /** 壳原生下载（3.9.0）：网页把当场解析好的地址与歌曲信息递来，壳自己拉
+     * 文件存盘——网页抓文件会被 CDN 跨域挡死（只剩名单），原生请求没有这道墙 */
+    @JavascriptInterface
+    fun downloadSong(json: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_DOWNLOAD
+            putExtra("json", json)
+        }
+        activity.startService(intent)
+    }
+
+    /** 已下载对账（3.9.0）：返回壳里真有文件的歌曲编号（JSON 数组字符串），
+     * 网页开机时拿它给「已下载」名单打/摘本地标记——文件真相在壳 */
+    @JavascriptInterface
+    fun getDownloadedKeys(): String {
+        return try {
+            val f = java.io.File(activity.filesDir, "dl_index.json")
+            if (!f.exists()) {
+                "[]"
+            } else {
+                val o = org.json.JSONObject(f.readText(Charsets.UTF_8))
+                val arr = org.json.JSONArray()
+                val it = o.keys()
+                while (it.hasNext()) arr.put(it.next())
+                arr.toString()
+            }
+        } catch (_: Exception) {
+            "[]"
+        }
+    }
 }

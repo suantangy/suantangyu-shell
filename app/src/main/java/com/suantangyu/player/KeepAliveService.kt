@@ -78,6 +78,7 @@ class KeepAliveService : Service() {
         // 单脑第 0 步（3.6.0）：完整队列快照（影子队列，只收存对账）
         const val ACTION_QUEUE_SNAPSHOT = "com.suantangyu.player.QUEUE_SNAPSHOT"
         const val ACTION_BRAIN_CMD = "com.suantangyu.player.BRAIN_CMD"
+        const val ACTION_DOWNLOAD = "com.suantangyu.player.DOWNLOAD"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -222,6 +223,10 @@ class KeepAliveService : Service() {
     private val resolveExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     // 3.7.0：换源专用车道——2026-11-04 实测换源解析被补仓批次堵了 33 秒才轮上，物理隔离
     private val swapExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // 3.9.0 壳原生下载：独立车道（大文件 IO，不挡解析/换源/起播）；索引落盘
+    // dl_index.json（key → {file,size,name,artist,ts}）——名单在网页、文件真相在壳
+    private val dlExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var dlIndex: JSONObject? = null
     // 3.3.1 诊断：引擎日志内存环 + 计数器。断播点与 hello 时各推一份状态，
     // 页面重开（postHello）即可在 toast 里看到断播前的最后日志与计数。
     private val engineLogLock = Object()
@@ -332,6 +337,195 @@ class KeepAliveService : Service() {
      * 熄屏冻结），壳自己解析清单前 3 首回填。网页活着时它总在切歌瞬间补仓，
      * 条件天然不成立，不会与网页抢解析。
      */
+    private fun dlDir(): java.io.File {
+        val d = java.io.File(filesDir, "downloads")
+        if (!d.exists()) d.mkdirs()
+        return d
+    }
+
+    private fun dlIndexLoad(): JSONObject {
+        var idx = dlIndex
+        if (idx == null) {
+            idx = try {
+                val f = java.io.File(filesDir, "dl_index.json")
+                if (f.exists()) JSONObject(f.readText(Charsets.UTF_8)) else JSONObject()
+            } catch (_: Exception) {
+                JSONObject()
+            }
+            dlIndex = idx
+        }
+        return idx
+    }
+
+    private fun dlIndexSave() {
+        try {
+            java.io.File(filesDir, "dl_index.json")
+                .writeText(dlIndexLoad().toString(), Charsets.UTF_8)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun dlMd5(s: String): String {
+        return try {
+            val d = java.security.MessageDigest.getInstance("MD5")
+                .digest(s.toByteArray(Charsets.UTF_8))
+            d.joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            Integer.toHexString(s.hashCode())
+        }
+    }
+
+    /** 本地已下载文件（没有返回 null）：脑起播本地优先与补仓跳过都查它 */
+    private fun localFileForKey(key: String): java.io.File? {
+        if (key.isEmpty()) return null
+        val e = dlIndexLoad().optJSONObject(key) ?: return null
+        val fn = e.optString("file")
+        if (fn.isEmpty()) return null
+        val f = java.io.File(dlDir(), fn)
+        return if (f.exists() && f.length() > 0) f else null
+    }
+
+    private fun deleteLocalDownload(key: String) {
+        val idx = dlIndexLoad()
+        val e = idx.optJSONObject(key) ?: return
+        try {
+            java.io.File(dlDir(), e.optString("file")).delete()
+        } catch (_: Exception) {
+        }
+        idx.remove(key)
+        dlIndexSave()
+    }
+
+    /**
+     * 壳原生下载执行（dlExec 车道）：流式拉文件进私有目录，登记索引
+     * （80 上限，超限删最老，文件索引一起删），完工回执网页并打日志；
+     * 系统 ≥29 再复制一份到「下载/酸汤鱼音乐」（见 exportDownloadCopy）。
+     */
+    private fun runDownload(
+        key: String, url: String, name: String, artist: String, filename: String
+    ) {
+        var ok = false
+        var size = 0L
+        var part: java.io.File? = null
+        try {
+            val ext = when {
+                url.contains("flac", true) || filename.endsWith(".flac", true) -> "flac"
+                url.contains("m4a", true) || url.contains(".mp4", true) -> "m4a"
+                else -> "mp3"
+            }
+            val fname = dlMd5(key) + "." + ext
+            val dest = java.io.File(dlDir(), fname)
+            part = java.io.File(dlDir(), fname + ".part")
+            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 30000
+            conn.setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+            )
+            conn.setRequestProperty("Referer", "https://m.858600.xyz/")
+            conn.connect()
+            if (conn.responseCode !in 200..299) throw Exception("http " + conn.responseCode)
+            conn.inputStream.use { input ->
+                java.io.FileOutputStream(part).use { out -> input.copyTo(out) }
+            }
+            size = part.length()
+            if (size < 1000) throw Exception("文件过小")
+            if (dest.exists()) dest.delete()
+            if (!part.renameTo(dest)) throw Exception("改名失败")
+            val idx = dlIndexLoad()
+            idx.put(
+                key, JSONObject()
+                    .put("file", fname).put("size", size)
+                    .put("name", name).put("artist", artist)
+                    .put("ts", System.currentTimeMillis())
+            )
+            // 上限 80 与网页名单同数：只增不删会吃满盘，超限按时间删最老
+            while (idx.length() > 80) {
+                var oldestKey: String? = null
+                var oldestTs = Long.MAX_VALUE
+                val kit = idx.keys()
+                while (kit.hasNext()) {
+                    val k = kit.next()
+                    val ts = idx.optJSONObject(k)?.optLong("ts", 0L) ?: 0L
+                    if (ts < oldestTs) {
+                        oldestTs = ts
+                        oldestKey = k
+                    }
+                }
+                val victim = oldestKey ?: break
+                try {
+                    java.io.File(
+                        dlDir(), idx.optJSONObject(victim)?.optString("file") ?: ""
+                    ).delete()
+                } catch (_: Exception) {
+                }
+                idx.remove(victim)
+            }
+            dlIndexSave()
+            ok = true
+            engineLog(
+                "引擎：下载完成 " + name + "（" +
+                    String.format("%.1f", size / 1048576.0) + " MB）"
+            )
+            exportDownloadCopy(dest, filename, ext, name)
+        } catch (e: Exception) {
+            try {
+                part?.delete()
+            } catch (_: Exception) {
+            }
+            engineLog(
+                "引擎：下载失败 " + name + "（" + (e.message ?: "网络错误").take(60) + "）"
+            )
+        }
+        pushSync(
+            JSONObject().put("t", "dl").put("key", key)
+                .put("ok", ok).put("size", size)
+        )
+    }
+
+    /**
+     * 把下好的真文件复制一份到系统「下载/酸汤鱼音乐」（API 29+ MediaStore，
+     * 无需存储权限）——对齐落雪一派：文件看得见、拷得走。导出的只是拷贝，
+     * 播放账本只认私有目录那份；导出失败只记日志，不算下载失败。
+     */
+    private fun exportDownloadCopy(
+        src: java.io.File, filename: String, ext: String, songName: String
+    ) {
+        if (android.os.Build.VERSION.SDK_INT < 29) return
+        try {
+            val mime = when (ext) {
+                "flac" -> "audio/flac"
+                "m4a" -> "audio/mp4"
+                else -> "audio/mpeg"
+            }
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, filename)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
+                put(
+                    android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                    "Download/酸汤鱼音乐"
+                )
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(
+                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+            ) ?: throw Exception("insert null")
+            val out = contentResolver.openOutputStream(uri)
+                ?: throw Exception("openOutputStream null")
+            out.use { o -> src.inputStream().use { input -> input.copyTo(o) } }
+            val done = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+            }
+            contentResolver.update(uri, done, null, null)
+            engineLog("引擎：已导出到下载文件夹 " + songName)
+        } catch (_: Exception) {
+            engineLog("引擎：导出失败 " + songName + "（不影响 App 内播放）")
+        }
+    }
+
     private fun maybeEngineResolve() {
         val wantPlay = playing ||
             (try {
@@ -362,6 +556,8 @@ class KeepAliveService : Service() {
             if (todo.size >= 3) break
             val k = LxResolver.keyOfJson(s)
             if (k.isEmpty() || armedKeys.contains(k)) continue
+            // 3.9.0：已下载到本地的歌不占补仓解析，起播时脑子直接播文件
+            if (localFileForKey(k) != null) continue
             if (s.optString("name").isEmpty()) continue
             todo.add(s)
         }
@@ -949,6 +1145,22 @@ class KeepAliveService : Service() {
                     .put("http", httpCode)
                     .put("msg", (error.message ?: "").take(120))
             )
+            // 3.9.0：本地文件播出错 = 文件损坏——网络阶梯（重试/换源）治不了
+            // 本地文件：删文件摘索引、打行留痕，回在线路径把当前曲重走一遍，
+            // 一次性自愈不进阶梯；删后 localFileForKey 落空，天然防重复进此分支
+            if (nativeUrl.startsWith("file:") && nativeKey.isNotEmpty() &&
+                localFileForKey(nativeKey) != null
+            ) {
+                val healKey = nativeKey
+                deleteLocalDownload(healKey)
+                engineLog("引擎：本地文件损坏，已删除 " + title)
+                brainStartKey = healKey
+                tickHandler.postDelayed({
+                    brainOpGen++
+                    executeBrainAdvance(healKey, "start", 0)
+                }, 300)
+                return
+            }
             // 3.3.5：错误留痕进引擎日志 + 壳内自救。解析成功不等于流能播，
             // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
             if (!errRescuePending) {
@@ -1478,6 +1690,10 @@ class KeepAliveService : Service() {
             resolveExec.shutdownNow()
         } catch (_: Exception) {
         }
+        try {
+            dlExec.shutdownNow()
+        } catch (_: Exception) {
+        }
         stopWatchdog()
         try {
             tickHandler.removeCallbacks(tickRunnable)
@@ -1808,6 +2024,21 @@ class KeepAliveService : Service() {
                     }
                 }
             }
+            ACTION_DOWNLOAD -> {
+                // 3.9.0 壳原生下载：网页递来当场解析好的地址，壳在下载车道拉文件存盘
+                try {
+                    val o = JSONObject(intent.getStringExtra("json") ?: "{}")
+                    val dKey = o.optString("key")
+                    val dUrl = o.optString("url")
+                    if (dKey.isNotEmpty() && dUrl.startsWith("http")) {
+                        val dName = o.optString("name")
+                        val dArtist = o.optString("artist")
+                        val dFile = o.optString("filename").ifEmpty { dName + ".mp3" }
+                        dlExec.execute { runDownload(dKey, dUrl, dName, dArtist, dFile) }
+                    }
+                } catch (_: Exception) {
+                }
+            }
             ACTION_BRAIN_CMD -> {
                 // 单脑第 1 步：页面上下首指令。脑子未就绪（没喂过 v2 快照）时
                 // 回退老路遥控页面，保证按钮永远有效
@@ -2046,6 +2277,27 @@ class KeepAliveService : Service() {
                     .put("url", nativeUrl).put("repeat", true)
             )
             noteBrainStarted(targetKey)
+            return
+        }
+        // 3.9.0：本地已下载优先——有文件就不联网解析；排在跑道命中之前，
+        // 跑道里预解析的在线版不能顶掉用户下好的文件
+        val lf = localFileForKey(targetKey)
+        if (lf != null) {
+            val di2 = brainQueueKeys.indexOf(targetKey)
+            val d2 = if (di2 >= 0) brainQueue[di2] else descriptorByKey[targetKey]
+            var cov = d2?.optString("cover") ?: ""
+            if (cov.isEmpty()) cov = d2?.optString("img") ?: ""
+            val item = ArmedItem(
+                "file://" + lf.absolutePath, targetKey,
+                (d2?.optString("name") ?: "").ifEmpty { brainNameOf(targetKey) },
+                d2?.optString("artist") ?: "",
+                cov, false, true
+            )
+            engineLog("引擎：本地播放 " + item.title)
+            if (cause == "start" && targetKey == brainStartKey) brainStartKey = ""
+            armedItems.removeAll { it.key == targetKey }
+            dropQueueAheadThrough(targetKey)
+            applyAdvance(item, playIt = true)
             return
         }
         val ai = armedItems.indexOfFirst { it.key == targetKey }
