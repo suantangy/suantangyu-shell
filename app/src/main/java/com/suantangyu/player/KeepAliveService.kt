@@ -126,7 +126,7 @@ class KeepAliveService : Service() {
                     try {
                         val pNow = player
                         if (pNow != null && pNow.playbackState == Player.STATE_ENDED &&
-                            armedItems.isEmpty()
+                            armedItems.isEmpty() && !sleepStopParked
                         ) {
                             val nNow = android.os.SystemClock.elapsedRealtime()
                             if (stallSinceMs == 0L) stallSinceMs = nNow
@@ -2234,6 +2234,9 @@ class KeepAliveService : Service() {
     // 单脑第 3 步：睡眠定时进脑——分钟到点时刻（墙钟毫秒，0=未设）/ 播完本首标
     private var brainSleepUntilMs: Long = 0L
     private var brainSleepAfterTrack: Boolean = false
+    // 睡眠落闸后的有意停泊：播放器停在 ENDED+跑道空是用户要的结果，
+    // 不是断播——断播点探测（ENDED 空跑道 10 秒）须认这个标记让行
+    private var sleepStopParked: Boolean = false
     private var brainHistory: ArrayList<String> = ArrayList()
     private var brainActive: Boolean = false
     private var brainAdvanceBusy: Boolean = false
@@ -2290,6 +2293,7 @@ class KeepAliveService : Service() {
     /** 每有一首真正开始播（页面起播/原生接播/脑内切歌/换源成功都经此）记一笔 */
     private fun noteBrainStarted(key: String) {
         if (key.isEmpty()) return
+        sleepStopParked = false
         brainCurKey = key
         brainPlayed.add(key)
         if (brainHistory.lastOrNull() != key) {
@@ -2518,6 +2522,7 @@ class KeepAliveService : Service() {
     /** 「播完本首」落闸：销账、暂停、通知页面（ENDED 闸口与跑道顺接兜底共用） */
     private fun fireBrainSleepStop() {
         brainSleepAfterTrack = false
+        sleepStopParked = true
         persistBrainSoon()
         try {
             player?.pause()
