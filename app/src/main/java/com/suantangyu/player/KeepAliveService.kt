@@ -78,6 +78,7 @@ class KeepAliveService : Service() {
         // 单脑第 0 步（3.6.0）：完整队列快照（影子队列，只收存对账）
         const val ACTION_QUEUE_SNAPSHOT = "com.suantangyu.player.QUEUE_SNAPSHOT"
         const val ACTION_BRAIN_CMD = "com.suantangyu.player.BRAIN_CMD"
+        const val ACTION_BRAIN_SLEEP = "com.suantangyu.player.BRAIN_SLEEP"
         const val ACTION_DOWNLOAD = "com.suantangyu.player.DOWNLOAD"
     }
 
@@ -212,7 +213,7 @@ class KeepAliveService : Service() {
     private var configQuality: String = "master"
     private var configAutoDown: Boolean = true
     private var lastSourcesConfigJson: String = ""
-    private var queueAheadSongs: List<org.json.JSONObject> = emptyList()
+    // 单脑第 3 步：queueAheadSongs（网页上报的后续清单副本）已退役，补仓改吃脑队列
     // 单脑第 0 步（3.6.0）：影子队列快照（只存不用）与原文去重
     private var shadowSnapshotJson: String = ""
     private var shadowQueueKeys: Set<String> = emptySet()
@@ -241,7 +242,7 @@ class KeepAliveService : Service() {
     private var errRetryUrl = ""
     private var errRetryCount = 0
     // 描述符按 key 留存（QUEUE_AHEAD/点播/预置交来时存），阶梯换源时取用
-    private val descriptorByKey = LinkedHashMap<String, org.json.JSONObject>()
+    // 单脑第 3 步：descriptorByKey 登记册已退役——队列即档案（brainQueue）
     // 3.4.0 阶梯（cheng 议定；3.5.3 瘦身：重解析台阶实测 6/6 无新链、撤）：
     // 每集只换源一次；换源新曲 key 记账（算同一集延续）；待网页同步的换源记录
     private var errEpisodeKey = ""
@@ -267,7 +268,7 @@ class KeepAliveService : Service() {
             e = engineErrCount
         }
         return "批次 " + b + " 成功 " + ok + " 失败 " + f +
-            " 队列剩 " + queueAheadSongs.size + " 跑道 " + armedItems.size +
+            " 队列剩 " + brainAheadWindow().size + " 跑道 " + armedItems.size +
             " 源 " + configSources.size + " 出错 " + e
     }
 
@@ -324,12 +325,21 @@ class KeepAliveService : Service() {
         }
     }
 
-    /** 队列清单推进：某首已成为当前曲时，它及之前的条目从清单摘除 */
-    private fun dropQueueAheadThrough(key: String) {
-        if (key.isEmpty() || queueAheadSongs.isEmpty()) return
-        val idx = queueAheadSongs.indexOfFirst { LxResolver.keyOfJson(it) == key }
-        if (idx < 0) return
-        queueAheadSongs = ArrayList(queueAheadSongs.drop(idx + 1))
+    /** 单脑第 3 步：补仓窗口 = 脑队列从当前下标往后现算（取代网页上报的
+     * 后续清单副本 dropQueueAheadThrough 那套——切歌后窗口按下标自动跟上） */
+    private fun brainAheadWindow(): List<org.json.JSONObject> {
+        if (brainQueue.isEmpty()) return emptyList()
+        val idx = brainQueueKeys.indexOf(brainCurrentKey())
+        if (idx < 0) return emptyList()
+        val out = ArrayList<org.json.JSONObject>()
+        var i = idx + 1
+        while (out.size < 24) {
+            if (i >= brainQueue.size) i = 0
+            if (i == idx) break
+            out.add(brainQueue[i])
+            i++
+        }
+        return out
     }
 
     /**
@@ -604,23 +614,25 @@ class KeepAliveService : Service() {
                 null
             } == true)
         if (!nativeActive || !wantPlay || engineBusy) return
-        if (configSources.isEmpty() || queueAheadSongs.isEmpty()) return
+        if (configSources.isEmpty() || !brainActive) return
         if (armedItems.size > 1) return
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastArmAtMs < 15000) return
         if (armedItems.isNotEmpty() && now - lastEngineAtMs < 10000) return
+        val aheadWin = brainAheadWindow()
+        if (aheadWin.isEmpty()) return
         val armedKeys = armedItems.map { it.key }.toSet()
         val ordered =
-            if (queueMode == "shuffle" && brainActive) {
+            if (brainMode == "shuffle" && brainActive) {
                 // 单脑第 1 步：随机补仓优先没播过的，一轮不重复从补仓就开始守
-                val fresh = queueAheadSongs.filter {
+                val fresh = aheadWin.filter {
                     !brainPlayed.contains(LxResolver.keyOfJson(it))
                 }
-                val rest = queueAheadSongs.filter {
+                val rest = aheadWin.filter {
                     brainPlayed.contains(LxResolver.keyOfJson(it))
                 }
                 fresh.shuffled() + rest.shuffled()
-            } else if (queueMode == "shuffle") queueAheadSongs.shuffled() else queueAheadSongs
+            } else if (brainMode == "shuffle") aheadWin.shuffled() else aheadWin
         val todo = ArrayList<org.json.JSONObject>()
         for (s in ordered) {
             if (todo.size >= 3) break
@@ -776,6 +788,7 @@ class KeepAliveService : Service() {
     }
 
     private fun watchdogTick() {
+        checkBrainSleepDeadline()
         val p = player
         if (!nativeActive || p == null || nativeUrl.isEmpty()) {
             watchdogStall = 0
@@ -963,7 +976,6 @@ class KeepAliveService : Service() {
             return
         }
         armedItems.removeAt(0)
-        dropQueueAheadThrough(item.key)
         applyAdvance(item, playIt = true)
     }
 
@@ -1124,7 +1136,6 @@ class KeepAliveService : Service() {
         val item = armedItems[idx]
         if (item.repeat) return
         repeat(idx + 1) { if (armedItems.isNotEmpty()) armedItems.removeAt(0) }
-        dropQueueAheadThrough(item.key)
         applyAdvance(item, playIt = false)
     }
 
@@ -1306,14 +1317,21 @@ class KeepAliveService : Service() {
      * 搜索/解析在解析线程跑，换链回主线程执行；无果则落到跳过兜底。
      * 每集只换一次；没描述符的歌不走这级（亮屏点播由网页自己的链救）。 */
     private fun tryQqSwapOrSkip(p: ExoPlayer, curKey: String, curUrl: String) {
-        var desc = if (curKey.isNotEmpty()) descriptorByKey[curKey] else null
+        // 单脑第 3 步：查档改脑队列直查——队列即档案，无登记册副本
+        var desc: org.json.JSONObject? = null
+        if (curKey.isNotEmpty()) {
+            val ci = brainQueueKeys.indexOf(curKey)
+            if (ci >= 0) desc = brainQueue[ci]
+        }
         if (desc == null) {
             // 3.5.3 兜底：编号对不上时按同名档案再找一次——典型是网页经
             // postPlayUrl 起播的歌、播放项编号只剩网址（3.5.2 抓现行），
             // 档案明明在册就不该瞎；同名多条时优先歌手对得上的那条
             var foundKey = ""
             var byName: org.json.JSONObject? = null
-            for ((k, v) in descriptorByKey) {
+            for (bi in brainQueue.indices) {
+                val k = brainQueueKeys[bi]
+                val v = brainQueue[bi]
                 if (k.endsWith("|" + title)) {
                     if (byName == null) {
                         byName = v
@@ -1337,7 +1355,7 @@ class KeepAliveService : Service() {
             // 一并记下——下次复发一锤定音：reg 在而 key 不同 = 两边编号分歧；
             // reg 不在 = 根本没入册（被挤掉或从未登记），map 大小佐证挤掉说
             var regKey = ""
-            for (k in descriptorByKey.keys) {
+            for (k in brainQueueKeys) {
                 if (k.endsWith("|" + title)) {
                     regKey = k
                     break
@@ -1346,7 +1364,7 @@ class KeepAliveService : Service() {
             engineLog(
                 "引擎：无描述符，阶梯跳过 " + title +
                     " key=" + curKey +
-                    " map=" + descriptorByKey.size +
+                    " map=" + brainQueueKeys.size +
                     (if (regKey.isNotEmpty()) " reg=" + regKey else "")
             )
             doSkipAfterError(p)
@@ -1399,7 +1417,7 @@ class KeepAliveService : Service() {
                 errSwapSettled = true
                 if (alt != null && newUrl.isNotEmpty()) {
                     val newKey = LxResolver.keyOfJson(alt)
-                    descriptorByKey[newKey] = alt
+                    applySwapToBrain(curKey, alt, newKey)
                     val host3 = try {
                         java.net.URI(newUrl).host ?: ""
                     } catch (_: Exception) {
@@ -1411,7 +1429,7 @@ class KeepAliveService : Service() {
                     errQqNewKey = newKey
                     try {
                         pushSync(
-                            JSONObject().put("t", "qqswap")
+                            JSONObject().put("t", "swapdisplay")
                                 .put("forKey", curKey)
                                 .put("song", alt)
                         )
@@ -1962,21 +1980,10 @@ class KeepAliveService : Service() {
                                 o.optBoolean("r", false) || o.optInt("r", 0) == 1
                             )
                         )
-                        // 3.5.1：预置自带完整档案（字段 s）就按预置自己的编号
-                        // 入册——档案跟着歌走，出错阶梯不再依赖队列上报窗口
-                        val dk = o.optString("k")
-                        val ds = o.optJSONObject("s")
-                        if (dk.isNotEmpty() && ds != null) {
-                            descriptorByKey.remove(dk)
-                            descriptorByKey[dk] = ds
-                        }
+                        // 单脑第 3 步：预置自带的档案（字段 s）不再登记——
+                        // 队列即档案，预置只作跑道（网址+编号）
                     }
                 } catch (_: Exception) {
-                }
-                while (descriptorByKey.size > 96) {
-                    val kit = descriptorByKey.keys.iterator()
-                    if (!kit.hasNext()) break
-                    descriptorByKey.remove(kit.next())
                 }
                 // phase-3：新预置清单同步进播放器队列，接播改由播放器内部完成
                 syncUpcomingToPlayer()
@@ -1988,7 +1995,6 @@ class KeepAliveService : Service() {
                 if (pendingAdvance == null && !inAdvanceGuard()) {
                     cancelPendingAdvance()
                     armedItems.clear()
-                    queueAheadSongs = emptyList()
                     // 预置已撤，播放器队列里排着的后续项一并撤下，防它照旧接播
                     syncUpcomingToPlayer()
                 }
@@ -2008,60 +2014,8 @@ class KeepAliveService : Service() {
                     engineLog("引擎：已接收音源配置 " + configSources.size + " 个源")
                 }
             }
-            ACTION_QUEUE_AHEAD -> {
-                queueMode = intent.getStringExtra("mode") ?: queueMode
-                val raw = intent.getStringExtra("json") ?: "[]"
-                val list = ArrayList<org.json.JSONObject>()
-                try {
-                    val arr = org.json.JSONArray(raw)
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        list.add(o)
-                    }
-                } catch (_: Exception) {
-                }
-                queueAheadSongs = list
-                // 3.3.8：描述符按 key 留存，出错重解析同一首时用（上限 96 防膨胀）
-                for (s in list) {
-                    val k = LxResolver.keyOfJson(s)
-                    if (k.isNotEmpty()) {
-                        // 3.5.1：remove+put 刷新位置——还在窗口里的歌保持年轻，
-                        // 免得长队列滑动时被 96 上限从队头挤掉
-                        descriptorByKey.remove(k)
-                        descriptorByKey[k] = s
-                    }
-                }
-                while (descriptorByKey.size > 96) {
-                    val kit = descriptorByKey.keys.iterator()
-                    if (!kit.hasNext()) break
-                    descriptorByKey.remove(kit.next())
-                }
-                // 队列变了：壳解析回填的预置若已不在新队列里，撤掉防播错歌
-                val before = armedItems.size
-                armedItems.removeAll {
-                    it.viaResolver && list.none { s -> LxResolver.keyOfJson(s) == it.key }
-                }
-                if (armedItems.size != before) syncUpcomingToPlayer()
-            }
-            ACTION_CURRENT_SONG -> {
-                // 3.4.2：当前曲描述符登记（预告清单只含后续曲，当前曲是盲区——
-                // 点播直达/进程重开接管的当前曲没描述符时，出错阶梯第 2/3 级被静默跳过）
-                try {
-                    val o = org.json.JSONObject(intent.getStringExtra("json") ?: "{}")
-                    val k = LxResolver.keyOfJson(o)
-                    if (k.isNotEmpty()) {
-                        // remove+put 刷新位置，免得长会话里被 96 上限淘汰掉正在播的这首
-                        descriptorByKey.remove(k)
-                        descriptorByKey[k] = o
-                        while (descriptorByKey.size > 96) {
-                            val kit = descriptorByKey.keys.iterator()
-                            if (!kit.hasNext()) break
-                            descriptorByKey.remove(kit.next())
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
+            // ACTION_QUEUE_AHEAD 已退役（单脑第 3 步）：队列真相只走快照
+            // ACTION_CURRENT_SONG 已退役（单脑第 3 步）：当前曲档案在快照队列里
             ACTION_QUEUE_SNAPSHOT -> {
                 // 单脑第 0 步（3.6.0）：影子队列——完整队列快照只收存对账，
                 // 不参与任何播放决策（第 1 步起才由脑子接管）。与自家账本
@@ -2087,21 +2041,19 @@ class KeepAliveService : Service() {
                         shadowCurKey = o.optString("curKey")
                         shadowMode = o.optString("mode")
                         feedBrainFromSnapshot(o)
-                        val known = HashSet<String>()
-                        known.addAll(descriptorByKey.keys)
-                        for (item in armedItems) {
-                            if (item.key.isNotEmpty()) known.add(item.key)
-                        }
-                        if (nativeKey.isNotEmpty()) known.add(nativeKey)
-                        val missing = known.filter { !keys.contains(it) }
+                        // 单脑第 3 步：快照即 operational 输入，影子对账只留
+                        // 「当前一致」绊线（不一致 = 交接异常，值得一行取证）
+                        val ckT = brainAliases[shadowCurKey] ?: shadowCurKey
                         val agree = if (nativeKey.isEmpty()) "—"
-                            else if (shadowCurKey == nativeKey) "是" else "否"
-                        var line = "引擎：影子队列 同步 " + n + " 首 已知 " + known.size +
-                            " 缺失 " + missing.size + " 当前一致 " + agree
-                        if (missing.isNotEmpty()) {
-                            line += " 缺失例：" + missing.first().substringAfter("|")
+                            else if (ckT == nativeKey) "是" else "否"
+                        engineLog("引擎：影子队列 同步 " + n + " 首 当前一致 " + agree)
+                        // 跑道修剪接替原 ahead 处理器：壳解析回填的预置若已
+                        // 不在新队列里，撤掉防原生接播播错歌
+                        val beforeN = armedItems.size
+                        armedItems.removeAll {
+                            it.viaResolver && !brainQueueKeys.contains(it.key)
                         }
-                        engineLog(line)
+                        if (armedItems.size != beforeN) syncUpcomingToPlayer()
                     } catch (_: Exception) {
                     }
                 }
@@ -2129,6 +2081,25 @@ class KeepAliveService : Service() {
                     "prev" -> if (brainActive) brainManualPrev() else sendControl("prev")
                     "playkey" -> brainPlayKey(intent.getStringExtra("key").orEmpty())
                 }
+            }
+            ACTION_BRAIN_SLEEP -> {
+                // 单脑第 3 步：睡眠定时归脑子计（熄屏页面冻结不再拖延到点执行）
+                val mins = intent.getIntExtra("mins", 0)
+                val after = intent.getBooleanExtra("afterTrack", false)
+                if (after) {
+                    brainSleepAfterTrack = true
+                    brainSleepUntilMs = 0L
+                    engineLog("引擎：睡眠定时已设（播完本首）")
+                } else if (mins > 0) {
+                    brainSleepAfterTrack = false
+                    brainSleepUntilMs = System.currentTimeMillis() + mins * 60000L
+                    engineLog("引擎：睡眠定时已设 " + mins + " 分钟")
+                } else {
+                    brainSleepAfterTrack = false
+                    brainSleepUntilMs = 0L
+                    engineLog("引擎：睡眠定时已取消")
+                }
+                persistBrainSoon()
             }
             ACTION_HELLO -> {
                 // 3.5.0：hello 不再倒日志尾巴——完整日志在网页「后台日志」面板里看；
@@ -2172,7 +2143,7 @@ class KeepAliveService : Service() {
                         }
                         if (curId == errQqNewKey || curId == pendingSwapFor) {
                             pushSync(
-                                JSONObject().put("t", "qqswap")
+                                JSONObject().put("t", "swapdisplay")
                                     .put("forKey", pendingSwapFor)
                                     .put("song", ps)
                             )
@@ -2182,6 +2153,13 @@ class KeepAliveService : Service() {
                         }
                     }
                 } catch (_: Exception) {
+                }
+                if (brainSleepUntilMs > 0L || brainSleepAfterTrack) {
+                    pushSync(
+                        JSONObject().put("t", "sleepstate")
+                            .put("until", brainSleepUntilMs)
+                            .put("afterTrack", brainSleepAfterTrack)
+                    )
                 }
                 if (nativeActive) syncAnchorFromPlayer()
                 pushSync(
@@ -2242,6 +2220,12 @@ class KeepAliveService : Service() {
     private var brainCurKey: String = ""
     private var brainMode: String = "list"
     private var brainPlayed: LinkedHashSet<String> = LinkedHashSet()
+    // 单脑第 3 步：换源别名表（旧编号 → 新编号）——治「换源后页面还拿旧编号
+    // 说话」的窗口期：点播指令翻译、快照摄入以脑内新档案为准；随脑状态持久化
+    private var brainAliases: LinkedHashMap<String, String> = LinkedHashMap()
+    // 单脑第 3 步：睡眠定时进脑——分钟到点时刻（墙钟毫秒，0=未设）/ 播完本首标
+    private var brainSleepUntilMs: Long = 0L
+    private var brainSleepAfterTrack: Boolean = false
     private var brainHistory: ArrayList<String> = ArrayList()
     private var brainActive: Boolean = false
     private var brainAdvanceBusy: Boolean = false
@@ -2258,16 +2242,31 @@ class KeepAliveService : Service() {
         val ks = ArrayList<String>()
         for (i in 0 until arr.length()) {
             val sj = arr.optJSONObject(i) ?: continue
-            val k = LxResolver.keyOfJson(sj)
+            var k = LxResolver.keyOfJson(sj)
             if (k.isEmpty()) continue
-            qs.add(sj)
+            var desc = sj
+            // 单脑第 3 步：别名槽位以脑内新档案为准——换源后页面还没采纳
+            // 新歌时，它发来的旧档案不许把脑内已落账的新档案盖回去
+            val aliasT = brainAliases[k]
+            if (aliasT != null && aliasT != k) {
+                val ai = brainQueueKeys.indexOf(aliasT)
+                if (ai >= 0) {
+                    desc = brainQueue[ai]
+                    k = aliasT
+                }
+            }
+            if (ks.contains(k)) continue
+            qs.add(desc)
             ks.add(k)
         }
         if (qs.isEmpty()) return
         brainQueue = qs
         brainQueueKeys = ks
         brainMode = o.optString("mode").ifEmpty { "list" }
-        if (brainCurKey.isEmpty()) brainCurKey = o.optString("curKey")
+        if (brainCurKey.isEmpty()) {
+            val ck = o.optString("curKey")
+            brainCurKey = brainAliases[ck] ?: ck
+        }
         brainActive = true
         persistBrainSoon()
     }
@@ -2335,9 +2334,40 @@ class KeepAliveService : Service() {
     private fun brainNameOf(key: String): String {
         val i = brainQueueKeys.indexOf(key)
         if (i >= 0) return brainQueue[i].optString("name")
-        val d = descriptorByKey[key]
-        if (d != null) return d.optString("name")
+        val aliased = brainAliases[key]
+        if (aliased != null) {
+            val j = brainQueueKeys.indexOf(aliased)
+            if (j >= 0) return brainQueue[j].optString("name")
+        }
         return key.substringAfter("|")
+    }
+
+    /** 单脑第 3 步：换源在脑内一次落账——当前槽位档案、当前编号、已播名单、
+     * 历史全部换新编号并登记别名，网页只收 swapdisplay 显示通知；不再有
+     * 「网页回写新编号、脑子还记旧编号」的窗口（第一步第 3 条同轮重播的根） */
+    private fun applySwapToBrain(forKey: String, alt: org.json.JSONObject, newKey: String) {
+        if (forKey.isEmpty() || newKey.isEmpty() || forKey == newKey) return
+        val idx = brainQueueKeys.indexOf(forKey)
+        if (idx >= 0) {
+            brainQueue[idx] = alt
+            brainQueueKeys[idx] = newKey
+        }
+        if (brainCurKey == forKey) brainCurKey = newKey
+        if (brainPlayed.contains(forKey)) {
+            val np = LinkedHashSet<String>()
+            for (k in brainPlayed) np.add(if (k == forKey) newKey else k)
+            brainPlayed = np
+        }
+        for (i in brainHistory.indices) {
+            if (brainHistory[i] == forKey) brainHistory[i] = newKey
+        }
+        brainAliases[forKey] = newKey
+        while (brainAliases.size > 32) {
+            val kit = brainAliases.keys.iterator()
+            if (!kit.hasNext()) break
+            brainAliases.remove(kit.next())
+        }
+        persistBrainSoon()
     }
 
     /** 脑内切歌执行：跑道命中直接接播；未命中用脑内描述符现解析；解析失败顺延下一候选（最多 3 跳） */
@@ -2366,7 +2396,7 @@ class KeepAliveService : Service() {
         val lf = localFileForKey(targetKey)
         if (lf != null) {
             val di2 = brainQueueKeys.indexOf(targetKey)
-            val d2 = if (di2 >= 0) brainQueue[di2] else descriptorByKey[targetKey]
+            val d2 = if (di2 >= 0) brainQueue[di2] else null
             var cov = d2?.optString("cover") ?: ""
             if (cov.isEmpty()) cov = d2?.optString("img") ?: ""
             val item = ArmedItem(
@@ -2378,7 +2408,6 @@ class KeepAliveService : Service() {
             engineLog("引擎：本地播放 " + item.title + " key=" + item.key)
             if (cause == "start" && targetKey == brainStartKey) brainStartKey = ""
             armedItems.removeAll { it.key == targetKey }
-            dropQueueAheadThrough(targetKey)
             applyAdvance(item, playIt = true)
             return
         }
@@ -2386,12 +2415,11 @@ class KeepAliveService : Service() {
         if (ai >= 0) {
             val item = armedItems[ai]
             repeat(ai + 1) { if (armedItems.isNotEmpty()) armedItems.removeAt(0) }
-            dropQueueAheadThrough(targetKey)
             applyAdvance(item, playIt = true)
             return
         }
         val di = brainQueueKeys.indexOf(targetKey)
-        val desc = if (di >= 0) brainQueue[di] else descriptorByKey[targetKey]
+        val desc = if (di >= 0) brainQueue[di] else null
         if (desc == null || configSources.isEmpty()) {
             // 无描述符/无音源：退回旧路兜底（跑道队首或宽限等页面）；
             // 起播无跑道可退时必须给终点回执，不许把点播晾在静默里
@@ -2435,8 +2463,7 @@ class KeepAliveService : Service() {
                         desc.optString("cover").ifEmpty { desc.optString("img") },
                         false, true
                     )
-                    dropQueueAheadThrough(targetKey)
-                    applyAdvance(item, playIt = true)
+                            applyAdvance(item, playIt = true)
                 } else {
                     engineLog("引擎：脑切歌解析失败 " + brainNameOf(targetKey))
                     if (depth < 3) {
@@ -2461,7 +2488,34 @@ class KeepAliveService : Service() {
         }
     }
 
+    /** 睡眠分钟定时到点检查（看门狗 10 秒粒度）：到点暂停并通知页面清显示；
+     * 没在播也照常收账，免得页面留着过期的定时显示 */
+    private fun checkBrainSleepDeadline() {
+        if (brainSleepUntilMs <= 0L) return
+        if (System.currentTimeMillis() < brainSleepUntilMs) return
+        brainSleepUntilMs = 0L
+        persistBrainSoon()
+        val p = player
+        if (p != null && nativeActive) {
+            try {
+                p.pause()
+            } catch (_: Exception) {
+            }
+            playing = false
+        }
+        engineLog("引擎：睡眠定时到点，已暂停")
+        pushSync(JSONObject().put("t", "sleepfired"))
+    }
+
     private fun brainEndedAdvance() {
+        // 单脑第 3 步：「播完本首」睡眠闸——到站不接播，落停并通知页面
+        if (brainSleepAfterTrack) {
+            brainSleepAfterTrack = false
+            persistBrainSoon()
+            engineLog("引擎：睡眠定时（本首后）已停")
+            pushSync(JSONObject().put("t", "sleepfired"))
+            return
+        }
         if (brainAdvanceBusy) return
         val t = computeBrainNextKey(false)
         if (t == null) {
@@ -2489,13 +2543,15 @@ class KeepAliveService : Service() {
      * 起播的每一跳都必须落到终点（成功 advanced 或 failBrainStart 回执），
      * 不许把点播晾在静默里；被新意图代次作废的跳不推终点，新意图自带终点。
      */
-    private fun brainPlayKey(key: String) {
-        if (key.isEmpty()) return
+    private fun brainPlayKey(keyIn: String) {
+        if (keyIn.isEmpty()) return
+        // 单脑第 3 步：陈旧页面拿换源前旧编号点播 → 翻译成脑内新编号再执行
+        val key = brainAliases[keyIn] ?: keyIn
         val di = brainQueueKeys.indexOf(key)
-        val desc = if (di >= 0) brainQueue[di] else descriptorByKey[key]
+        val desc = if (di >= 0) brainQueue[di] else null
         if (desc == null) {
             engineLog("引擎：脑起播无档案 " + key.substringAfter("|"))
-            pushSync(JSONObject().put("t", "startfailed").put("key", key))
+            pushSync(JSONObject().put("t", "startfailed").put("key", keyIn))
             return
         }
         if (key == brainCurrentKey() && nativeActive) {
@@ -2561,6 +2617,11 @@ class KeepAliveService : Service() {
             o.put("mode", brainMode)
             o.put("played", org.json.JSONArray(ArrayList(brainPlayed)))
             o.put("history", org.json.JSONArray(brainHistory))
+            o.put("aliases", JSONObject(brainAliases as Map<*, *>))
+            val sl = JSONObject()
+            sl.put("until", brainSleepUntilMs)
+            sl.put("afterTrack", brainSleepAfterTrack)
+            o.put("sleep", sl)
             o.put("savedAt", System.currentTimeMillis())
             java.io.File(filesDir, "brain_state.json")
                 .writeText(o.toString(), Charsets.UTF_8)
@@ -2598,6 +2659,22 @@ class KeepAliveService : Service() {
             val ha = o.optJSONArray("history")
             if (ha != null) {
                 for (i in 0 until ha.length()) brainHistory.add(ha.optString(i))
+            }
+            brainAliases = LinkedHashMap()
+            val alo = o.optJSONObject("aliases")
+            if (alo != null) {
+                val kit2 = alo.keys()
+                while (kit2.hasNext()) {
+                    val kk = kit2.next()
+                    brainAliases[kk] = alo.optString(kk)
+                }
+            }
+            val slo = o.optJSONObject("sleep")
+            brainSleepUntilMs = slo?.optLong("until", 0L) ?: 0L
+            brainSleepAfterTrack = slo?.optBoolean("afterTrack", false) ?: false
+            if (brainSleepUntilMs in 1..System.currentTimeMillis()) {
+                // 服务没了的这段时间里到点已过：按已执行处理，不补停
+                brainSleepUntilMs = 0L
             }
             brainActive = true
             val nm = if (brainCurKey.isNotEmpty()) brainNameOf(brainCurKey) else ""

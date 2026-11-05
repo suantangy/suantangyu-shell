@@ -289,15 +289,10 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
-    /** 后续队列清单（模式 + 歌曲描述 JSON 数组），壳按名单点名解析回填跑道 */
+    /** 后续队列清单——单脑第 3 步已退役为空实现：队列真相只走
+     * postQueueSnapshot（老网页调它无副作用，新网页不再调） */
     @JavascriptInterface
     fun postQueueAhead(mode: String, json: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
-            action = KeepAliveService.ACTION_QUEUE_AHEAD
-            putExtra("mode", mode)
-            putExtra("json", json)
-        }
-        activity.startService(intent)
     }
 
     /** 后台日志（3.5.0）：网页「后台日志」面板打开时现读日志文件尾（3.5.1 起最近 600 行） */
@@ -315,14 +310,9 @@ class BaoBridge(private val activity: MainActivity) {
         }
     }
 
-    /** 当前曲描述符（3.4.2）：预告清单不含当前曲，这里单独上报补上盲区 */
+    /** 当前曲描述符——单脑第 3 步已退役为空实现：当前曲档案在快照队列里 */
     @JavascriptInterface
     fun postCurrentSong(json: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
-            action = KeepAliveService.ACTION_CURRENT_SONG
-            putExtra("json", json)
-        }
-        activity.startService(intent)
     }
 
     /** 单脑第 1 步（3.7.0）：页面上下首改为给脑子发指令（脑子未就绪时壳回退遥控页面） */
@@ -352,6 +342,18 @@ class BaoBridge(private val activity: MainActivity) {
             action = KeepAliveService.ACTION_BRAIN_CMD
             putExtra("cmd", "playkey")
             putExtra("key", key)
+        }
+        activity.startService(intent)
+    }
+
+    /** 单脑第 3 步：睡眠定时归脑子计——页面只发命令（分钟数，0=取消；
+     * afterTrack=true 为播完本首），到点由服务执行并回推 sleepfired */
+    @JavascriptInterface
+    fun cmdSetSleep(minutes: Int, afterTrack: Boolean) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_SLEEP
+            putExtra("mins", minutes)
+            putExtra("afterTrack", afterTrack)
         }
         activity.startService(intent)
     }
