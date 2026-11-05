@@ -28,6 +28,7 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -2168,6 +2169,22 @@ class KeepAliveService : Service() {
                             .put("until", brainSleepUntilMs)
                             .put("afterTrack", brainSleepAfterTrack)
                     )
+                }
+                // 3.10.3 会话恢复：脑子有存档队列时，把整条队列+当前曲递给
+                // 刚打开的页面画出来（主流 App 的重开姿势——队列在、当前曲
+                // 在、暂停不出声；曲内进度不记）。页面自己已有队列时自会忽略
+                try {
+                    if (brainQueue.isNotEmpty() && brainCurKey.isNotEmpty()) {
+                        val qa = JSONArray()
+                        for (qs in brainQueue) qa.put(JSONObject(qs))
+                        pushSync(
+                            JSONObject().put("t", "restore")
+                                .put("queue", qa)
+                                .put("curKey", brainCurKey)
+                                .put("mode", brainMode)
+                        )
+                    }
+                } catch (_: Exception) {
                 }
                 if (nativeActive) syncAnchorFromPlayer()
                 pushSync(
