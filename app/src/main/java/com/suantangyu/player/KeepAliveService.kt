@@ -614,6 +614,7 @@ class KeepAliveService : Service() {
                 null
             } == true)
         if (!nativeActive || !wantPlay || engineBusy) return
+        if (brainSleepAfterTrack) return
         if (configSources.isEmpty() || !brainActive) return
         if (armedItems.size > 1) return
         val now = android.os.SystemClock.elapsedRealtime()
@@ -1136,7 +1137,9 @@ class KeepAliveService : Service() {
         val item = armedItems[idx]
         if (item.repeat) return
         repeat(idx + 1) { if (armedItems.isNotEmpty()) armedItems.removeAt(0) }
+        val sleepStop = brainSleepAfterTrack
         applyAdvance(item, playIt = false)
+        if (sleepStop) fireBrainSleepStop()
     }
 
     private val playerListener = object : Player.Listener {
@@ -2089,6 +2092,11 @@ class KeepAliveService : Service() {
                 if (after) {
                     brainSleepAfterTrack = true
                     brainSleepUntilMs = 0L
+                    // 跑道撤空：播放器队列里排着的后续项会被它内部顺接、
+                    // 根本不经 ENDED 闸口（3.10.0 实测漏停）——设定当下就撤，
+                    // 本首播完必然落到 STATE_ENDED 由闸口收账
+                    armedItems.clear()
+                    syncUpcomingToPlayer()
                     engineLog("引擎：睡眠定时已设（播完本首）")
                 } else if (mins > 0) {
                     brainSleepAfterTrack = false
@@ -2507,13 +2515,23 @@ class KeepAliveService : Service() {
         pushSync(JSONObject().put("t", "sleepfired"))
     }
 
+    /** 「播完本首」落闸：销账、暂停、通知页面（ENDED 闸口与跑道顺接兜底共用） */
+    private fun fireBrainSleepStop() {
+        brainSleepAfterTrack = false
+        persistBrainSoon()
+        try {
+            player?.pause()
+        } catch (_: Exception) {
+        }
+        playing = false
+        engineLog("引擎：睡眠定时（本首后）已停")
+        pushSync(JSONObject().put("t", "sleepfired"))
+    }
+
     private fun brainEndedAdvance() {
         // 单脑第 3 步：「播完本首」睡眠闸——到站不接播，落停并通知页面
         if (brainSleepAfterTrack) {
-            brainSleepAfterTrack = false
-            persistBrainSoon()
-            engineLog("引擎：睡眠定时（本首后）已停")
-            pushSync(JSONObject().put("t", "sleepfired"))
+            fireBrainSleepStop()
             return
         }
         if (brainAdvanceBusy) return
@@ -2526,12 +2544,14 @@ class KeepAliveService : Service() {
     }
 
     private fun brainManualNext() {
+        brainSleepAfterTrack = false
         brainOpGen++
         val t = computeBrainNextKey(true) ?: return
         executeBrainAdvance(t, "next", 0)
     }
 
     private fun brainManualPrev() {
+        brainSleepAfterTrack = false
         brainOpGen++
         val t = computeBrainPrevKey() ?: return
         executeBrainAdvance(t, "prev", 0)
@@ -2545,6 +2565,7 @@ class KeepAliveService : Service() {
      */
     private fun brainPlayKey(keyIn: String) {
         if (keyIn.isEmpty()) return
+        brainSleepAfterTrack = false
         // 单脑第 3 步：陈旧页面拿换源前旧编号点播 → 翻译成脑内新编号再执行
         val key = brainAliases[keyIn] ?: keyIn
         val di = brainQueueKeys.indexOf(key)
