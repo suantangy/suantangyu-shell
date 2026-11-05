@@ -24,6 +24,12 @@ class BaoBridge(private val activity: MainActivity) {
         return BuildConfig.VERSION_NAME
     }
 
+    /** 单脑第 4 步能力探针：跑道归脑子单供应（3.11.0 起）。老壳无此方法，页面据此保持旧补给行为 */
+    @JavascriptInterface
+    fun brainOwnsRunway(): Boolean {
+        return true
+    }
+
     /** 检查更新发现新版本时：用系统浏览器打开 Release 下载页（WebView 自身不处理 APK 下载） */
     @JavascriptInterface
     fun openExternalUrl(url: String) {

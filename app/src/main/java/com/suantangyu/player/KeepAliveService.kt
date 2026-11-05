@@ -622,7 +622,7 @@ class KeepAliveService : Service() {
         if (now - lastArmAtMs < 15000) return
         if (armedItems.isNotEmpty() && now - lastEngineAtMs < 10000) return
         val aheadWin = brainAheadWindow()
-        if (aheadWin.isEmpty()) return
+        if (aheadWin.isEmpty() && brainMode != "single") return
         val armedKeys = armedItems.map { it.key }.toSet()
         val ordered =
             if (brainMode == "shuffle" && brainActive) {
@@ -646,6 +646,23 @@ class KeepAliveService : Service() {
             todo.add(s)
         }
         if (todo.isEmpty()) return
+        // 单脑第 4 步（K1）：单曲模式跑道只供「当前曲重复项」——desiredUpcoming
+        // 见 repeat 即清空播放器后续队列、逼接播走 ENDED 的脑内重复；不囤后续
+        // 曲（囤了也轮不到，重复项才是单曲跑道的唯一货物）。
+        var step4RepeatKey = ""
+        if (brainMode == "single") {
+            val ci = brainQueueKeys.indexOf(brainCurrentKey())
+            val cs = if (ci >= 0) brainQueue[ci] else null
+            val ck = if (cs != null) LxResolver.keyOfJson(cs) else ""
+            todo.clear()
+            if (cs != null && ck.isNotEmpty() && !armedKeys.contains(ck) &&
+                cs.optString("name").isNotEmpty()
+            ) {
+                todo.add(cs)
+                step4RepeatKey = ck
+            }
+            if (todo.isEmpty()) return
+        }
         engineBusy = true
         lastEngineAtMs = now
         synchronized(engineLogLock) { engineBatchCount++ }
@@ -654,7 +671,16 @@ class KeepAliveService : Service() {
             var fN = 0
             try {
                 for (song in todo) {
-                    val url = LxResolver.resolve(
+                    val sKey4 = LxResolver.keyOfJson(song)
+                    val reuse4 =
+                        if (step4RepeatKey.isNotEmpty() && sKey4 == step4RepeatKey) {
+                            val lf = localFileForKey(step4RepeatKey)
+                            if (lf != null) "file://" + lf.absolutePath
+                            else if (nativeKey == step4RepeatKey &&
+                                nativeUrl.startsWith("http")
+                            ) nativeUrl else ""
+                        } else ""
+                    val url = if (reuse4.isNotEmpty()) reuse4 else LxResolver.resolve(
                         song, configSources, configQuality, configAutoDown, lxEngine()
                     ) { m -> engineLog(m) }
                     if (url.isNullOrEmpty()) {
@@ -667,7 +693,8 @@ class KeepAliveService : Service() {
                         url, LxResolver.keyOfJson(song),
                         song.optString("name"), song.optString("artist"),
                         song.optString("cover").ifEmpty { song.optString("img") },
-                        false, true
+                        step4RepeatKey.isNotEmpty() &&
+                            LxResolver.keyOfJson(song) == step4RepeatKey, true
                     )
                     tickHandler.post {
                         if (armedItems.size < 8 && armedItems.none { it.key == item.key }) {
@@ -1961,6 +1988,11 @@ class KeepAliveService : Service() {
                 if (pendingAdvance == null && !inAdvanceGuard()) stopNative()
             }
             ACTION_ARM_NEXT -> {
+                if (brainActive) {
+                    // 单脑第 4 步：脑子在场，跑道单供应——网页预置整段忽略
+                    // （页面新版已停发；此为防旧页面/残余调用冲掉脑存货的
+                    // 保险；也不更新 lastArmAtMs，免得补仓门控被假信号推迟）
+                } else {
                 // 网页重新预置（或接管记账）：以新清单为准。
                 // 但宽限期内（已播完正等待接播）不要取消待接播计时——doArmedAdvance
                 // 在触发时才读清单，换上新清单即可；取消计时等于白等一首歌的时间。
@@ -1991,6 +2023,7 @@ class KeepAliveService : Service() {
                 }
                 // phase-3：新预置清单同步进播放器队列，接播改由播放器内部完成
                 syncUpcomingToPlayer()
+                }
             }
             ACTION_DISARM_NEXT -> {
                 // 宽限期内的 disarm 同样多来自网页切歌失败后的收尾（played=false 分支），
