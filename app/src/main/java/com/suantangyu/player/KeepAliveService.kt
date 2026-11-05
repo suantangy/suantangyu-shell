@@ -502,6 +502,36 @@ class KeepAliveService : Service() {
                 "m4a" -> "audio/mp4"
                 else -> "audio/mpeg"
             }
+            // 3.9.2：同名旧副本先删再导——重复下载同一首，系统「下载/酸汤鱼音乐」
+            // 里永远只留一份（此前每次导出都新增一条、系统自动改名带 (1)，
+            // cheng 2026-11-05 在文件管理器里实见两份后定的）
+            try {
+                val dlUri = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                contentResolver.query(
+                    dlUri,
+                    arrayOf(
+                        android.provider.MediaStore.Downloads._ID,
+                        android.provider.MediaStore.Downloads.RELATIVE_PATH
+                    ),
+                    android.provider.MediaStore.Downloads.DISPLAY_NAME + "=?",
+                    arrayOf(filename),
+                    null
+                )?.use { c ->
+                    val idCol = c.getColumnIndex(android.provider.MediaStore.Downloads._ID)
+                    val pathCol =
+                        c.getColumnIndex(android.provider.MediaStore.Downloads.RELATIVE_PATH)
+                    while (c.moveToNext()) {
+                        val rp = if (pathCol >= 0) c.getString(pathCol) ?: "" else ""
+                        if (rp.trimEnd('/') == "Download/酸汤鱼音乐" && idCol >= 0) {
+                            contentResolver.delete(
+                                android.content.ContentUris.withAppendedId(dlUri, c.getLong(idCol)),
+                                null, null
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
             val values = android.content.ContentValues().apply {
                 put(android.provider.MediaStore.Downloads.DISPLAY_NAME, filename)
                 put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
