@@ -2083,7 +2083,7 @@ class KeepAliveService : Service() {
                         val ckT = brainAliases[shadowCurKey] ?: shadowCurKey
                         val agree = if (nativeKey.isEmpty()) "—"
                             else if (ckT == nativeKey) "是" else "否"
-                        engineLog("引擎：影子队列 同步 " + n + " 首 当前一致 " + agree)
+                        engineLog("引擎：影子队列 同步 " + n + " 首 当前一致 " + agree + " 模式 " + shadowMode)
                         // 跑道修剪接替原 ahead 处理器：壳解析回填的预置若已
                         // 不在新队列里，撤掉防原生接播播错歌
                         val beforeN = armedItems.size
