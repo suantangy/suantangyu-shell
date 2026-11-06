@@ -248,6 +248,20 @@ class KeepAliveService : Service() {
     // 换源新曲 key 记账：hello 重推网页同步用；兼作防循环——换上的歌
     // 没出声就又出错，不二次换源、直接跳过（真出声后 onIsPlayingChanged 清）
     private var errQqNewKey = ""
+    // 3.14.0 会话锁：播放意图在时服务自持 WakeLock+WifiLock，不再只靠
+    // 播放器那把「在播才持」的锁——熄屏深睡会把网络分段挂起（2026-11-06
+    // 实证：省电无限制开着仍被掐、2001 簇发、亮屏即恢复）。watchdogTick
+    // 每轮对账补漏，意图灭（暂停/停播）即放
+    private var sessionWakeLock: PowerManager.WakeLock? = null
+    private var sessionWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    // 3.14.0 网络停车场：网络类报错先探网，全网不通就停在当前曲等恢复
+    // （看门狗每 20 秒重拉一次，出声即走），不再在没网的窗口里跳歌烧
+    // 队列；等满 3 分钟仍不通才放弃、转回报错换源老路
+    private var netParkKey = ""
+    private var netParkTitle = ""
+    private var netParkSinceMs: Long = 0L
+    private var netParkLastTryMs: Long = 0L
+    private var netProbeInFlight = false
     private var pendingSwapFor = ""
     private var pendingSwapSong: org.json.JSONObject? = null
     private var engineFailCount = 0
@@ -747,7 +761,7 @@ class KeepAliveService : Service() {
                             // 且跑道非空就直接接播队首；阶梯正在救当前曲时不抢。
                             val pp = player
                             if (nativeActive && pp != null && pp.playWhenReady &&
-                                swapNotInFlight() &&
+                                swapNotInFlight() && netParkKey.isEmpty() &&
                                 (pp.playbackState == Player.STATE_IDLE ||
                                     pp.playbackState == Player.STATE_ENDED)
                             ) {
@@ -858,6 +872,7 @@ class KeepAliveService : Service() {
 
     private fun watchdogTick() {
         checkBrainSleepDeadline()
+        updateSessionLocks()
         val p = player
         if (!nativeActive || p == null || nativeUrl.isEmpty()) {
             watchdogStall = 0
@@ -886,6 +901,32 @@ class KeepAliveService : Service() {
             p.playbackState
         } catch (_: Exception) {
             Player.STATE_IDLE
+        }
+        // 3.14.0 网络停车场值班：停着的歌每 20 秒重拉一次探活，出声由
+        // onIsPlayingChanged 收账；用户暂停就散场；等满 3 分钟仍不通，
+        // 放弃停车、把这首交回报错换源老路。值班期间看门狗其它处置让路
+        if (netParkKey.isNotEmpty()) {
+            if (!wantPlay) {
+                clearNetPark()
+            } else {
+                val nowE = SystemClock.elapsedRealtime()
+                if (nowE - netParkSinceMs > 180_000L) {
+                    val pk = netParkKey
+                    val pt = netParkTitle
+                    clearNetPark()
+                    engineLog("引擎：网络等待超时，转入换源 " + pt)
+                    rescueByQqSwap(p, pk, nativeUrl)
+                } else if (nowE - netParkLastTryMs >= 20_000L) {
+                    netParkLastTryMs = nowE
+                    try {
+                        p.seekTo(p.currentMediaItemIndex, 0)
+                        p.prepare()
+                        p.play()
+                    } catch (_: Exception) {
+                    }
+                }
+                return
+            }
         }
         // 用户暂停（无播放意图）不干预
         if (!wantPlay) {
@@ -924,7 +965,7 @@ class KeepAliveService : Service() {
         // 3.5.5：IDLE 停摆兜底——看门狗第二击把播放器停到 IDLE 后，若跑道
         // 里已有歌（无论谁放的），此前无人接播、只能干等网页醒来。此处与
         // 补仓落袋的停摆接播互为兜底：还想播、跑道非空、播放器空闲 → 接播。
-        if (st == Player.STATE_IDLE && wantPlay &&
+        if (st == Player.STATE_IDLE && wantPlay && netParkKey.isEmpty() &&
             swapNotInFlight() && armedItems.isNotEmpty()
         ) {
             val first = armedItems.firstOrNull()
@@ -1224,6 +1265,10 @@ class KeepAliveService : Service() {
                 errQqNewKey = ""
                 rescueInFlight = false
                 rescueSettled = true
+                if (netParkKey.isNotEmpty()) {
+                    engineLog("引擎：网络已恢复，继续播放 " + title)
+                    clearNetPark()
+                }
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -1318,7 +1363,7 @@ class KeepAliveService : Service() {
             }
             // 3.3.5：错误留痕进引擎日志 + 壳内自救。解析成功不等于流能播，
             // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
-            if (!rescueInFlight) {
+            if (!rescueInFlight && !netProbeInFlight) {
                 engineErrCount++
                 val host = try {
                     java.net.URI(nativeUrl).host ?: ""
@@ -1340,14 +1385,140 @@ class KeepAliveService : Service() {
                     } catch (_: Exception) {
                         ""
                     }
-                    if (curKey.isNotEmpty() && curKey == errQqNewKey) {
-                        doSkipAfterError(p)
-                    } else {
-                        rescueByQqSwap(p, curKey, nativeUrl)
+                    when {
+                        curKey.isNotEmpty() && curKey == netParkKey -> {
+                            // 停车等待中看门狗重拉又失败：不重复探网、
+                            // 不计数，续等下一轮重拉（3.14.0）
+                            netParkLastTryMs =
+                                android.os.SystemClock.elapsedRealtime()
+                        }
+                        error.errorCode == 2001 || error.errorCode == 2002 -> {
+                            // 网络类报错先探网（3.14.0）：全网不通就停车
+                            // 保歌，别在没网的窗口里换源/跳歌白烧队列；
+                            // 网通（只是单个站死）照常走报错换源
+                            val k2 = curKey
+                            val u2 = nativeUrl
+                            val t2 = title
+                            val a2 = artist
+                            netProbeInFlight = true
+                            swapExec.execute {
+                                val up = qqSearchReachable(t2, a2)
+                                tickHandler.post {
+                                    netProbeInFlight = false
+                                    val pp2 = player
+                                    if (pp2 == null || !nativeActive ||
+                                        nativeUrl != u2
+                                    ) {
+                                        return@post
+                                    }
+                                    if (up) {
+                                        if (k2.isNotEmpty() &&
+                                            k2 == errQqNewKey
+                                        ) {
+                                            doSkipAfterError(pp2)
+                                        } else {
+                                            rescueByQqSwap(pp2, k2, u2)
+                                        }
+                                    } else {
+                                        netParkKey = k2
+                                        netParkTitle = t2
+                                        netParkSinceMs = android.os
+                                            .SystemClock.elapsedRealtime()
+                                        netParkLastTryMs = netParkSinceMs
+                                        engineLog(
+                                            "引擎：网络中断，停在这首等恢复 " + t2
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        curKey.isNotEmpty() && curKey == errQqNewKey -> {
+                            doSkipAfterError(p)
+                        }
+                        else -> {
+                            rescueByQqSwap(p, curKey, nativeUrl)
+                        }
                     }
                 }
             }
         }
+    }
+
+    /** 会话锁对账（3.14.0）：想播就持锁、意图灭就放锁。watchdogTick
+     * 每轮调一次，生命周期边沿漏了也会在 10 秒内补齐/回收 */
+    private fun updateSessionLocks() {
+        val want = nativeActive &&
+            (try { player?.playWhenReady } catch (_: Exception) { null } == true)
+        if (want) {
+            try {
+                if (sessionWakeLock?.isHeld != true) {
+                    val pm = getSystemService(POWER_SERVICE) as PowerManager
+                    val wl = pm.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK, "Suantangyu:Session"
+                    )
+                    wl.setReferenceCounted(false)
+                    wl.acquire()
+                    sessionWakeLock = wl
+                }
+            } catch (_: Exception) {
+            }
+            try {
+                if (sessionWifiLock?.isHeld != true) {
+                    val wm = applicationContext.getSystemService(WIFI_SERVICE)
+                        as android.net.wifi.WifiManager
+                    @Suppress("DEPRECATION")
+                    val fl = wm.createWifiLock(
+                        android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                        "Suantangyu:Session"
+                    )
+                    fl.setReferenceCounted(false)
+                    fl.acquire()
+                    sessionWifiLock = fl
+                }
+            } catch (_: Exception) {
+            }
+        } else {
+            releaseSessionLocks()
+        }
+    }
+
+    private fun releaseSessionLocks() {
+        try {
+            if (sessionWakeLock?.isHeld == true) sessionWakeLock?.release()
+        } catch (_: Exception) {
+        }
+        sessionWakeLock = null
+        try {
+            if (sessionWifiLock?.isHeld == true) sessionWifiLock?.release()
+        } catch (_: Exception) {
+        }
+        sessionWifiLock = null
+    }
+
+    /** 探网（3.14.0）：拿当前歌去 QQ 搜一下——能拿到任何回应（含空
+     * 结果）就是网通；硬失败（fetchJson 返回 null）才算全网不通 */
+    private fun qqSearchReachable(name: String, singer: String): Boolean {
+        val kw = (name + " " + singer).trim()
+        if (kw.isEmpty()) return true
+        val url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=" +
+            android.net.Uri.encode(kw) +
+            "&format=json&p=1&n=1&new_json=1&cr=1&t=0"
+        return try {
+            LxHttp.fetchJson(
+                url,
+                headers = mapOf("Referer" to "https://y.qq.com/"),
+                timeoutSec = 5
+            ) != null
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun clearNetPark() {
+        netParkKey = ""
+        netParkTitle = ""
+        netParkSinceMs = 0L
+        netParkLastTryMs = 0L
     }
 
     /** 强制换源重解析（3.13.0，阶梯拆并后的唯一救援）：非 QQ 曲搜 QQ
@@ -1827,6 +1998,7 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        releaseSessionLocks()
         cancelPendingAdvance()
         try {
             engine?.shutdown()
@@ -2630,6 +2802,7 @@ class KeepAliveService : Service() {
     }
 
     private fun brainManualNext() {
+        clearNetPark()
         brainSleepAfterTrack = false
         brainOpGen++
         val t = computeBrainNextKey(true) ?: return
@@ -2637,6 +2810,7 @@ class KeepAliveService : Service() {
     }
 
     private fun brainManualPrev() {
+        clearNetPark()
         brainSleepAfterTrack = false
         brainOpGen++
         val t = computeBrainPrevKey() ?: return
@@ -2651,6 +2825,7 @@ class KeepAliveService : Service() {
      */
     private fun brainPlayKey(keyIn: String) {
         if (keyIn.isEmpty()) return
+        clearNetPark()
         brainSleepAfterTrack = false
         // 单脑第 3 步：陈旧页面拿换源前旧编号点播 → 翻译成脑内新编号再执行
         val key = brainAliases[keyIn] ?: keyIn
