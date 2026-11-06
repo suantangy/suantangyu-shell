@@ -278,13 +278,11 @@ class KeepAliveService : Service() {
         if (e == null) {
             e = LxEngine { m ->
                 engineLog(m)
-                // 3.12.0：脚本日志分段镜像——解析段进行中，脚本自己的行
-                // （[源名] 开头）与脚本解析报错行同步记进脚本日志文件；
-                // 后台日志那份照旧全量，这只是同源多记一份分段版
-                if (ScriptSeg.depth > 0 &&
-                    (m.startsWith("[") || m.contains("解析报错"))
-                ) {
-                    scriptFileLog(m)
+                // 脚本日志分段（3.12.0 建，3.12.1 改暂存）：解析段进行中，
+                // 脚本自己的行（[源名] 开头）与脚本解析报错行记进当前段；
+                // 段先暂存、歌真正起播才落盘，后台日志那份照旧全量
+                if (m.startsWith("[") || m.contains("解析报错")) {
+                    ScriptSeg.line(m)
                 }
             }
             engine = e
@@ -338,17 +336,11 @@ class KeepAliveService : Service() {
 
     private val scriptLogLock = Any()
 
-    /** 脚本日志（3.12.0）：解析分段记录，独立文件 lx_script.log——
-     * 只记 resolve 的段（段头/段内脚本行/结论），供网页脚本日志面板
-     * 按歌呈现；与后台日志同源但互不影响，后台日志的记录方式不改。
-     * 上限 512KB、写满滚动保留约 384KB（同后台日志的保旧策略） */
-    private fun scriptFileLog(msg: String) {
-        val line = try {
-            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-                .format(java.util.Date()) + " " + msg
-        } catch (_: Exception) {
-            msg
-        }
+    /** 脚本日志落盘（3.12.0 建，3.12.1 改）：把一行已盖戳的原文 append
+     * 进独立文件 lx_script.log——内容由 ScriptSeg 在歌曲起播落盘时逐行
+     * 喂入，本函数只管文件；与后台日志同源但互不影响，后台日志的
+     * 记录方式不改。上限 512KB、写满滚动保留约 384KB（同后台策略） */
+    private fun scriptFileAppend(line: String) {
         synchronized(scriptLogLock) {
             try {
                 val f = java.io.File(filesDir, "lx_script.log")
@@ -1809,7 +1801,7 @@ class KeepAliveService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
-        ScriptSeg.sink = { s -> scriptFileLog(s) }
+        ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
         restoreBrainState()
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
@@ -2416,6 +2408,8 @@ class KeepAliveService : Service() {
             while (brainHistory.size > 200) brainHistory.removeAt(0)
         }
         persistBrainSoon()
+        // 3.12.1：这首的脚本日志段在此刻才落盘显示（预置段没播到不出现）
+        ScriptSeg.flushFor(key)
     }
 
     private fun computeBrainNextKey(manual: Boolean): String? {
@@ -2712,6 +2706,9 @@ class KeepAliveService : Service() {
         val k = brainStartKey
         brainStartKey = ""
         engineLog("引擎：脑起播失败 " + name + "（无可用接续）")
+        // 3.12.1：点播终点失败——这首虽没播成，但它就是用户点的「当前」，
+        // 段照样落盘，不然「为什么点不播」在脚本日志里查无此歌
+        if (k.isNotEmpty()) ScriptSeg.flushFor(k)
         if (k.isNotEmpty()) {
             pushSync(JSONObject().put("t", "startfailed").put("key", k))
         }

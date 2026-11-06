@@ -821,44 +821,114 @@ object LxResolver {
     }
 }
 
-/** 脚本日志分段（3.12.0）：resolve 一进一出记一段——段头（歌名-歌手）、
- * 段尾（解析成功 → host / 解析失败）；段进行中的脚本行由服务侧在引擎
- * 日志回调里按 depth 镜像（见 KeepAliveService）。sink 由服务在
- * onCreate 挂上（写 lx_script.log 独立文件）；后台日志的记录内容与
- * 文件一概不经此处。并发解析（补仓与换源同刻）时两段会在文件里
- * 交错——与旧网页脚本日志的已知串段上限同级，如实记录不做隔离。 */
+/** 脚本日志分段（3.12.0 建，3.12.1 改暂存落盘）：resolve 一进一出记
+ * 一段——段头（歌名-歌手）、段尾（解析成功 → host / 解析失败）；段
+ * 进行中的脚本行由服务侧引擎回调转入。段先在内存暂存，歌真正起播
+ * （或点播终点失败）才落盘进 lx_script.log——预置/补仓解析没被播到
+ * 的段永不出现，与旧网页脚本日志「播到才并入」的规矩一致。fileSink
+ * 由服务在 onCreate 挂上；后台日志的记录内容与文件一概不经此处。 */
 object ScriptSeg {
-    @Volatile
-    var depth = 0
-
-    @Volatile
-    var sink: ((String) -> Unit)? = null
-
-    fun begin(song: JSONObject) {
-        depth++
-        val name = song.optString("name")
-        val artist = song.optString("artist")
-        sink?.invoke(
-            if (artist.isEmpty()) "▶ 解析: " + name
-            else "▶ 解析: " + name + " - " + artist
-        )
+    /** 一段解析的暂存：歌的 key + 已盖时间戳的行（3.12.1 起先暂存、
+     * 歌真正起播才落盘——预置/补仓解析的段没被播到就永远不出现，
+     * 与旧网页脚本日志「播到才并入」的规矩一致，cheng 2026-11-06 定） */
+    class Seg(val key: String) {
+        val lines = ArrayList<String>()
     }
 
+    private val lock = Any()
+
+    /** 正在解析的段，按解析线程分开记（补仓 resolveExec 与换源/起播
+     * swapExec 可能同刻各开一段，段头段尾按线程配对不错位） */
+    private val openSegs = LinkedHashMap<Long, Seg>()
+
+    /** 脚本行（JS 线程转发，无从知道属于哪次调用）归最近开着的那段 */
+    private var mirrorTarget: Seg? = null
+
+    /** 暂存队列（解析完、还没起播的段），上限 16、满了丢最老的 */
+    private val pending = ArrayDeque<Seg>()
+
+    /** 落盘口子：服务在 onCreate 挂上（把一行原文 append 进 lx_script.log） */
+    @Volatile
+    var fileSink: ((String) -> Unit)? = null
+
+    private fun stamp(msg: String): String {
+        return try {
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date()) + " " + msg
+        } catch (_: Exception) {
+            msg
+        }
+    }
+
+    fun begin(song: JSONObject) {
+        synchronized(lock) {
+            val seg = Seg(LxResolver.keyOfJson(song))
+            val name = song.optString("name")
+            val artist = song.optString("artist")
+            seg.lines.add(
+                stamp(
+                    if (artist.isEmpty()) "▶ 解析: " + name
+                    else "▶ 解析: " + name + " - " + artist
+                )
+            )
+            openSegs[Thread.currentThread().id] = seg
+            mirrorTarget = seg
+        }
+    }
+
+    /** 脚本自己的行（服务侧引擎回调转入）：没有开着的段就丢弃 */
+    fun line(msg: String) {
+        synchronized(lock) {
+            val seg = mirrorTarget ?: return
+            if (!openSegs.containsValue(seg)) return
+            seg.lines.add(stamp(msg))
+        }
+    }
+
+    /** 解析线程自己的注记（如单曲解析超时跳过）：记进本线程的段 */
     fun note(msg: String) {
-        if (depth > 0) sink?.invoke(msg)
+        synchronized(lock) {
+            val seg = openSegs[Thread.currentThread().id] ?: return
+            seg.lines.add(stamp(msg))
+        }
     }
 
     fun end(url: String?) {
-        if (url != null) {
-            var host = ""
-            try {
-                host = java.net.URL(url).host ?: ""
-            } catch (_: Exception) {
+        synchronized(lock) {
+            val seg = openSegs.remove(Thread.currentThread().id) ?: return
+            if (url != null) {
+                var host = ""
+                try {
+                    host = java.net.URL(url).host ?: ""
+                } catch (_: Exception) {
+                }
+                seg.lines.add(
+                    stamp(if (host.isNotEmpty()) "▶ 解析成功 → " + host else "▶ 解析成功")
+                )
+            } else {
+                seg.lines.add(stamp("▶ 解析失败"))
             }
-            sink?.invoke(if (host.isNotEmpty()) "▶ 解析成功 → " + host else "▶ 解析成功")
-        } else {
-            sink?.invoke("▶ 解析失败")
+            pending.addLast(seg)
+            while (pending.size > 16) pending.removeFirst()
+            if (mirrorTarget === seg) {
+                mirrorTarget = openSegs.values.lastOrNull()
+            }
         }
-        if (depth > 0) depth--
+    }
+
+    /** 这首歌真正起播（或点播终点失败）时，把它暂存的段按解析先后落盘 */
+    fun flushFor(key: String) {
+        if (key.isEmpty()) return
+        val sink = fileSink ?: return
+        synchronized(lock) {
+            val it = pending.iterator()
+            while (it.hasNext()) {
+                val seg = it.next()
+                if (seg.key == key) {
+                    for (l in seg.lines) sink(l)
+                    it.remove()
+                }
+            }
+        }
     }
 }
