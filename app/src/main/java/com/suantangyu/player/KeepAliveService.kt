@@ -236,20 +236,18 @@ class KeepAliveService : Service() {
     private var engineOkCount = 0
     // 3.3.6：播放出错计数（被自救盖过去的断也要有明账，进计数行）
     private var engineErrCount = 0
-    // 3.3.5 出错自救：连续跳过计数（真出声即清零）与待执行标记（同一次错误只排一次）
+    // 3.3.5 出错自救：连续跳过计数（真出声即清零）
     private var errSkipCount = 0
-    private var errRescuePending = false
-    // 3.3.7 同曲原地重试状态：按 URL 记账，每首最多重试 2 次（真出声/换曲清零）
-    private var errRetryUrl = ""
-    private var errRetryCount = 0
-    // 描述符按 key 留存（QUEUE_AHEAD/点播/预置交来时存），阶梯换源时取用
-    // 单脑第 3 步：descriptorByKey 登记册已退役——队列即档案（brainQueue）
-    // 3.4.0 阶梯（cheng 议定；3.5.3 瘦身：重解析台阶实测 6/6 无新链、撤）：
-    // 每集只换源一次；换源新曲 key 记账（算同一集延续）；待网页同步的换源记录
-    private var errEpisodeKey = ""
+    // 救援状态（3.13.0 阶梯拆并）：原「重试→换源→跳过」阶梯撤除——同址
+    // 重试实测零救回、重解析 6/6 无新链；报错改为直接强制换源重解析，
+    // 形从落雪（报错→钻回取址链换源→跳过）。以下三旗供 12 秒帽看门狗
+    // 与完成回调抢答、及停摆接播守卫共用
+    private var rescueInFlight = false
+    private var rescueSettled = true // 收账标记：帽看门狗与完成回调谁先到谁收
+    private var rescueStartMs: Long = 0L // 救援开工时刻（守卫判在飞用）
+    // 换源新曲 key 记账：hello 重推网页同步用；兼作防循环——换上的歌
+    // 没出声就又出错，不二次换源、直接跳过（真出声后 onIsPlayingChanged 清）
     private var errQqNewKey = ""
-    private var errQqUsed = false
-    private var errSwapSettled = true // 换源收账标记（3.5.4：超时看门狗与完成回调抢答用）
     private var pendingSwapFor = ""
     private var pendingSwapSong: org.json.JSONObject? = null
     private var engineFailCount = 0
@@ -749,7 +747,7 @@ class KeepAliveService : Service() {
                             // 且跑道非空就直接接播队首；阶梯正在救当前曲时不抢。
                             val pp = player
                             if (nativeActive && pp != null && pp.playWhenReady &&
-                                !errRescuePending && swapNotInFlight() &&
+                                swapNotInFlight() &&
                                 (pp.playbackState == Player.STATE_IDLE ||
                                     pp.playbackState == Player.STATE_ENDED)
                             ) {
@@ -926,7 +924,7 @@ class KeepAliveService : Service() {
         // 3.5.5：IDLE 停摆兜底——看门狗第二击把播放器停到 IDLE 后，若跑道
         // 里已有歌（无论谁放的），此前无人接播、只能干等网页醒来。此处与
         // 补仓落袋的停摆接播互为兜底：还想播、跑道非空、播放器空闲 → 接播。
-        if (st == Player.STATE_IDLE && wantPlay && !errRescuePending &&
+        if (st == Player.STATE_IDLE && wantPlay &&
             swapNotInFlight() && armedItems.isNotEmpty()
         ) {
             val first = armedItems.firstOrNull()
@@ -1223,12 +1221,9 @@ class KeepAliveService : Service() {
             playing = isPlaying
             if (isPlaying) {
                 errSkipCount = 0
-                errRetryCount = 0
-                errRetryUrl = ""
-                errEpisodeKey = ""
                 errQqNewKey = ""
-                errQqUsed = false
-                errSwapSettled = true
+                rescueInFlight = false
+                rescueSettled = true
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -1323,8 +1318,7 @@ class KeepAliveService : Service() {
             }
             // 3.3.5：错误留痕进引擎日志 + 壳内自救。解析成功不等于流能播，
             // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
-            if (!errRescuePending) {
-                errRescuePending = true
+            if (!rescueInFlight) {
                 engineErrCount++
                 val host = try {
                     java.net.URI(nativeUrl).host ?: ""
@@ -1336,60 +1330,36 @@ class KeepAliveService : Service() {
                         (if (httpCode > 0) " http=" + httpCode else "") +
                         (if (host.isNotEmpty()) " host=" + host else "")
                 )
-                // 3.3.9（cheng 定）：两次重试等待统一 1.5s——故障窗以分钟计，
-                // 等再久也熬不过去，只徒增静默；1.5s 足够接住短暂抖动
-                val delay = 1500L
-                tickHandler.postDelayed({
-                    errRescuePending = false
-                    errorSkipRescue()
-                }, delay)
+                // 3.13.0：报错即救——同址重试实测零救回已撤，不再等 1.5 秒，
+                // 直接强制换源重解析；刚换源落地的歌没出声就又出错则防循环
+                // 直接跳过（errQqNewKey 记账，真出声后才清）
+                val p = player
+                if (p != null) {
+                    val curKey = try {
+                        p.currentMediaItem?.mediaId ?: ""
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    if (curKey.isNotEmpty() && curKey == errQqNewKey) {
+                        doSkipAfterError(p)
+                    } else {
+                        rescueByQqSwap(p, curKey, nativeUrl)
+                    }
+                }
             }
         }
     }
 
-    /** 出错自救：跳过死掉的这首、接上下一首，永不停摆（落雪式处理）；
-     * 连续跳 3 次仍出错才停手并留断播点记录。用户已暂停时不自作主张。 */
-    private fun errorSkipRescue() {
-        val p = player ?: return
-        if (!nativeActive) return
-        if (!p.playWhenReady) return
-        val curUrl = nativeUrl
-        // 第一级：同一首原地重试。code=2001 这类连接层故障多是时间窗问题，
-        // 歌本身没坏，重拉同一条流多半就活——跳歌是最后手段，不是第一反应
-        if (curUrl.isEmpty() || curUrl != errRetryUrl || errRetryCount < 2) {
-            if (curUrl != errRetryUrl) {
-                errRetryUrl = curUrl
-                errRetryCount = 0
-            }
-            errRetryCount++
-            engineLog("引擎：出错原地重试 " + title + "（第" + errRetryCount + "次）")
-            try {
-                p.seekTo(p.currentMediaItemIndex, 0)
-                p.prepare()
-                p.play()
-            } catch (_: Exception) {
-            }
-            return
-        }
-        // 集号对齐：切到别的歌 → 换源记账重新起算；
-        // 换源换上的新曲（errQqNewKey）算同一集延续，不重置
-        val curKey = try {
-            p.currentMediaItem?.mediaId ?: ""
-        } catch (_: Exception) {
-            ""
-        }
-        if (curKey.isNotEmpty() && curKey != errEpisodeKey && curKey != errQqNewKey) {
-            errEpisodeKey = curKey
-            errQqUsed = false
-        }
-        // 第二级：换源（非 QQ 曲换 QQ；QQ 曲在 QQ 内换版本）；再下级才是跳过
-        tryQqSwapOrSkip(p, curKey, curUrl)
-    }
-
-    /** 第二级换源：非 QQ 曲搜 QQ 同名换上；QQ 曲在 QQ 内换一个不同版本。
-     * 搜索/解析在解析线程跑，换链回主线程执行；无果则落到跳过兜底。
-     * 每集只换一次；没描述符的歌不走这级（亮屏点播由网页自己的链救）。 */
-    private fun tryQqSwapOrSkip(p: ExoPlayer, curKey: String, curUrl: String) {
+    /** 强制换源重解析（3.13.0，阶梯拆并后的唯一救援）：非 QQ 曲搜 QQ
+     * 同名换上；QQ 曲在 QQ 内换一个不同版本。播放报错由 onPlayerError
+     * 直接喊到这里——中间不再有同址重试（实测零救回）。搜索/解析在
+     * 解析线程跑，换链回主线程执行；无果则落到跳过兜底。没描述符的
+     * 歌不走这级（亮屏点播由网页自己的链救）。 */
+    private fun rescueByQqSwap(p: ExoPlayer, curKey: String, curUrl: String) {
+        if (!nativeActive || !p.playWhenReady) return
+        rescueInFlight = true
+        rescueSettled = false
+        rescueStartMs = android.os.SystemClock.elapsedRealtime()
         // 单脑第 3 步：查档改脑队列直查——队列即档案，无登记册副本
         var desc: org.json.JSONObject? = null
         if (curKey.isNotEmpty()) {
@@ -1443,38 +1413,38 @@ class KeepAliveService : Service() {
             doSkipAfterError(p)
             return
         }
-        if (configSources.isEmpty() || errQqUsed) {
+        if (configSources.isEmpty()) {
             doSkipAfterError(p)
             return
         }
-        errQqUsed = true
-        errSwapSettled = false
-        errSwapStartMs = android.os.SystemClock.elapsedRealtime()
         val name = desc.optString("name").ifEmpty { title }
         val singer = desc.optString("artist")
         val plat = desc.optString("source").ifEmpty { "qq" }
         engineLog("引擎：换源搜索 " + name)
-        // 3.5.4（cheng 定）：换源全程 5 秒封顶——到点还没成，记超时并跳过，
-        // 不让喘不过气的接口把静默拖到分钟级；迟到的结果由收账标记 +
-        // nativeUrl 守卫丢弃（已跳走的不复活；断播点没跳成的仍可被迟到救兵救）
-        val swapStartMs = android.os.SystemClock.elapsedRealtime()
+        // 3.13.0（cheng 改定）：换源全程 12 秒封顶——原 3.5.4 的 5 秒帽
+        // 罩不住 apicx 冷查询（~8 秒）、且实测有 +11 秒才到的成功答案；
+        // 到点还没成，记超时并跳过，不让喘不过气的接口把静默拖到分钟
+        // 级；迟到的结果由收账标记 + nativeUrl 守卫丢弃（已跳走的不
+        // 复活；断播点没跳成的仍可被迟到救兵救）
+        val swapStartMs = rescueStartMs
         tickHandler.postDelayed({
             val pp = player
-            if (!errSwapSettled && pp != null && nativeActive && pp.playWhenReady && nativeUrl == curUrl) {
-                errSwapSettled = true
-                engineLog("引擎：换源无果 " + name + "（5 秒超时）")
+            if (!rescueSettled && pp != null && nativeActive && pp.playWhenReady && nativeUrl == curUrl) {
+                rescueSettled = true
+                rescueInFlight = false
+                engineLog("引擎：换源无果 " + name + "（12 秒超时）")
                 doSkipAfterError(pp)
             }
-        }, 5000L)
+        }, 12000L)
         swapExec.execute {
-            val remainMs = 5000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)
-            val alt = searchQqAlt(desc, name, singer, plat, (remainMs / 1000L).toInt().coerceIn(2, 8))
+            val remainMs = 12000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)
+            val alt = searchQqAlt(desc, name, singer, plat, (remainMs / 1000L).toInt().coerceIn(2, 5))
             val newUrl = if (alt != null) {
                 try {
                     LxResolver.resolve(
                         alt, configSources, configQuality, configAutoDown,
                         lxEngine(),
-                        (5000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)).coerceAtLeast(1000L)
+                        (12000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)).coerceAtLeast(1000L)
                     ) { m -> engineLog(m) }?.toString() ?: ""
                 } catch (_: Exception) {
                     ""
@@ -1485,9 +1455,12 @@ class KeepAliveService : Service() {
             tickHandler.post {
                 val pp = player
                 if (pp == null || !nativeActive || nativeUrl != curUrl) {
+                    rescueSettled = true
+                    rescueInFlight = false
                     return@post
                 }
-                errSwapSettled = true
+                rescueSettled = true
+                rescueInFlight = false
                 if (alt != null && newUrl.isNotEmpty()) {
                     val newKey = LxResolver.keyOfJson(alt)
                     applySwapToBrain(curKey, alt, newKey)
@@ -1543,7 +1516,7 @@ class KeepAliveService : Service() {
     }
 
     /** QQ 搜索挑一首可换的：非 QQ 曲取第一条可用结果；QQ 曲取第一个不同
-     * songmid 的版本（同版本在第 2 步已重解析过，换了等于没换，故不取）。 */
+     * songmid 的版本（同版本就是刚死掉的那个文件，换了等于没换，故不取）。 */
     private fun searchQqAlt(
         orig: org.json.JSONObject, name: String, singer: String, plat: String,
         timeoutSec: Int = 8
@@ -1618,11 +1591,11 @@ class KeepAliveService : Service() {
 
     /** 跳过出错的这首、接上下一首；连续跳 3 首仍败才停手记断播点 */
     private fun doSkipAfterError(p: ExoPlayer) {
+        rescueInFlight = false
+        rescueSettled = true
         if (!nativeActive) return
         if (!p.playWhenReady) return
         errSkipCount++
-        errRetryUrl = ""
-        errRetryCount = 0
         if (errSkipCount > 3) {
             engineLog("引擎：断播点（连续出错） " + engineCounters())
             return
@@ -2337,7 +2310,6 @@ class KeepAliveService : Service() {
     private var brainOpGen: Int = 0 // 意图代次：新意图一来，旧解析落地作废（与落雪 gettingUrlId 同构）
     private var brainStartKey: String = "" // 正在办的起播键（终点回执 startfailed 按它回）
     private var brainSaveRunnable: Runnable? = null
-    private var errSwapStartMs: Long = 0L // 换源开工时刻（踢子守卫判在飞用）
 
     private fun feedBrainFromSnapshot(o: org.json.JSONObject) {
         if (o.optInt("v", 1) < 2) return
@@ -2722,13 +2694,13 @@ class KeepAliveService : Service() {
     /**
      * 3.5.5 踢子守卫补丁（3.7.0）：换源未收账且开工未满 12 秒 = 救援在飞，
      * 两处停摆接播都不许抢（2026-11-04 晚实测 4 次换源全被踢子抢先跳走，
-     * 根因是 errRescuePending 在阶梯派出后 1.5 秒即清、踢子看不见换源）。
-     * 12 秒上限防收账旗异常卡死把踢子永久锁死（换源自身预算才 5 秒）。
+     * 根因是待救标记在救援派出后即清、踢子看不见换源）。
+     * 15 秒上限防收账旗异常卡死把踢子永久锁死（换源自身预算 12 秒）。
      */
     private fun swapNotInFlight(): Boolean {
-        if (errSwapSettled) return true
-        if (errSwapStartMs <= 0L) return true
-        return SystemClock.elapsedRealtime() - errSwapStartMs > 12000L
+        if (rescueSettled) return true
+        if (rescueStartMs <= 0L) return true
+        return SystemClock.elapsedRealtime() - rescueStartMs > 15000L
     }
 
     private fun persistBrainSoon() {
