@@ -253,6 +253,27 @@ object LxResolver {
         budgetMs: Long = 90000L,
         log: (String) -> Unit
     ): String? {
+        // 3.12.0：解析分段记录（脚本日志搬进脑子）——一进一出包一段，
+        // 段头/段尾写进独立脚本日志，解析本体一字不改
+        ScriptSeg.begin(song)
+        var out: String? = null
+        try {
+            out = resolveBody(song, sources, wantQ, autoDown, engine, budgetMs, log)
+        } finally {
+            ScriptSeg.end(out)
+        }
+        return out
+    }
+
+    private fun resolveBody(
+        song: JSONObject,
+        sources: List<SrcCfg>,
+        wantQ: String,
+        autoDown: Boolean,
+        engine: LxEngine?,
+        budgetMs: Long = 90000L,
+        log: (String) -> Unit
+    ): String? {
         // 3.3.1：单曲解析总时限（默认 90 秒，脚本源慢调用由引擎 30 秒/次封顶，
         // 这里再封整曲上限，防一首坏歌把单线程解析队列拖死、后面全断）；
         // 3.5.4：换源路径传小预算（5 秒总限的剩余量），到点就收，不再逐档磨
@@ -261,6 +282,7 @@ object LxResolver {
         for (q in tiers) {
             if (System.currentTimeMillis() > deadline) {
                 log("引擎：单曲解析超时跳过 " + song.optString("name"))
+                ScriptSeg.note("引擎：单曲解析超时跳过 " + song.optString("name"))
                 return null
             }
             val url = resolveAtQuality(song, q, sources, engine, log, deadline)
@@ -796,5 +818,47 @@ object LxResolver {
             }
         }
         return null
+    }
+}
+
+/** 脚本日志分段（3.12.0）：resolve 一进一出记一段——段头（歌名-歌手）、
+ * 段尾（解析成功 → host / 解析失败）；段进行中的脚本行由服务侧在引擎
+ * 日志回调里按 depth 镜像（见 KeepAliveService）。sink 由服务在
+ * onCreate 挂上（写 lx_script.log 独立文件）；后台日志的记录内容与
+ * 文件一概不经此处。并发解析（补仓与换源同刻）时两段会在文件里
+ * 交错——与旧网页脚本日志的已知串段上限同级，如实记录不做隔离。 */
+object ScriptSeg {
+    @Volatile
+    var depth = 0
+
+    @Volatile
+    var sink: ((String) -> Unit)? = null
+
+    fun begin(song: JSONObject) {
+        depth++
+        val name = song.optString("name")
+        val artist = song.optString("artist")
+        sink?.invoke(
+            if (artist.isEmpty()) "▶ 解析: " + name
+            else "▶ 解析: " + name + " - " + artist
+        )
+    }
+
+    fun note(msg: String) {
+        if (depth > 0) sink?.invoke(msg)
+    }
+
+    fun end(url: String?) {
+        if (url != null) {
+            var host = ""
+            try {
+                host = java.net.URL(url).host ?: ""
+            } catch (_: Exception) {
+            }
+            sink?.invoke(if (host.isNotEmpty()) "▶ 解析成功 → " + host else "▶ 解析成功")
+        } else {
+            sink?.invoke("▶ 解析失败")
+        }
+        if (depth > 0) depth--
     }
 }

@@ -276,7 +276,17 @@ class KeepAliveService : Service() {
     private fun lxEngine(): LxEngine {
         var e = engine
         if (e == null) {
-            e = LxEngine { m -> engineLog(m) }
+            e = LxEngine { m ->
+                engineLog(m)
+                // 3.12.0：脚本日志分段镜像——解析段进行中，脚本自己的行
+                // （[源名] 开头）与脚本解析报错行同步记进脚本日志文件；
+                // 后台日志那份照旧全量，这只是同源多记一份分段版
+                if (ScriptSeg.depth > 0 &&
+                    (m.startsWith("[") || m.contains("解析报错"))
+                ) {
+                    scriptFileLog(m)
+                }
+            }
             engine = e
         }
         return e
@@ -323,6 +333,46 @@ class KeepAliveService : Service() {
         try {
             pushSync(JSONObject().put("t", "enginelog").put("msg", line))
         } catch (_: Exception) {
+        }
+    }
+
+    private val scriptLogLock = Any()
+
+    /** 脚本日志（3.12.0）：解析分段记录，独立文件 lx_script.log——
+     * 只记 resolve 的段（段头/段内脚本行/结论），供网页脚本日志面板
+     * 按歌呈现；与后台日志同源但互不影响，后台日志的记录方式不改。
+     * 上限 512KB、写满滚动保留约 384KB（同后台日志的保旧策略） */
+    private fun scriptFileLog(msg: String) {
+        val line = try {
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(java.util.Date()) + " " + msg
+        } catch (_: Exception) {
+            msg
+        }
+        synchronized(scriptLogLock) {
+            try {
+                val f = java.io.File(filesDir, "lx_script.log")
+                if (f.length() > 512 * 1024) {
+                    try {
+                        val lines = f.readLines(Charsets.UTF_8)
+                        var bytes = lines.sumOf { it.toByteArray(Charsets.UTF_8).size + 1 }
+                        var drop = 0
+                        while (drop < lines.size && bytes > 384 * 1024) {
+                            bytes -= lines[drop].toByteArray(Charsets.UTF_8).size + 1
+                            drop++
+                        }
+                        if (drop > 0) {
+                            f.writeText(
+                                lines.drop(drop).joinToString("\n") + "\n",
+                                Charsets.UTF_8
+                            )
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                f.appendText(line + "\n")
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -1759,6 +1809,7 @@ class KeepAliveService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        ScriptSeg.sink = { s -> scriptFileLog(s) }
         restoreBrainState()
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——

@@ -316,6 +316,22 @@ class BaoBridge(private val activity: MainActivity) {
         }
     }
 
+    /** 脚本日志（3.12.0）：壳内解析分段记录（lx_script.log 尾 600 行）——
+     * 解析在脑子，脚本日志跟着脑子；网页面板有此桥才显示（纯浏览器不留） */
+    @JavascriptInterface
+    fun getScriptLog(): String {
+        return try {
+            val f = java.io.File(activity.filesDir, "lx_script.log")
+            if (!f.exists()) {
+                ""
+            } else {
+                f.readLines(Charsets.UTF_8).takeLast(600).joinToString("\n")
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     /** 当前曲描述符——单脑第 3 步已退役为空实现：当前曲档案在快照队列里 */
     @JavascriptInterface
     fun postCurrentSong(json: String) {
