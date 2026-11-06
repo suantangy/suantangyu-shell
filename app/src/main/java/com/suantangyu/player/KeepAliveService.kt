@@ -2323,7 +2323,21 @@ class KeepAliveService : Service() {
         if (qs.isEmpty()) return
         brainQueue = qs
         brainQueueKeys = ks
-        brainMode = o.optString("mode").ifEmpty { "list" }
+        val newMode = o.optString("mode").ifEmpty { "list" }
+        if (newMode != brainMode) {
+            // 第四步补洞（3.11.2）：模式一变，跑道里按旧模式囤的存货立即
+            // 清掉——播放器顺接不看模式，囤着旧货时切到单曲也会先把旧货
+            // 播完才轮到重复（网页时代靠 refreshArm 重预置整表替换跑道，
+            // 页面退出补给后这一步没人做，2026-11-06 仪表日志实证）
+            val beforeArmed = armedItems.size
+            armedItems.removeAll { !it.repeat }
+            if (armedItems.size != beforeArmed) syncUpcomingToPlayer()
+            engineLog(
+                "引擎：模式变更 " + brainMode + " → " + newMode +
+                    "（清跑道存货 " + (beforeArmed - armedItems.size) + " 首）"
+            )
+            brainMode = newMode
+        }
         if (brainCurKey.isEmpty()) {
             val ck = o.optString("curKey")
             brainCurKey = brainAliases[ck] ?: ck
