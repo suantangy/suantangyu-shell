@@ -9,8 +9,9 @@ import java.net.URLEncoder
  * 覆盖的源类型与网页完全一致：淡月疏星（直链拼接）、雾隐青山（POST 接口）、
  * LX 脚本源（走 LxEngine 的 QuickJS）、玉宁熙（四平台接口）、松间听雨（直链
  * 拼接）、通用 API 源（/url/{plat}/{id}/{q} 等常见形态）。
- * 与网页的已知差异：不做「同平台全败后搜 QQ 同名曲」回退（那需要搜索链，
- * 留待后续）；网页请求里的 CORS 代理腿在原生侧无意义，已略去。
+ * 3.15.0 起与网页对齐：同平台全灭后每档搜 QQ 同名兜底、降级按真档
+ * 降到 128k 封底；另有源×平台冷却（壳独有）。网页请求里的 CORS 代理
+ * 腿在原生侧无意义，已略去。
  */
 object LxResolver {
 
@@ -71,11 +72,26 @@ object LxResolver {
         return if (i < 0) 999 else i
     }
 
+    // 3.15.0 定案：降级按真档走——REAL_TIERS 逐档下走、128k（标准）
+    // 封底；flac24bit≈hires、192k≈320k 为孪生档不重复问，64k 不走。
+    // 不数档数：起点由设置音质定，封底全员统一（与网页同步改）
+    private val REAL_TIERS = listOf("master", "hires", "flac", "320k", "128k")
+
+    private fun canonTier(q: String): String {
+        return when (q) {
+            "flac24bit" -> "hires"
+            "192k" -> "320k"
+            "64k" -> "128k"
+            else -> q
+        }
+    }
+
     private fun qualityFallbacks(fromQ: String): List<String> {
         var start = QUALITY_ORDER.indexOf(fromQ)
         if (start < 0) start = QUALITY_ORDER.indexOf("flac")
         if (start < 0) start = 0
-        return QUALITY_ORDER.subList(start, minOf(start + 3, QUALITY_ORDER.size))
+        val ri = REAL_TIERS.indexOf(canonTier(QUALITY_ORDER[start]))
+        return REAL_TIERS.subList(if (ri < 0) 2 else ri, REAL_TIERS.size)
     }
 
     private fun qualityMeets(actual: String?, wanted: String): Boolean {
@@ -279,6 +295,11 @@ object LxResolver {
         // 3.5.4：换源路径传小预算（5 秒总限的剩余量），到点就收，不再逐档磨
         val deadline = System.currentTimeMillis() + budgetMs
         val tiers = if (autoDown) qualityFallbacks(wantQ) else listOf(wantQ)
+        val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
+        // 3.15.0：非 QQ 曲的 QQ 兜底（网页版顺序）——每档同平台全灭后
+        // 在同一档问一次 QQ；整首只搜一次，搜到的 QQ 版描述符各档复用
+        var qqAlt: JSONObject? = null
+        var qqAltTried = false
         for (q in tiers) {
             if (System.currentTimeMillis() > deadline) {
                 log("引擎：单曲解析超时跳过 " + song.optString("name"))
@@ -287,6 +308,20 @@ object LxResolver {
             }
             val url = resolveAtQuality(song, q, sources, engine, log, deadline)
             if (url != null) return url
+            if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
+                if (!qqAltTried) {
+                    qqAltTried = true
+                    qqAlt = searchQqAltDesc(song)
+                }
+                val alt = qqAlt
+                if (alt != null) {
+                    val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline)
+                    if (u2 != null) {
+                        log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
+                        return u2
+                    }
+                }
+            }
         }
         return null
     }
@@ -307,18 +342,123 @@ object LxResolver {
         }
         for (src in chain) {
             if (System.currentTimeMillis() > deadline) return null
+            if (isCooling(src, songPlat)) continue
+            val t0 = System.currentTimeMillis()
+            var threw = false
             val r = try {
                 resolveBySource(src, song, q, mid, engine, log)
             } catch (e: Exception) {
+                threw = true
                 null
-            } ?: continue
+            }
+            if (r == null) {
+                // 3.15.0 源×平台冷却：硬失败（抛异常、或耗满 8 秒超时级
+                // 时长仍无果）才凉这个源在这个平台 3 分钟；快速答
+                // 「没有」不凉——那是歌的问题不是源死了
+                if (threw || System.currentTimeMillis() - t0 >= 8000L) {
+                    benchSource(src, songPlat, log)
+                }
+                continue
+            }
             if (r.lx) return r.url
             val det = detectQualityFromUrl(r.url)
             if (det == null || qualityMeets(det, q)) return r.url
-            // 与网页一致：首个出址的源音质不达标时本档判败（网页转 QQ 回退，引擎直接进下一档）
-            return null
+            // 3.15.0 对齐网页：音质不达标只毙这个源、继续问下一个源；
+            // 旧行为整档判败，会让排第一的源一个低音质址带死整档
         }
         return null
+    }
+
+    // ---------- 3.15.0：源×平台冷却 + QQ 兜底搜索 ----------
+
+    private val srcCooldownUntil = HashMap<String, Long>()
+
+    fun clearCooldowns() {
+        synchronized(srcCooldownUntil) { srcCooldownUntil.clear() }
+    }
+
+    private fun isCooling(src: SrcCfg, plat: String): Boolean {
+        val until = synchronized(srcCooldownUntil) {
+            srcCooldownUntil[src.key() + "|" + plat]
+        } ?: return false
+        return System.currentTimeMillis() < until
+    }
+
+    private fun benchSource(src: SrcCfg, plat: String, log: (String) -> Unit) {
+        synchronized(srcCooldownUntil) {
+            srcCooldownUntil[src.key() + "|" + plat] =
+                System.currentTimeMillis() + 180_000L
+        }
+        log("引擎：源冷却 " + src.name + " 平台 " + plat + "（3 分钟）")
+    }
+
+    /** QQ 兜底搜索：歌名+歌手搜 QQ，取首个可建描述符的结果 */
+    private fun searchQqAltDesc(song: JSONObject): JSONObject? {
+        val singer = song.optString("artist")
+            .ifEmpty { song.optString("singer") }
+        val kw = (song.optString("name") + " " + singer).trim()
+        if (kw.isEmpty()) return null
+        val url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=" +
+            enc(kw) + "&format=json&p=1&n=10&new_json=1&cr=1&t=0"
+        val data = try {
+            LxHttp.fetchJson(
+                url,
+                headers = mapOf("Referer" to "https://y.qq.com/"),
+                timeoutSec = 5
+            )
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val list = data.optJSONObject("data")?.optJSONObject("song")
+            ?.optJSONArray("list") ?: return null
+        for (i in 0 until list.length()) {
+            val item = list.optJSONObject(i) ?: continue
+            val built = buildQqDescriptor(item)
+            if (built != null) return built
+        }
+        return null
+    }
+
+    /** QQ 搜索结果 → 描述符（与服务侧 buildQqDescriptor 同字段） */
+    private fun buildQqDescriptor(item: JSONObject): JSONObject? {
+        val mid = item.optString("songmid").ifEmpty { item.optString("mid") }
+        val nm = item.optString("songname").ifEmpty { item.optString("name") }
+        if (mid.isEmpty() || nm.isEmpty()) return null
+        val singers = item.optJSONArray("singer")
+        val names = ArrayList<String>()
+        if (singers != null) {
+            for (j in 0 until singers.length()) {
+                val sn = singers.optJSONObject(j)?.optString("name") ?: ""
+                if (sn.isNotEmpty()) names.add(sn)
+            }
+        }
+        val artistStr = names.joinToString("/")
+        val amid = item.optString("albummid")
+        val album = item.optString("albumname")
+        val cover = if (amid.isNotEmpty()) {
+            "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + amid + ".jpg"
+        } else {
+            ""
+        }
+        val o = JSONObject()
+        o.put("source", "qq")
+        o.put("songmid", mid)
+        o.put("mid", mid)
+        o.put("id", mid)
+        o.put("name", nm)
+        o.put("songname", nm)
+        o.put("artist", artistStr)
+        o.put("singer", artistStr)
+        o.put("singername", artistStr)
+        o.put("album", album)
+        o.put("albumName", album)
+        o.put("albumname", album)
+        o.put("albummid", amid)
+        o.put("albumMid", amid)
+        o.put("cover", cover)
+        o.put("img", cover)
+        o.put("interval", item.optString("interval"))
+        return o
     }
 
     // ---------- resolveBySource 逐分支移植 ----------

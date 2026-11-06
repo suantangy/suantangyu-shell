@@ -2235,6 +2235,7 @@ class KeepAliveService : Service() {
                     } catch (_: Exception) {
                     }
                     configSources = LxResolver.parseSources(json)
+                    LxResolver.clearCooldowns()
                     lxEngine().configure(configSources.filter { it.isScript() })
                     engineLog("引擎：已接收音源配置 " + configSources.size + " 个源")
                 }
