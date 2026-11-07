@@ -245,9 +245,25 @@ class KeepAliveService : Service() {
     private var rescueInFlight = false
     private var rescueSettled = true // 收账标记：帽看门狗与完成回调谁先到谁收
     private var rescueStartMs: Long = 0L // 救援开工时刻（守卫判在飞用）
-    // 回链防循环记账：回链发动过的歌 key——救回的址没出声就又出错
-    // 不二次发动、直接跳过（真出声后 onIsPlayingChanged 清）
+    // 回链防循环记账：回链发动过的歌 key——会话收工后这首再出错
+    // 不二次发动、直接跳过（真出声后 onIsPlayingChanged 清）；会话
+    // 在岗期间候选没出声又死走 rescueContinue 续走，不经这条
     private var rescueDoneKey = ""
+    // 3.18.0 回链会话（甲案：一次发动、内部续走）：发动后回链不交差，
+    // 换上的址没出声又死就把死址追加进名单、同一次里接着往链后面走，
+    // 直到某个址真正出声、链走空、或 12 秒总预算到点才收工。会话代次
+    // 防迟到的取址结果串进新会话；rescueDoneKey 仍记「这首已发动过」
+    private var rescueSessKey = ""
+    private var rescueSessGen = 0
+    private var rescueSessDesc: JSONObject? = null
+    private var rescueSessName = ""
+    private var rescueSessPlat = ""
+    private val rescueSessBans = mutableSetOf<String>()
+    private var rescueSessDeadlineMs = 0L
+    private var rescueSessAwaitingUrl = ""
+    private var rescueSessCandHost = ""
+    private var rescueSessCandViaQq = false
+    private var rescueSessTries = 0
     // 3.14.0 会话锁：播放意图在时服务自持 WakeLock+WifiLock，不再只靠
     // 播放器那把「在播才持」的锁——熄屏深睡会把网络分段挂起（2026-11-06
     // 实证：省电无限制开着仍被掐、2001 簇发、亮屏即恢复）。watchdogTick
@@ -1260,6 +1276,28 @@ class KeepAliveService : Service() {
             playing = isPlaying
             if (isPlaying) {
                 errSkipCount = 0
+                // 3.18.0：回链候选真正出声才记「回链成功」并收工关会话
+                // （3.17.0 记在拿到新址时——《半壶纱》那种拿到址没出声
+                // 又死的也被记成成功，日后数自救占比会虚高）；别的歌
+                // 出声则会话作废静默关
+                if (rescueSessKey.isNotEmpty()) {
+                    val sk = try {
+                        player?.currentMediaItem?.mediaId ?: ""
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    if (sk == rescueSessKey &&
+                        rescueSessAwaitingUrl.isNotEmpty()
+                    ) {
+                        engineLog(
+                            "引擎：回链成功 " + rescueSessName + " → " +
+                                rescueSessCandHost +
+                                if (rescueSessCandViaQq) "（QQ 兜底）"
+                                else "（本平台）"
+                        )
+                    }
+                    closeRescueSession()
+                }
                 rescueDoneKey = ""
                 rescueInFlight = false
                 rescueSettled = true
@@ -1373,9 +1411,11 @@ class KeepAliveService : Service() {
                         (if (httpCode > 0) " http=" + httpCode else "") +
                         (if (host.isNotEmpty()) " host=" + host else "")
                 )
-                // 3.17.0：报错即救——死址作废、原歌钻回解析链重走
-                // （报错回链）；回链救回的歌没出声就又出错则防循环
-                // 直接跳过（rescueDoneKey 记账，真出声后才清）
+                // 报错即救——死址作废、原歌钻回解析链重走（报错
+                // 回链）；3.18.0 起一次发动内部续走：换上的址没出声
+                // 又死，把死址追加作废在同一次里接着走（rescueSessKey
+                // 在岗）；会话已收工的歌再出错才直接跳过
+                // （rescueDoneKey 记账，真出声后才清）
                 val p = player
                 if (p != null) {
                     val curKey = try {
@@ -1411,6 +1451,12 @@ class KeepAliveService : Service() {
                                     }
                                     if (up) {
                                         if (k2.isNotEmpty() &&
+                                            k2 == rescueSessKey
+                                        ) {
+                                            // 3.18.0：回链候选撞网络类报错
+                                            // 但网是通的——当候选死了续走
+                                            rescueContinue(pp2, k2)
+                                        } else if (k2.isNotEmpty() &&
                                             k2 == rescueDoneKey
                                         ) {
                                             doSkipAfterError(pp2)
@@ -1429,6 +1475,11 @@ class KeepAliveService : Service() {
                                     }
                                 }
                             }
+                        }
+                        curKey.isNotEmpty() && curKey == rescueSessKey -> {
+                            // 3.18.0 甲案：回链换上的址没出声又死——不
+                            // 算新发动，死址追加作废、同一次里续走
+                            rescueContinue(p, curKey)
                         }
                         curKey.isNotEmpty() && curKey == rescueDoneKey -> {
                             doSkipAfterError(p)
@@ -1519,18 +1570,34 @@ class KeepAliveService : Service() {
         netParkLastTryMs = 0L
     }
 
-    /** 报错回链（3.17.0，cheng 定案，取代 3.13.0 报错换源）：播放报错
-     * （文件死的那类）当取链失败处理——刚死的地址作废，原歌的描述符
-     * 交回解析链按平时取链的规矩整条重走（逐档降级、多源串行、链内
-     * QQ 兜底、源冷却全继承），链再交回死址由解析器当场毙掉继续走；
-     * 拿到不同的活址就地换上续播——歌还是原歌，队列/页面/账本一概
-     * 不动；整条链走空（或 12 秒预算到点）才跳过。一首歌只发动一次，
-     * 回链换上的址没出声又出错直接跳过（rescueDoneKey 记账，出声清）。 */
+    /** 关闭回链会话（3.18.0）：清会话账面。发动记账 rescueDoneKey
+     * 不在这里清——它管的是「这首已发动过一次」，只在真出声时清 */
+    private fun closeRescueSession() {
+        rescueSessKey = ""
+        rescueSessDesc = null
+        rescueSessName = ""
+        rescueSessPlat = ""
+        rescueSessBans.clear()
+        rescueSessDeadlineMs = 0L
+        rescueSessAwaitingUrl = ""
+        rescueSessCandHost = ""
+        rescueSessCandViaQq = false
+        rescueSessTries = 0
+    }
+
+    /** 报错回链（3.17.0 定案；3.18.0 改为一次发动内部续走——cheng
+     * 2026-11-07 拍板甲案）：播放报错（文件死的那类）当取链失败处理：
+     * 刚死的地址作废，原歌钻回解析链整条重走（逐档降级、多源串行、
+     * 链内 QQ 兜底、源冷却全继承）。3.17.0 是拿到第一个新址就交差，
+     * 新址没出声又死只能跳过（2026-11-07 19:04《半壶纱》实测：新址
+     * 与原址是同一份死文件的不同门牌，换门进来还是死的）；3.18.0 起
+     * 回链发动后不交差：换上的址由播放器当场试播，没出声又死就把它
+     * 追加进死址名单、在同一次发动里接着往链后面走，直到某个址真正
+     * 出声（出声点记「回链成功」）、链走空、或 12 秒总预算到点才收工
+     * 跳过。仍是一首只发动一次（rescueDoneKey 记账，出声清），续走
+     * 不算新发动、预算仍是发动时那一本账。 */
     private fun rescueByReResolve(p: ExoPlayer, curKey: String, curUrl: String) {
         if (!nativeActive || !p.playWhenReady) return
-        rescueInFlight = true
-        rescueSettled = false
-        rescueStartMs = android.os.SystemClock.elapsedRealtime()
         // 查档：脑队列直查（队列即档案，无登记册副本）
         var desc: org.json.JSONObject? = null
         var effKey = curKey
@@ -1587,58 +1654,115 @@ class KeepAliveService : Service() {
             doSkipAfterError(p)
             return
         }
+        // 开会话：死址名单从原址起记，12 秒总预算从此刻起一本账。
+        // 会话看门狗只管「到点仍没装上任何候选」的干等——候选装上后，
+        // 它的生死由出声（记成功）或再报错（续走）收账，看门狗不抢答
         val dd = desc
-        val name = dd.optString("name").ifEmpty { title }
-        val plat = dd.optString("source").ifEmpty { "qq" }
-        engineLog("引擎：报错回链 " + name + "（死址作废，重走解析链）")
-        // 12 秒是整次重走的总预算（传给解析链当单曲预算）——不是旧
-        // 换源那种「专等 QQ」的帽，QQ 在新方案里只是链内的一步；
-        // 到点还没成，看门狗收口跳过，迟到结果由收账标记 + nativeUrl
-        // 守卫丢弃
+        closeRescueSession()
+        rescueSessGen++
+        rescueSessKey = effKey
+        rescueSessDesc = dd
+        rescueSessName = dd.optString("name").ifEmpty { title }
+        rescueSessPlat = dd.optString("source").ifEmpty { "qq" }
+        if (curUrl.isNotEmpty()) rescueSessBans.add(curUrl)
+        rescueSessDeadlineMs =
+            android.os.SystemClock.elapsedRealtime() + 12000L
+        rescueDoneKey = effKey
+        engineLog("引擎：报错回链 " + rescueSessName + "（死址作废，重走解析链）")
+        val sessGen = rescueSessGen
+        val sessKey = effKey
+        val firstDeadUrl = curUrl
         tickHandler.postDelayed({
             val pp = player
-            if (!rescueSettled && pp != null && nativeActive && pp.playWhenReady && nativeUrl == curUrl) {
-                rescueSettled = true
+            if (rescueSessGen == sessGen && rescueSessKey == sessKey &&
+                rescueSessAwaitingUrl.isEmpty() && pp != null &&
+                nativeActive && pp.playWhenReady &&
+                nativeUrl == firstDeadUrl
+            ) {
+                engineLog("引擎：回链无果 " + rescueSessName + "（12 秒超时）")
+                closeRescueSession()
                 rescueInFlight = false
-                engineLog("引擎：回链无果 " + name + "（12 秒超时）")
+                rescueSettled = true
                 doSkipAfterError(pp)
             }
         }, 12000L)
+        rescueWalkStep(p)
+    }
+
+    /** 回链会话里走一步解析链（3.18.0）：拿剩余预算 + 累积死址名单
+     * 重走整条链——链再交回任何一个死址都由解析器当场毙掉，于是这一
+     * 步天然从上一步停下的地方往后面走（多源顺序、逐档降级、链内 QQ
+     * 兜底、源冷却全继承）；拿到新址就装上试播，交由出声（记「回链
+     * 成功」）或再报错（rescueContinue 续走）收账 */
+    private fun rescueWalkStep(p: ExoPlayer) {
+        val dd = rescueSessDesc
+        if (dd == null || rescueSessKey.isEmpty()) {
+            closeRescueSession()
+            rescueInFlight = false
+            rescueSettled = true
+            return
+        }
+        val remain = rescueSessDeadlineMs -
+            android.os.SystemClock.elapsedRealtime()
+        if (remain < 1000L) {
+            engineLog("引擎：回链无果 " + rescueSessName + "（12 秒超时）")
+            closeRescueSession()
+            doSkipAfterError(p)
+            return
+        }
+        val sessGen = rescueSessGen
+        val sessKey = rescueSessKey
+        val name = rescueSessName
+        val plat = rescueSessPlat
+        val bans = rescueSessBans.toSet()
+        val stepBaseUrl = nativeUrl
+        rescueInFlight = true
+        rescueSettled = false
+        rescueStartMs = android.os.SystemClock.elapsedRealtime()
         swapExec.execute {
             val newUrl = try {
                 LxResolver.resolve(
                     dd, configSources, configQuality, configAutoDown,
-                    lxEngine(), 12000L, curUrl
+                    lxEngine(), remain, bans
                 ) { m -> engineLog(m) }?.toString() ?: ""
             } catch (_: Exception) {
                 ""
             }
             tickHandler.post {
                 val pp = player
-                if (pp == null || !nativeActive || nativeUrl != curUrl) {
-                    rescueSettled = true
+                if (pp == null || !nativeActive ||
+                    rescueSessGen != sessGen || rescueSessKey != sessKey ||
+                    nativeUrl != stepBaseUrl
+                ) {
+                    // 会话已换代/已关、或歌已被切走接管：迟到结果丢弃
                     rescueInFlight = false
+                    rescueSettled = true
                     return@post
                 }
-                rescueSettled = true
                 rescueInFlight = false
+                rescueSettled = true
                 if (newUrl.isNotEmpty()) {
+                    rescueSessTries++
                     val host3 = try {
                         java.net.URI(newUrl).host ?: ""
                     } catch (_: Exception) {
                         ""
                     }
-                    // 救回成色分开入账，供日后数本平台自救占比
+                    // 成色先记在会话里，出声时才落「回链成功」账
                     val viaQq = plat != "qq" && host3.contains("qqmusic")
+                    rescueSessCandHost = host3
+                    rescueSessCandViaQq = viaQq
+                    rescueSessAwaitingUrl = newUrl
                     engineLog(
-                        "引擎：回链成功 " + name + " → " + host3 +
-                            if (viaQq) "（QQ 兜底）" else "（本平台）"
+                        "引擎：回链试播 " + name + " → " + host3 +
+                            (if (viaQq) "（QQ 兜底）" else "（本平台）") +
+                            (if (rescueSessTries > 1)
+                                "（第" + rescueSessTries + "把）" else "")
                     )
-                    rescueDoneKey = effKey
                     try {
                         val item = mediaItemFor(
                             ArmedItem(
-                                newUrl, effKey,
+                                newUrl, sessKey,
                                 name, dd.optString("artist"),
                                 dd.optString("cover"), false, true
                             )
@@ -1650,7 +1774,7 @@ class KeepAliveService : Service() {
                         try {
                             for (i2 in 0 until pp.mediaItemCount) {
                                 if (i2 != idx3 &&
-                                    pp.getMediaItemAt(i2).mediaId == effKey
+                                    pp.getMediaItemAt(i2).mediaId == sessKey
                                 ) {
                                     pp.replaceMediaItem(i2, item)
                                 }
@@ -1658,29 +1782,45 @@ class KeepAliveService : Service() {
                         } catch (_: Exception) {
                         }
                         nativeUrl = newUrl
-                        nativeKey = effKey
+                        nativeKey = sessKey
                         pp.seekTo(idx3, 0)
                         pp.prepare()
                         pp.play()
                         // 跑道存货里同歌副本同步换新址（账面与播放器一致）
                         for (i3 in armedItems.indices) {
-                            if (armedItems[i3].key == effKey &&
+                            if (armedItems[i3].key == sessKey &&
                                 armedItems[i3].url != newUrl
                             ) {
                                 armedItems[i3] =
                                     armedItems[i3].copy(url = newUrl)
                             }
                         }
-                        ScriptSeg.flushFor(effKey)
+                        ScriptSeg.flushFor(sessKey)
                     } catch (_: Exception) {
+                        closeRescueSession()
                         doSkipAfterError(pp)
                     }
                 } else {
                     engineLog("引擎：回链无果 " + name)
+                    closeRescueSession()
                     doSkipAfterError(pp)
                 }
             }
         }
+    }
+
+    /** 回链候选没出声又死（3.18.0 续走入口）：当前址追加进死址名单、
+     * 在同一次发动里接着走下一步——不算新发动，预算仍是会话那本账 */
+    private fun rescueContinue(p: ExoPlayer, curKey: String) {
+        if (rescueSessKey.isEmpty() || curKey != rescueSessKey) {
+            // 会话不在岗（不该走到这）：按新发动走，别把歌晾着
+            rescueByReResolve(p, curKey, nativeUrl)
+            return
+        }
+        if (nativeUrl.isNotEmpty()) rescueSessBans.add(nativeUrl)
+        rescueSessAwaitingUrl = ""
+        engineLog("引擎：回链新址又死 " + rescueSessName + "（作废续走）")
+        rescueWalkStep(p)
     }
 
     /** 跳过出错的这首、接上下一首；连续跳 3 首仍败才停手记断播点 */
