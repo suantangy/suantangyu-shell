@@ -14,6 +14,8 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -289,6 +291,33 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(
             this, Intent(this, KeepAliveService::class.java)
         )
+
+        // 首帧后查一次 Doze 豁免（见 requestDozeExemptionOnce）
+        window.decorView.post { requestDozeExemptionOnce() }
+    }
+
+    /** 3.19.0 Doze 白名单实验：不在安卓原生电池豁免名单里、且从没
+     * 申请过，就弹一次系统申请窗——这是官方给「熄屏深睡也要保持
+     * 联网」开的豁免通道（深睡对未豁免应用的标准动作之一就是分段
+     * 挂起网络，与实测的熄屏掐网同形）。MIUI 的「省电无限制」与它
+     * 是否同一件事没人验过：弹不弹得出本身就是答案的一半（已豁免
+     * 就不弹；确切状态另由服务每次启动记进后台日志）。点过一次
+     * （允许或拒绝）即记账，不再重复弹，免得成复读机 */
+    private fun requestDozeExemptionOnce() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+            val prefs = getSharedPreferences("shell_prefs", MODE_PRIVATE)
+            if (prefs.getBoolean("doze_asked", false)) return
+            prefs.edit().putBoolean("doze_asked", true).apply()
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + packageName)
+                )
+            )
+        } catch (_: Exception) {
+        }
     }
 
     override fun onDestroy() {
