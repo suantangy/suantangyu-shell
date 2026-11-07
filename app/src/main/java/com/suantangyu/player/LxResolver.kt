@@ -984,7 +984,10 @@ object ScriptSeg {
     /** 脚本行（JS 线程转发，无从知道属于哪次调用）归最近开着的那段 */
     private var mirrorTarget: Seg? = null
 
-    /** 暂存队列（解析完、还没起播的段），上限 16、满了丢最老的 */
+    /** 暂存队列（解析完、还没起播的段）：同一首歌只留最新一段
+     * （3.16.0 改——断网时补仓对同几首歌反复重问，失败段叠加会把
+     * 待播歌的成功段从 FIFO 里挤掉，2026-11-07 实测 Sugar 段丢失），
+     * 上限 32 首、满了丢最老的 */
     private val pending = ArrayDeque<Seg>()
 
     /** 落盘口子：服务在 onCreate 挂上（把一行原文 append 进 lx_script.log） */
@@ -1048,8 +1051,13 @@ object ScriptSeg {
             } else {
                 seg.lines.add(stamp("▶ 解析失败"))
             }
+            // 同 key 旧段先清掉，只留这一段（见 pending 注释）
+            val pit = pending.iterator()
+            while (pit.hasNext()) {
+                if (pit.next().key == seg.key) pit.remove()
+            }
             pending.addLast(seg)
-            while (pending.size > 16) pending.removeFirst()
+            while (pending.size > 32) pending.removeFirst()
             if (mirrorTarget === seg) {
                 mirrorTarget = openSegs.values.lastOrNull()
             }
