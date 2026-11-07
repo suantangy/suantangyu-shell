@@ -2010,19 +2010,6 @@ class KeepAliveService : Service() {
         createChannel()
         ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
         restoreBrainState()
-        // 3.19.0 Doze 白名单实验：服务每次启动把原生电池豁免状态记进
-        // 后台日志——先查清自己在不在安卓原生白名单里（MIUI「省电无
-        // 限制」是否等同于它，靠这行验）；申请入口在 MainActivity，
-        // 只在未豁免且从没申请过时弹一次系统窗
-        try {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            engineLog(
-                "引擎：电池豁免状态 " +
-                    if (pm.isIgnoringBatteryOptimizations(packageName))
-                        "已豁免（原生白名单）" else "未豁免（原生白名单）"
-            )
-        } catch (_: Exception) {
-        }
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {

@@ -10,9 +10,6 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- App 内更新：下载 APK 后调起安装意图用 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <!-- 3.19.0 Doze 白名单实验：向系统申请电池优化豁免用（熄屏深睡
-         分段掐网的官方豁免通道；仅声明权限，弹不弹由代码里的一次性记账控制） -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="true"
