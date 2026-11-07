@@ -245,9 +245,9 @@ class KeepAliveService : Service() {
     private var rescueInFlight = false
     private var rescueSettled = true // 收账标记：帽看门狗与完成回调谁先到谁收
     private var rescueStartMs: Long = 0L // 救援开工时刻（守卫判在飞用）
-    // 换源新曲 key 记账：hello 重推网页同步用；兼作防循环——换上的歌
-    // 没出声就又出错，不二次换源、直接跳过（真出声后 onIsPlayingChanged 清）
-    private var errQqNewKey = ""
+    // 回链防循环记账：回链发动过的歌 key——救回的址没出声就又出错
+    // 不二次发动、直接跳过（真出声后 onIsPlayingChanged 清）
+    private var rescueDoneKey = ""
     // 3.14.0 会话锁：播放意图在时服务自持 WakeLock+WifiLock，不再只靠
     // 播放器那把「在播才持」的锁——熄屏深睡会把网络分段挂起（2026-11-06
     // 实证：省电无限制开着仍被掐、2001 簇发、亮屏即恢复）。watchdogTick
@@ -256,14 +256,12 @@ class KeepAliveService : Service() {
     private var sessionWifiLock: android.net.wifi.WifiManager.WifiLock? = null
     // 3.14.0 网络停车场：网络类报错先探网，全网不通就停在当前曲等恢复
     // （看门狗每 20 秒重拉一次，出声即走），不再在没网的窗口里跳歌烧
-    // 队列；等满 3 分钟仍不通才放弃、转回报错换源老路
+    // 队列；等满 3 分钟仍不通才放弃、转入报错回链
     private var netParkKey = ""
     private var netParkTitle = ""
     private var netParkSinceMs: Long = 0L
     private var netParkLastTryMs: Long = 0L
     private var netProbeInFlight = false
-    private var pendingSwapFor = ""
-    private var pendingSwapSong: org.json.JSONObject? = null
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -761,7 +759,7 @@ class KeepAliveService : Service() {
                             // 且跑道非空就直接接播队首；阶梯正在救当前曲时不抢。
                             val pp = player
                             if (nativeActive && pp != null && pp.playWhenReady &&
-                                swapNotInFlight() && netParkKey.isEmpty() &&
+                                rescueNotInFlight() && netParkKey.isEmpty() &&
                                 (pp.playbackState == Player.STATE_IDLE ||
                                     pp.playbackState == Player.STATE_ENDED)
                             ) {
@@ -904,7 +902,7 @@ class KeepAliveService : Service() {
         }
         // 3.14.0 网络停车场值班：停着的歌每 20 秒重拉一次探活，出声由
         // onIsPlayingChanged 收账；用户暂停就散场；等满 3 分钟仍不通，
-        // 放弃停车、把这首交回报错换源老路。值班期间看门狗其它处置让路
+        // 放弃停车、把这首交回报错回链。值班期间看门狗其它处置让路
         if (netParkKey.isNotEmpty()) {
             if (!wantPlay) {
                 clearNetPark()
@@ -914,8 +912,8 @@ class KeepAliveService : Service() {
                     val pk = netParkKey
                     val pt = netParkTitle
                     clearNetPark()
-                    engineLog("引擎：网络等待超时，转入换源 " + pt)
-                    rescueByQqSwap(p, pk, nativeUrl)
+                    engineLog("引擎：网络等待超时，转入回链 " + pt)
+                    rescueByReResolve(p, pk, nativeUrl)
                 } else if (nowE - netParkLastTryMs >= 20_000L) {
                     netParkLastTryMs = nowE
                     try {
@@ -966,7 +964,7 @@ class KeepAliveService : Service() {
         // 里已有歌（无论谁放的），此前无人接播、只能干等网页醒来。此处与
         // 补仓落袋的停摆接播互为兜底：还想播、跑道非空、播放器空闲 → 接播。
         if (st == Player.STATE_IDLE && wantPlay && netParkKey.isEmpty() &&
-            swapNotInFlight() && armedItems.isNotEmpty()
+            rescueNotInFlight() && armedItems.isNotEmpty()
         ) {
             val first = armedItems.firstOrNull()
             if (first != null) {
@@ -1262,7 +1260,7 @@ class KeepAliveService : Service() {
             playing = isPlaying
             if (isPlaying) {
                 errSkipCount = 0
-                errQqNewKey = ""
+                rescueDoneKey = ""
                 rescueInFlight = false
                 rescueSettled = true
                 if (netParkKey.isNotEmpty()) {
@@ -1375,9 +1373,9 @@ class KeepAliveService : Service() {
                         (if (httpCode > 0) " http=" + httpCode else "") +
                         (if (host.isNotEmpty()) " host=" + host else "")
                 )
-                // 3.13.0：报错即救——同址重试实测零救回已撤，不再等 1.5 秒，
-                // 直接强制换源重解析；刚换源落地的歌没出声就又出错则防循环
-                // 直接跳过（errQqNewKey 记账，真出声后才清）
+                // 3.17.0：报错即救——死址作废、原歌钻回解析链重走
+                // （报错回链）；回链救回的歌没出声就又出错则防循环
+                // 直接跳过（rescueDoneKey 记账，真出声后才清）
                 val p = player
                 if (p != null) {
                     val curKey = try {
@@ -1395,7 +1393,7 @@ class KeepAliveService : Service() {
                         error.errorCode == 2001 || error.errorCode == 2002 -> {
                             // 网络类报错先探网（3.14.0）：全网不通就停车
                             // 保歌，别在没网的窗口里换源/跳歌白烧队列；
-                            // 网通（只是单个站死）照常走报错换源
+                            // 网通（只是单个站死）照常走报错回链
                             val k2 = curKey
                             val u2 = nativeUrl
                             val t2 = title
@@ -1413,11 +1411,11 @@ class KeepAliveService : Service() {
                                     }
                                     if (up) {
                                         if (k2.isNotEmpty() &&
-                                            k2 == errQqNewKey
+                                            k2 == rescueDoneKey
                                         ) {
                                             doSkipAfterError(pp2)
                                         } else {
-                                            rescueByQqSwap(pp2, k2, u2)
+                                            rescueByReResolve(pp2, k2, u2)
                                         }
                                     } else {
                                         netParkKey = k2
@@ -1432,11 +1430,11 @@ class KeepAliveService : Service() {
                                 }
                             }
                         }
-                        curKey.isNotEmpty() && curKey == errQqNewKey -> {
+                        curKey.isNotEmpty() && curKey == rescueDoneKey -> {
                             doSkipAfterError(p)
                         }
                         else -> {
-                            rescueByQqSwap(p, curKey, nativeUrl)
+                            rescueByReResolve(p, curKey, nativeUrl)
                         }
                     }
                 }
@@ -1521,26 +1519,28 @@ class KeepAliveService : Service() {
         netParkLastTryMs = 0L
     }
 
-    /** 强制换源重解析（3.13.0，阶梯拆并后的唯一救援）：非 QQ 曲搜 QQ
-     * 同名换上；QQ 曲在 QQ 内换一个不同版本。播放报错由 onPlayerError
-     * 直接喊到这里——中间不再有同址重试（实测零救回）。搜索/解析在
-     * 解析线程跑，换链回主线程执行；无果则落到跳过兜底。没描述符的
-     * 歌不走这级（亮屏点播由网页自己的链救）。 */
-    private fun rescueByQqSwap(p: ExoPlayer, curKey: String, curUrl: String) {
+    /** 报错回链（3.17.0，cheng 定案，取代 3.13.0 报错换源）：播放报错
+     * （文件死的那类）当取链失败处理——刚死的地址作废，原歌的描述符
+     * 交回解析链按平时取链的规矩整条重走（逐档降级、多源串行、链内
+     * QQ 兜底、源冷却全继承），链再交回死址由解析器当场毙掉继续走；
+     * 拿到不同的活址就地换上续播——歌还是原歌，队列/页面/账本一概
+     * 不动；整条链走空（或 12 秒预算到点）才跳过。一首歌只发动一次，
+     * 回链换上的址没出声又出错直接跳过（rescueDoneKey 记账，出声清）。 */
+    private fun rescueByReResolve(p: ExoPlayer, curKey: String, curUrl: String) {
         if (!nativeActive || !p.playWhenReady) return
         rescueInFlight = true
         rescueSettled = false
         rescueStartMs = android.os.SystemClock.elapsedRealtime()
-        // 单脑第 3 步：查档改脑队列直查——队列即档案，无登记册副本
+        // 查档：脑队列直查（队列即档案，无登记册副本）
         var desc: org.json.JSONObject? = null
+        var effKey = curKey
         if (curKey.isNotEmpty()) {
             val ci = brainQueueKeys.indexOf(curKey)
             if (ci >= 0) desc = brainQueue[ci]
         }
         if (desc == null) {
-            // 3.5.3 兜底：编号对不上时按同名档案再找一次——典型是网页经
-            // postPlayUrl 起播的歌、播放项编号只剩网址（3.5.2 抓现行），
-            // 档案明明在册就不该瞎；同名多条时优先歌手对得上的那条
+            // 编号对不上时按同名档案再找一次（同旧兜底）；同名多条时
+            // 优先歌手对得上的那条
             var foundKey = ""
             var byName: org.json.JSONObject? = null
             for (bi in brainQueue.indices) {
@@ -1560,14 +1560,13 @@ class KeepAliveService : Service() {
             }
             if (byName != null) {
                 desc = byName
+                effKey = foundKey
                 engineLog("引擎：按名找回档案 " + title + "（key=" + foundKey + "）")
             }
         }
         if (desc == null) {
-            // 没档案就没法重解析/换源——把原因记明，别再静默跳过（3.4.2）
-            // 3.5.2 诊断抓现行：把当时的编号原文、档案总数、同名档案的编号
-            // 一并记下——下次复发一锤定音：reg 在而 key 不同 = 两边编号分歧；
-            // reg 不在 = 根本没入册（被挤掉或从未登记），map 大小佐证挤掉说
+            // 没档案就没法重解析——把原因记明，别再静默跳过（3.4.2）；
+            // 编号原文、档案总数、同名档案编号一并记下供对账（3.5.2）
             var regKey = ""
             for (k in brainQueueKeys) {
                 if (k.endsWith("|" + title)) {
@@ -1576,7 +1575,7 @@ class KeepAliveService : Service() {
                 }
             }
             engineLog(
-                "引擎：无描述符，阶梯跳过 " + title +
+                "引擎：无描述符，回链跳过 " + title +
                     " key=" + curKey +
                     " map=" + brainQueueKeys.size +
                     (if (regKey.isNotEmpty()) " reg=" + regKey else "")
@@ -1588,39 +1587,30 @@ class KeepAliveService : Service() {
             doSkipAfterError(p)
             return
         }
-        val name = desc.optString("name").ifEmpty { title }
-        val singer = desc.optString("artist")
-        val plat = desc.optString("source").ifEmpty { "qq" }
-        engineLog("引擎：换源搜索 " + name)
-        // 3.13.0（cheng 改定）：换源全程 12 秒封顶——原 3.5.4 的 5 秒帽
-        // 罩不住 apicx 冷查询（~8 秒）、且实测有 +11 秒才到的成功答案；
-        // 到点还没成，记超时并跳过，不让喘不过气的接口把静默拖到分钟
-        // 级；迟到的结果由收账标记 + nativeUrl 守卫丢弃（已跳走的不
-        // 复活；断播点没跳成的仍可被迟到救兵救）
-        val swapStartMs = rescueStartMs
+        val dd = desc
+        val name = dd.optString("name").ifEmpty { title }
+        val plat = dd.optString("source").ifEmpty { "qq" }
+        engineLog("引擎：报错回链 " + name + "（死址作废，重走解析链）")
+        // 12 秒是整次重走的总预算（传给解析链当单曲预算）——不是旧
+        // 换源那种「专等 QQ」的帽，QQ 在新方案里只是链内的一步；
+        // 到点还没成，看门狗收口跳过，迟到结果由收账标记 + nativeUrl
+        // 守卫丢弃
         tickHandler.postDelayed({
             val pp = player
             if (!rescueSettled && pp != null && nativeActive && pp.playWhenReady && nativeUrl == curUrl) {
                 rescueSettled = true
                 rescueInFlight = false
-                engineLog("引擎：换源无果 " + name + "（12 秒超时）")
+                engineLog("引擎：回链无果 " + name + "（12 秒超时）")
                 doSkipAfterError(pp)
             }
         }, 12000L)
         swapExec.execute {
-            val remainMs = 12000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)
-            val alt = searchQqAlt(desc, name, singer, plat, (remainMs / 1000L).toInt().coerceIn(2, 5))
-            val newUrl = if (alt != null) {
-                try {
-                    LxResolver.resolve(
-                        alt, configSources, configQuality, configAutoDown,
-                        lxEngine(),
-                        (12000L - (android.os.SystemClock.elapsedRealtime() - swapStartMs)).coerceAtLeast(1000L)
-                    ) { m -> engineLog(m) }?.toString() ?: ""
-                } catch (_: Exception) {
-                    ""
-                }
-            } else {
+            val newUrl = try {
+                LxResolver.resolve(
+                    dd, configSources, configQuality, configAutoDown,
+                    lxEngine(), 12000L, curUrl
+                ) { m -> engineLog(m) }?.toString() ?: ""
+            } catch (_: Exception) {
                 ""
             }
             tickHandler.post {
@@ -1632,132 +1622,65 @@ class KeepAliveService : Service() {
                 }
                 rescueSettled = true
                 rescueInFlight = false
-                if (alt != null && newUrl.isNotEmpty()) {
-                    val newKey = LxResolver.keyOfJson(alt)
-                    applySwapToBrain(curKey, alt, newKey)
+                if (newUrl.isNotEmpty()) {
                     val host3 = try {
                         java.net.URI(newUrl).host ?: ""
                     } catch (_: Exception) {
                         ""
                     }
-                    engineLog("引擎：换源成功 " + alt.optString("name") + " → " + host3)
-                    pendingSwapFor = curKey
-                    pendingSwapSong = alt
-                    errQqNewKey = newKey
+                    // 救回成色分开入账，供日后数本平台自救占比
+                    val viaQq = plat != "qq" && host3.contains("qqmusic")
+                    engineLog(
+                        "引擎：回链成功 " + name + " → " + host3 +
+                            if (viaQq) "（QQ 兜底）" else "（本平台）"
+                    )
+                    rescueDoneKey = effKey
                     try {
-                        pushSync(
-                            JSONObject().put("t", "swapdisplay")
-                                .put("forKey", curKey)
-                                .put("song", alt)
-                        )
-                    } catch (_: Exception) {
-                    }
-                    title = alt.optString("name").ifEmpty { title }
-                    artist = alt.optString("artist").ifEmpty { artist }
-                    try {
-                        updateNotification()
-                    } catch (_: Exception) {
-                    }
-                    try {
-                        val idx3 = pp.currentMediaItemIndex
-                        pp.replaceMediaItem(
-                            idx3,
-                            mediaItemFor(
-                                ArmedItem(
-                                    newUrl, newKey,
-                                    alt.optString("name"), alt.optString("artist"),
-                                    alt.optString("cover"), false, true
-                                )
+                        val item = mediaItemFor(
+                            ArmedItem(
+                                newUrl, effKey,
+                                name, dd.optString("artist"),
+                                dd.optString("cover"), false, true
                             )
                         )
+                        val idx3 = pp.currentMediaItemIndex
+                        pp.replaceMediaItem(idx3, item)
+                        // 播放列表里同歌的其它副本（单曲循环预置）一并
+                        // 换新址，免得轮到副本又踩同一个死址
+                        try {
+                            for (i2 in 0 until pp.mediaItemCount) {
+                                if (i2 != idx3 &&
+                                    pp.getMediaItemAt(i2).mediaId == effKey
+                                ) {
+                                    pp.replaceMediaItem(i2, item)
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
                         nativeUrl = newUrl
-                        nativeKey = newKey
+                        nativeKey = effKey
                         pp.seekTo(idx3, 0)
                         pp.prepare()
                         pp.play()
+                        // 跑道存货里同歌副本同步换新址（账面与播放器一致）
+                        for (i3 in armedItems.indices) {
+                            if (armedItems[i3].key == effKey &&
+                                armedItems[i3].url != newUrl
+                            ) {
+                                armedItems[i3] =
+                                    armedItems[i3].copy(url = newUrl)
+                            }
+                        }
+                        ScriptSeg.flushFor(effKey)
                     } catch (_: Exception) {
                         doSkipAfterError(pp)
                     }
                 } else {
-                    engineLog("引擎：换源无果 " + name)
+                    engineLog("引擎：回链无果 " + name)
                     doSkipAfterError(pp)
                 }
             }
         }
-    }
-
-    /** QQ 搜索挑一首可换的：非 QQ 曲取第一条可用结果；QQ 曲取第一个不同
-     * songmid 的版本（同版本就是刚死掉的那个文件，换了等于没换，故不取）。 */
-    private fun searchQqAlt(
-        orig: org.json.JSONObject, name: String, singer: String, plat: String,
-        timeoutSec: Int = 8
-    ): org.json.JSONObject? {
-        val kw = (name + " " + singer).trim()
-        if (kw.isEmpty()) return null
-        val url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=" +
-            android.net.Uri.encode(kw) +
-            "&format=json&p=1&n=10&new_json=1&cr=1&t=0"
-        val data = try {
-            LxHttp.fetchJson(
-                url,
-                headers = mapOf("Referer" to "https://y.qq.com/"),
-                timeoutSec = timeoutSec
-            )
-        } catch (_: Exception) {
-            null
-        } ?: return null
-        val list = data.optJSONObject("data")?.optJSONObject("song")
-            ?.optJSONArray("list") ?: return null
-        val origMid = orig.optString("songmid")
-        for (i in 0 until list.length()) {
-            val item = list.optJSONObject(i) ?: continue
-            val built = buildQqDescriptor(item) ?: continue
-            if (plat != "qq") return built
-            if (built.optString("songmid") != origMid) return built
-        }
-        return null
-    }
-
-    /** QQ 搜索结果 → 描述符（与网页 normSong 同字段；封面由 albummid 拼） */
-    private fun buildQqDescriptor(item: org.json.JSONObject): org.json.JSONObject? {
-        val mid = item.optString("songmid").ifEmpty { item.optString("mid") }
-        val nm = item.optString("songname").ifEmpty { item.optString("name") }
-        if (mid.isEmpty() || nm.isEmpty()) return null
-        val singers = item.optJSONArray("singer")
-        val names = ArrayList<String>()
-        if (singers != null) {
-            for (j in 0 until singers.length()) {
-                val sn = singers.optJSONObject(j)?.optString("name") ?: ""
-                if (sn.isNotEmpty()) names.add(sn)
-            }
-        }
-        val artistStr = names.joinToString("/")
-        val amid = item.optString("albummid")
-        val album = item.optString("albumname")
-        val cover = if (amid.isNotEmpty()) {
-            "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + amid + ".jpg"
-        } else {
-            ""
-        }
-        val o = org.json.JSONObject()
-        o.put("source", "qq")
-        o.put("songmid", mid)
-        o.put("mid", mid)
-        o.put("id", mid)
-        o.put("name", nm)
-        o.put("songname", nm)
-        o.put("artist", artistStr)
-        o.put("singer", artistStr)
-        o.put("singername", artistStr)
-        o.put("album", album)
-        o.put("albumName", album)
-        o.put("albumname", album)
-        o.put("albummid", amid)
-        o.put("albumMid", amid)
-        o.put("cover", cover)
-        o.put("img", cover)
-        o.put("interval", item.optString("interval"))
-        return o
     }
 
     /** 跳过出错的这首、接上下一首；连续跳 3 首仍败才停手记断播点 */
@@ -2361,30 +2284,6 @@ class KeepAliveService : Service() {
                     }
                 } catch (_: Exception) {
                 }
-                // 3.4.0：换源记录重推——页面冻住时 qqswap 没送达的话，
-                // 借这次 hello 补推给刚醒的页面（页面按 forKey 核对，不符自会忽略）；
-                // 当前曲已不是换源那首/原曲时，记录作废清掉
-                try {
-                    val ps = pendingSwapSong
-                    if (ps != null) {
-                        val curId = try {
-                            player?.currentMediaItem?.mediaId ?: ""
-                        } catch (_: Exception) {
-                            ""
-                        }
-                        if (curId == errQqNewKey || curId == pendingSwapFor) {
-                            pushSync(
-                                JSONObject().put("t", "swapdisplay")
-                                    .put("forKey", pendingSwapFor)
-                                    .put("song", ps)
-                            )
-                        } else if (curId.isNotEmpty()) {
-                            pendingSwapSong = null
-                            pendingSwapFor = ""
-                        }
-                    }
-                } catch (_: Exception) {
-                }
                 if (brainSleepUntilMs > 0L || brainSleepAfterTrack) {
                     pushSync(
                         JSONObject().put("t", "sleepstate")
@@ -2542,7 +2441,7 @@ class KeepAliveService : Service() {
         return nk
     }
 
-    /** 每有一首真正开始播（页面起播/原生接播/脑内切歌/换源成功都经此）记一笔 */
+    /** 每有一首真正开始播（页面起播/原生接播/脑内切歌/回链成功都经此）记一笔 */
     private fun noteBrainStarted(key: String) {
         if (key.isEmpty()) return
         sleepStopParked = false
@@ -2606,34 +2505,6 @@ class KeepAliveService : Service() {
             if (j >= 0) return brainQueue[j].optString("name")
         }
         return key.substringAfter("|")
-    }
-
-    /** 单脑第 3 步：换源在脑内一次落账——当前槽位档案、当前编号、已播名单、
-     * 历史全部换新编号并登记别名，网页只收 swapdisplay 显示通知；不再有
-     * 「网页回写新编号、脑子还记旧编号」的窗口（第一步第 3 条同轮重播的根） */
-    private fun applySwapToBrain(forKey: String, alt: org.json.JSONObject, newKey: String) {
-        if (forKey.isEmpty() || newKey.isEmpty() || forKey == newKey) return
-        val idx = brainQueueKeys.indexOf(forKey)
-        if (idx >= 0) {
-            brainQueue[idx] = alt
-            brainQueueKeys[idx] = newKey
-        }
-        if (brainCurKey == forKey) brainCurKey = newKey
-        if (brainPlayed.contains(forKey)) {
-            val np = LinkedHashSet<String>()
-            for (k in brainPlayed) np.add(if (k == forKey) newKey else k)
-            brainPlayed = np
-        }
-        for (i in brainHistory.indices) {
-            if (brainHistory[i] == forKey) brainHistory[i] = newKey
-        }
-        brainAliases[forKey] = newKey
-        while (brainAliases.size > 32) {
-            val kit = brainAliases.keys.iterator()
-            if (!kit.hasNext()) break
-            brainAliases.remove(kit.next())
-        }
-        persistBrainSoon()
     }
 
     /** 脑内切歌执行：跑道命中直接接播；未命中用脑内描述符现解析；解析失败顺延下一候选（最多 3 跳） */
@@ -2871,9 +2742,9 @@ class KeepAliveService : Service() {
      * 3.5.5 踢子守卫补丁（3.7.0）：换源未收账且开工未满 12 秒 = 救援在飞，
      * 两处停摆接播都不许抢（2026-11-04 晚实测 4 次换源全被踢子抢先跳走，
      * 根因是待救标记在救援派出后即清、踢子看不见换源）。
-     * 15 秒上限防收账旗异常卡死把踢子永久锁死（换源自身预算 12 秒）。
+     * 15 秒上限防收账旗异常卡死把踢子永久锁死（回链自身预算 12 秒）。
      */
-    private fun swapNotInFlight(): Boolean {
+    private fun rescueNotInFlight(): Boolean {
         if (rescueSettled) return true
         if (rescueStartMs <= 0L) return true
         return SystemClock.elapsedRealtime() - rescueStartMs > 15000L

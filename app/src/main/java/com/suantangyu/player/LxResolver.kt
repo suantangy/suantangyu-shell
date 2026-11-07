@@ -267,6 +267,7 @@ object LxResolver {
         autoDown: Boolean,
         engine: LxEngine?,
         budgetMs: Long = 90000L,
+        banUrl: String = "",
         log: (String) -> Unit
     ): String? {
         // 3.12.0：解析分段记录（脚本日志搬进脑子）——一进一出包一段，
@@ -274,7 +275,7 @@ object LxResolver {
         ScriptSeg.begin(song)
         var out: String? = null
         try {
-            out = resolveBody(song, sources, wantQ, autoDown, engine, budgetMs, log)
+            out = resolveBody(song, sources, wantQ, autoDown, engine, budgetMs, banUrl, log)
         } finally {
             ScriptSeg.end(out)
         }
@@ -288,11 +289,13 @@ object LxResolver {
         autoDown: Boolean,
         engine: LxEngine?,
         budgetMs: Long = 90000L,
+        banUrl: String = "",
         log: (String) -> Unit
     ): String? {
         // 3.3.1：单曲解析总时限（默认 90 秒，脚本源慢调用由引擎 30 秒/次封顶，
         // 这里再封整曲上限，防一首坏歌把单线程解析队列拖死、后面全断）；
-        // 3.5.4：换源路径传小预算（5 秒总限的剩余量），到点就收，不再逐档磨
+        // 3.17.0：报错回链传 12 秒预算 + 死址（banUrl），到点就收；
+        // 链在任何一档、任何源（含 QQ 兜底）交回死址都当场毙掉继续走
         val deadline = System.currentTimeMillis() + budgetMs
         val tiers = if (autoDown) qualityFallbacks(wantQ) else listOf(wantQ)
         val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
@@ -306,7 +309,7 @@ object LxResolver {
                 ScriptSeg.note("引擎：单曲解析超时跳过 " + song.optString("name"))
                 return null
             }
-            val url = resolveAtQuality(song, q, sources, engine, log, deadline)
+            val url = resolveAtQuality(song, q, sources, engine, log, deadline, banUrl)
             if (url != null) return url
             if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
                 if (!qqAltTried) {
@@ -315,7 +318,7 @@ object LxResolver {
                 }
                 val alt = qqAlt
                 if (alt != null) {
-                    val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline)
+                    val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrl)
                     if (u2 != null) {
                         log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
                         return u2
@@ -332,7 +335,8 @@ object LxResolver {
         sources: List<SrcCfg>,
         engine: LxEngine?,
         log: (String) -> Unit,
-        deadline: Long = Long.MAX_VALUE
+        deadline: Long = Long.MAX_VALUE,
+        banUrl: String = ""
     ): String? {
         val mid = cleanPlayMid(song)
         if (mid.isEmpty()) return null
@@ -358,6 +362,12 @@ object LxResolver {
                 if (threw || System.currentTimeMillis() - t0 >= 8000L) {
                     benchSource(src, songPlat, log)
                 }
+                continue
+            }
+            if (banUrl.isNotEmpty() && r.url == banUrl) {
+                // 3.17.0 报错回链：刚死的地址再交回来不算数，当这个源
+                // 没答、继续问下一个；不冷却——源没错，死的是那份文件
+                ScriptSeg.note("引擎：死址重现，作废继续")
                 continue
             }
             if (r.lx) return r.url
@@ -1073,6 +1083,16 @@ object ScriptSeg {
             while (it.hasNext()) {
                 val seg = it.next()
                 if (seg.key == key) {
+                    // 3.17.0：段头改盖落盘（≈起播）时刻——段内各行是
+                    // 解析时盖的戳，补仓常提前十几分钟解析，面板上最新
+                    // 一段却顶着十几分钟前的时间，看着像坏了（cheng
+                    // 2026-11-07 指出「时间不对」）；段头对齐起播时刻，
+                    // 段内行保留解析原戳（哪会儿解析的、用了几秒不丢）
+                    if (seg.lines.isNotEmpty()) {
+                        val head = seg.lines[0]
+                        val sp = head.indexOf(' ')
+                        if (sp > 0) seg.lines[0] = stamp(head.substring(sp + 1))
+                    }
                     for (l in seg.lines) sink(l)
                     it.remove()
                 }
