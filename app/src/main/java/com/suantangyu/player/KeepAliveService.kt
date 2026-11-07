@@ -272,11 +272,13 @@ class KeepAliveService : Service() {
     private var sessionWifiLock: android.net.wifi.WifiManager.WifiLock? = null
     // 3.14.0 网络停车场：网络类报错先探网，全网不通就停在当前曲等恢复
     // （看门狗每 20 秒重拉一次，出声即走），不再在没网的窗口里跳歌烧
-    // 队列；等满 3 分钟仍不通才放弃、转入报错回链
+    // 队列；3.21.0 起不限时（cheng 拍板）：歌没错、错的是网，不定死
+    // 数——想播就一直等到网回来，每 10 分钟留一行等待日志兜底
     private var netParkKey = ""
     private var netParkTitle = ""
     private var netParkSinceMs: Long = 0L
     private var netParkLastTryMs: Long = 0L
+    private var netParkWaitLoggedMin = 0
     private var netProbeInFlight = false
     private var engineFailCount = 0
     private var engineBatchCount = 0
@@ -684,6 +686,9 @@ class KeepAliveService : Service() {
             } == true)
         if (!nativeActive || !wantPlay || engineBusy) return
         if (brainSleepAfterTrack) return
+        // 3.21.0：停车期间（已证全网断）补仓暂停——问也白问，只会每
+        // 十几秒刷一批解析失败、白耗电波；网回来停车解除后自动恢复
+        if (netParkKey.isNotEmpty()) return
         if (configSources.isEmpty() || !brainActive) return
         if (armedItems.size > 1) return
         val now = android.os.SystemClock.elapsedRealtime()
@@ -916,30 +921,46 @@ class KeepAliveService : Service() {
         } catch (_: Exception) {
             Player.STATE_IDLE
         }
-        // 3.14.0 网络停车场值班：停着的歌每 20 秒重拉一次探活，出声由
-        // onIsPlayingChanged 收账；用户暂停就散场；等满 3 分钟仍不通，
-        // 放弃停车、把这首交回报错回链。值班期间看门狗其它处置让路
+        // 网络停车场值班：停着的歌每 20 秒重拉一次探活，出声由
+        // onIsPlayingChanged 收账；用户暂停就散场；3.21.0 起不限时，
+        // 不再有「等满 N 分钟放弃」——想播就一直等，每等满 10 分钟
+        // 留一行等待日志（防探针误判时闷头干等、日志上没人看得出）。
+        // 切歌后当前项已不是停着的歌 → 停车作废：旧代码值班只认当前
+        // 序号、不认歌，切走后会对新歌每 20 秒从头重拉，上限 3 分钟
+        // 时窗口小没出事，不限时后必须堵。值班期间看门狗其它处置让路
         if (netParkKey.isNotEmpty()) {
             if (!wantPlay) {
                 clearNetPark()
             } else {
-                val nowE = SystemClock.elapsedRealtime()
-                if (nowE - netParkSinceMs > 180_000L) {
-                    val pk = netParkKey
-                    val pt = netParkTitle
-                    clearNetPark()
-                    engineLog("引擎：网络等待超时，转入回链 " + pt)
-                    rescueByReResolve(p, pk, nativeUrl)
-                } else if (nowE - netParkLastTryMs >= 20_000L) {
-                    netParkLastTryMs = nowE
-                    try {
-                        p.seekTo(p.currentMediaItemIndex, 0)
-                        p.prepare()
-                        p.play()
-                    } catch (_: Exception) {
-                    }
+                val curId = try {
+                    p.currentMediaItem?.mediaId ?: ""
+                } catch (_: Exception) {
+                    ""
                 }
-                return
+                if (curId.isNotEmpty() && curId != netParkKey) {
+                    clearNetPark()
+                } else {
+                    val nowE = SystemClock.elapsedRealtime()
+                    val waitedBucket =
+                        ((nowE - netParkSinceMs) / 600_000L).toInt()
+                    if (waitedBucket > netParkWaitLoggedMin) {
+                        netParkWaitLoggedMin = waitedBucket
+                        engineLog(
+                            "引擎：仍在等网络恢复 " + netParkTitle +
+                                "（已等 " + (waitedBucket * 10) + " 分钟）"
+                        )
+                    }
+                    if (nowE - netParkLastTryMs >= 20_000L) {
+                        netParkLastTryMs = nowE
+                        try {
+                            p.seekTo(p.currentMediaItemIndex, 0)
+                            p.prepare()
+                            p.play()
+                        } catch (_: Exception) {
+                        }
+                    }
+                    return
+                }
             }
         }
         // 用户暂停（无播放意图）不干预
@@ -1400,35 +1421,50 @@ class KeepAliveService : Service() {
             // 3.3.5：错误留痕进引擎日志 + 壳内自救。解析成功不等于流能播，
             // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
             if (!rescueInFlight && !netProbeInFlight) {
-                engineErrCount++
-                val host = try {
-                    java.net.URI(nativeUrl).host ?: ""
+                val p = player
+                val curKey = try {
+                    p?.currentMediaItem?.mediaId ?: ""
                 } catch (_: Exception) {
                     ""
                 }
-                engineLog(
-                    "引擎：播放出错 " + title + " code=" + error.errorCode +
-                        (if (httpCode > 0) " http=" + httpCode else "") +
-                        (if (host.isNotEmpty()) " host=" + host else "")
-                )
+                // 3.21.0：停车期间的重拉失败（网络类）不逐条记日志、
+                // 不计出错数——不限时后一晚能刷近千条假账；入场与恢复
+                // 已各记一行，中间靠看门狗每 10 分钟的等待行对账
+                val parkRetry = curKey.isNotEmpty() &&
+                    curKey == netParkKey &&
+                    (error.errorCode == 2001 || error.errorCode == 2002)
+                if (!parkRetry) {
+                    engineErrCount++
+                    val host = try {
+                        java.net.URI(nativeUrl).host ?: ""
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    engineLog(
+                        "引擎：播放出错 " + title + " code=" + error.errorCode +
+                            (if (httpCode > 0) " http=" + httpCode else "") +
+                            (if (host.isNotEmpty()) " host=" + host else "")
+                    )
+                }
                 // 报错即救——死址作废、原歌钻回解析链重走（报错
                 // 回链）；3.18.0 起一次发动内部续走：换上的址没出声
                 // 又死，把死址追加作废在同一次里接着走（rescueSessKey
                 // 在岗）；会话已收工的歌再出错才直接跳过
                 // （rescueDoneKey 记账，真出声后才清）
-                val p = player
                 if (p != null) {
-                    val curKey = try {
-                        p.currentMediaItem?.mediaId ?: ""
-                    } catch (_: Exception) {
-                        ""
-                    }
                     when {
-                        curKey.isNotEmpty() && curKey == netParkKey -> {
-                            // 停车等待中看门狗重拉又失败：不重复探网、
-                            // 不计数，续等下一轮重拉（3.14.0）
+                        parkRetry -> {
+                            // 停车等待中看门狗重拉又失败：不重复探网，
+                            // 续等下一轮重拉（日志/计数已在上面免掉）
                             netParkLastTryMs =
                                 android.os.SystemClock.elapsedRealtime()
+                        }
+                        curKey.isNotEmpty() && curKey == netParkKey -> {
+                            // 停车中报了非网络类错（如 3003）：网多半
+                            // 已经半通、坏的是文件本身——退出停车，按
+                            // 文件死走报错回链，别在停车场里死等
+                            clearNetPark()
+                            rescueByReResolve(p, curKey, nativeUrl)
                         }
                         error.errorCode == 2001 || error.errorCode == 2002 -> {
                             // 网络类报错先探网（3.14.0）：全网不通就停车
@@ -1469,6 +1505,7 @@ class KeepAliveService : Service() {
                                         netParkSinceMs = android.os
                                             .SystemClock.elapsedRealtime()
                                         netParkLastTryMs = netParkSinceMs
+                                        netParkWaitLoggedMin = 0
                                         engineLog(
                                             "引擎：网络中断，停在这首等恢复 " + t2
                                         )
@@ -1568,6 +1605,7 @@ class KeepAliveService : Service() {
         netParkTitle = ""
         netParkSinceMs = 0L
         netParkLastTryMs = 0L
+        netParkWaitLoggedMin = 0
     }
 
     /** 关闭回链会话（3.18.0）：清会话账面。发动记账 rescueDoneKey
