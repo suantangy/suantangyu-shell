@@ -1022,8 +1022,8 @@ object ScriptSeg {
             val artist = song.optString("artist")
             seg.lines.add(
                 stamp(
-                    if (artist.isEmpty()) "▶ 播放: " + name
-                    else "▶ 播放: " + name + " - " + artist
+                    if (artist.isEmpty()) "▶ 解析: " + name
+                    else "▶ 解析: " + name + " - " + artist
                 )
             )
             openSegs[Thread.currentThread().id] = seg

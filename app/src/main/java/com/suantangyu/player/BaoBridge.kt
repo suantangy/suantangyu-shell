@@ -380,29 +380,6 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
-    /** K歌（3.22.0）：页面把模式交给脑子（off/acc/orig）——伴奏查找、槽位
-     * 替换、跨歌跟随全在脑内，熄屏页面冻结也不断档 */
-    @JavascriptInterface
-    fun cmdKaraokeMode(mode: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
-            action = KeepAliveService.ACTION_BRAIN_CMD
-            putExtra("cmd", "karaoke")
-            putExtra("kmode", mode)
-        }
-        activity.startService(intent)
-    }
-
-    /** K歌模式对齐（3.22.0）：网页重载后读脑子落盘的模式（服务维护的小文件） */
-    @JavascriptInterface
-    fun getKaraokeState(): String {
-        return try {
-            val f = java.io.File(activity.filesDir, "karaoke_state.json")
-            if (f.exists()) f.readText(Charsets.UTF_8) else "{\"mode\":\"off\"}"
-        } catch (_: Exception) {
-            "{\"mode\":\"off\"}"
-        }
-    }
-
     /** 单脑第 0 步（3.6.0）：完整队列快照，壳只收存做影子对账，不参与播放 */
     @JavascriptInterface
     fun postQueueSnapshot(json: String) {
