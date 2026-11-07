@@ -1459,6 +1459,12 @@ class KeepAliveService : Service() {
                             netParkLastTryMs =
                                 android.os.SystemClock.elapsedRealtime()
                         }
+                        karaokeSubKey.isNotEmpty() && curKey == karaokeSubKey -> {
+                            // 3.22.0：伴奏流出错不走原歌的回链——回原唱
+                            // 接进度、本首不再重试伴奏（停车重拉的网络错
+                            // 已在 parkRetry 分支先行处理，不会进这里）
+                            karaokeAccFailed(curKey)
+                        }
                         curKey.isNotEmpty() && curKey == netParkKey -> {
                             // 停车中报了非网络类错（如 3003）：网多半
                             // 已经半通、坏的是文件本身——退出停车，按
@@ -1861,6 +1867,210 @@ class KeepAliveService : Service() {
         rescueWalkStep(p)
     }
 
+
+    // —— 3.22.0 K歌 ——
+    // 模式归脑：熄屏时页面冻结，伴奏查找/槽位替换/跨歌跟随全在脑内完成。
+    // 伴唱 = 只换当前槽位播的地址（队列/下标/已播账本一概不动，同报错回链
+    // 的路子），从头播；退出/切原唱时把原唱地址按当前进度接回。原唱模式
+    // 音频不动，只切页面歌词呈现。模式仅运行时有效、不入脑存档，服务重建
+    // 即回关闭；状态经 karaoke_state.json 供网页重载后对齐（getKaraokeState）。
+    private var karaokeMode: String = "off"              // off | acc | orig
+    private var karaokeSubKey: String = ""               // 当前被伴奏替换的歌 key
+    private var karaokeSubOrigUrl: String = ""           // 替换前的原唱地址
+    private var karaokeGen: Int = 0
+    private val karaokeAccUrls = HashMap<String, String>()
+    private val karaokeAccMiss = HashSet<String>()
+    private val karaokeLookupBusy = HashSet<String>()
+
+    private fun karaokePersistState() {
+        try {
+            java.io.File(filesDir, "karaoke_state.json")
+                .writeText(JSONObject().put("mode", karaokeMode).toString(), Charsets.UTF_8)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun karaokePush(accState: String = "", forKey: String = "") {
+        val o = JSONObject().put("t", "karaoke").put("mode", karaokeMode)
+        if (accState.isNotEmpty()) o.put("accState", accState)
+        if (forKey.isNotEmpty()) o.put("forKey", forKey)
+        pushSync(o)
+    }
+
+    private fun brainDescOf(key: String): JSONObject? {
+        val ci = brainQueueKeys.indexOf(key)
+        return if (ci >= 0 && ci < brainQueue.size) brainQueue[ci] else null
+    }
+
+    private fun setKaraokeMode(m: String) {
+        val mode = if (m == "acc" || m == "orig") m else "off"
+        karaokeMode = mode
+        karaokeGen++
+        karaokePersistState()
+        karaokePush()
+        engineLog(
+            "引擎：K歌模式 " + when (mode) {
+                "acc" -> "伴唱"
+                "orig" -> "原唱"
+                else -> "关闭"
+            }
+        )
+        if (mode == "acc") {
+            karaokeEnterCurrent()
+        } else if (karaokeSubKey.isNotEmpty()) {
+            karaokeRestoreSlot(true)
+        }
+    }
+
+    /** 伴唱落到当前曲：缓存有伴奏地址直接换，没有就异步查（预取也走这里入缓存） */
+    private fun karaokeEnterCurrent() {
+        val key = brainCurrentKey()
+        if (key.isEmpty() || key == karaokeSubKey) return
+        val cached = karaokeAccUrls[key]
+        if (cached != null) {
+            karaokeSubstitute(key, cached)
+            return
+        }
+        if (karaokeAccMiss.contains(key)) {
+            karaokePush("missing", key)
+            return
+        }
+        val desc = brainDescOf(key) ?: return
+        karaokeLookup(key, desc, true)
+    }
+
+    /** 查伴奏（swapExec 上跑）：酷狗伴奏描述符再走现行解析链拿地址、5sing
+     * 直接是地址；结果一律入缓存，apply 且仍是当前曲、仍在伴唱模式才换上 */
+    private fun karaokeLookup(key: String, desc: JSONObject, apply: Boolean) {
+        if (!karaokeLookupBusy.add(key)) return
+        val gen = karaokeGen
+        swapExec.execute {
+            var accUrl = ""
+            try {
+                when (val r = KaraokeFinder.find(desc)) {
+                    is KaraokeFinder.Result.KgDesc -> {
+                        accUrl = LxResolver.resolve(
+                            r.desc, configSources, configQuality, configAutoDown,
+                            lxEngine(), 25000L
+                        ) { m -> engineLog(m) }?.toString() ?: ""
+                    }
+                    is KaraokeFinder.Result.DirectUrl -> accUrl = r.url
+                    is KaraokeFinder.Result.None -> {}
+                }
+            } catch (_: Exception) {
+                accUrl = ""
+            }
+            val found = accUrl
+            tickHandler.post {
+                karaokeLookupBusy.remove(key)
+                if (found.isEmpty()) {
+                    karaokeAccMiss.add(key)
+                    if (apply && karaokeMode == "acc" && brainCurrentKey() == key) {
+                        engineLog("引擎：K歌 没找到伴奏 " + desc.optString("name"))
+                        karaokePush("missing", key)
+                    }
+                    return@post
+                }
+                karaokeAccUrls[key] = found
+                if (apply && karaokeMode == "acc" && gen == karaokeGen &&
+                    brainCurrentKey() == key && key != karaokeSubKey
+                ) {
+                    karaokeSubstitute(key, found)
+                }
+            }
+        }
+    }
+
+    /** 把当前槽位换成伴奏：只换这一格的流、从头播，原唱地址 stash 待接回 */
+    private fun karaokeSubstitute(key: String, accUrl: String) {
+        val p = player ?: return
+        if (!nativeActive || key == karaokeSubKey) return
+        if (brainCurrentKey() != key) return
+        val desc = brainDescOf(key) ?: return
+        try {
+            karaokeSubOrigUrl = nativeUrl
+            val item = mediaItemFor(
+                ArmedItem(
+                    accUrl, key, desc.optString("name"), desc.optString("artist"),
+                    desc.optString("cover"), false, true
+                )
+            )
+            val idx = p.currentMediaItemIndex
+            p.replaceMediaItem(idx, item)
+            nativeUrl = accUrl
+            nativeKey = key
+            karaokeSubKey = key
+            p.seekTo(idx, 0)
+            p.prepare()
+            if (p.playWhenReady) p.play()
+            engineLog("引擎：K歌 伴唱接上 " + desc.optString("name"))
+            karaokePush("on", key)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 当前槽位换回原唱地址、接当前进度续播（退出伴唱/切原唱/伴奏出错时） */
+    private fun karaokeRestoreSlot(keepPos: Boolean) {
+        val key = karaokeSubKey
+        val orig = karaokeSubOrigUrl
+        karaokeSubKey = ""
+        karaokeSubOrigUrl = ""
+        val p = player ?: return
+        if (!nativeActive || key.isEmpty() || orig.isEmpty()) return
+        if (brainCurrentKey() != key) return
+        val desc = brainDescOf(key) ?: return
+        try {
+            val pos = if (keepPos) {
+                try {
+                    p.currentPosition
+                } catch (_: Exception) {
+                    0L
+                }
+            } else {
+                0L
+            }
+            val item = mediaItemFor(
+                ArmedItem(
+                    orig, key, desc.optString("name"), desc.optString("artist"),
+                    desc.optString("cover"), false, true
+                )
+            )
+            val idx = p.currentMediaItemIndex
+            p.replaceMediaItem(idx, item)
+            nativeUrl = orig
+            nativeKey = key
+            p.seekTo(idx, pos)
+            p.prepare()
+            if (p.playWhenReady) p.play()
+            engineLog("引擎：K歌 回原唱 " + desc.optString("name"))
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 伴奏流播出错：不走原歌的报错回链——回原唱接进度，本首不再重试伴奏 */
+    private fun karaokeAccFailed(curKey: String) {
+        engineLog("引擎：K歌 伴奏播放出错，回原唱 " + brainNameOf(curKey))
+        karaokeAccMiss.add(curKey)
+        karaokeAccUrls.remove(curKey)
+        karaokePush("error", curKey)
+        tickHandler.post { karaokeRestoreSlot(true) }
+    }
+
+    /** 跟随预取：唱着当前曲时把脑子算出的下一首伴奏先查好（只入缓存不换） */
+    private fun karaokePrefetchNext() {
+        if (karaokeMode != "acc") return
+        val nextKey = try {
+            computeBrainNextKey(false)
+        } catch (_: Exception) {
+            null
+        } ?: return
+        if (nextKey.isEmpty() || nextKey == brainCurrentKey()) return
+        if (karaokeAccUrls.containsKey(nextKey) || karaokeAccMiss.contains(nextKey)) return
+        if (engineBusy) return
+        val desc = brainDescOf(nextKey) ?: return
+        karaokeLookup(nextKey, desc, false)
+    }
+
     /** 跳过出错的这首、接上下一首；连续跳 3 首仍败才停手记断播点 */
     private fun doSkipAfterError(p: ExoPlayer) {
         rescueInFlight = false
@@ -2048,6 +2258,7 @@ class KeepAliveService : Service() {
         createChannel()
         ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
         restoreBrainState()
+        karaokePersistState()
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
@@ -2407,6 +2618,7 @@ class KeepAliveService : Service() {
                     "next" -> if (brainActive) brainManualNext() else sendControl("next")
                     "prev" -> if (brainActive) brainManualPrev() else sendControl("prev")
                     "playkey" -> brainPlayKey(intent.getStringExtra("key").orEmpty())
+                    "karaoke" -> setKaraokeMode(intent.getStringExtra("kmode").orEmpty())
                 }
             }
             ACTION_BRAIN_SLEEP -> {
@@ -2632,6 +2844,31 @@ class KeepAliveService : Service() {
         persistBrainSoon()
         // 3.12.1：这首的脚本日志段在此刻才落盘显示（预置段没播到不出现）
         ScriptSeg.flushFor(key)
+        // 3.22.0 K歌跟随：伴唱跨歌保留——新歌以原唱起播后，缓存有伴奏
+        // 立刻换上、没有异步去找；替换曲真正起播时 key == karaokeSubKey
+        // 自动跳过，不会重复发动。非伴唱模式下旧替换标记随旧曲作废。
+        if (karaokeMode == "acc") {
+            if (key != karaokeSubKey) {
+                val cachedK = karaokeAccUrls[key]
+                if (cachedK != null) {
+                    val ck = cachedK
+                    tickHandler.post {
+                        if (karaokeMode == "acc" && brainCurrentKey() == key) {
+                            karaokeSubstitute(key, ck)
+                        }
+                    }
+                } else if (karaokeAccMiss.contains(key)) {
+                    karaokePush("missing", key)
+                } else {
+                    val d2 = brainDescOf(key)
+                    if (d2 != null) karaokeLookup(key, d2, true)
+                }
+            }
+            karaokePrefetchNext()
+        } else if (karaokeSubKey.isNotEmpty() && key != karaokeSubKey) {
+            karaokeSubKey = ""
+            karaokeSubOrigUrl = ""
+        }
     }
 
     private fun computeBrainNextKey(manual: Boolean): String? {
