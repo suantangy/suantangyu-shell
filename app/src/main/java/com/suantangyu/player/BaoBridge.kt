@@ -332,6 +332,36 @@ class BaoBridge(private val activity: MainActivity) {
         }
     }
 
+    /** 音效（3.24.0）：壳里系统均衡器的完整状态——网页打开音效面板时
+     * 同步现读 eq_state.json 原样返回；文件不存在（播放器还没建过
+     * Equalizer）返回 {"available":false} */
+    @JavascriptInterface
+    fun getEqState(): String {
+        return try {
+            val f = java.io.File(activity.filesDir, "eq_state.json")
+            if (!f.exists()) {
+                "{\"available\":false}"
+            } else {
+                f.readText(Charsets.UTF_8)
+            }
+        } catch (_: Exception) {
+            "{\"available\":false}"
+        }
+    }
+
+    /** 音效命令（3.24.0）：载荷原样透传给服务的 "eq" 命令——
+     * {"enabled":bool} / {"preset":int} / {"band":int,"level":int}，
+     * 服务即时应用到系统 Equalizer 并重写 eq_state.json */
+    @JavascriptInterface
+    fun cmdEq(json: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_CMD
+            putExtra("cmd", "eq")
+            putExtra("json", json)
+        }
+        activity.startService(intent)
+    }
+
     /** 当前曲描述符——单脑第 3 步已退役为空实现：当前曲档案在快照队列里 */
     @JavascriptInterface
     fun postCurrentSong(json: String) {

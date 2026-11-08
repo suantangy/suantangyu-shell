@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.audiofx.Equalizer
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -1292,6 +1293,11 @@ class KeepAliveService : Service() {
             handlePlaylistTransition(mediaItem, reason)
         }
 
+        override fun onAudioSessionIdChanged(audioSessionId: Int) {
+            // 3.24.0：音频会话变化时重建系统均衡器并重应用音效状态
+            eqAttach(audioSessionId)
+        }
+
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (!nativeActive) return
             playing = isPlaying
@@ -1936,7 +1942,161 @@ class KeepAliveService : Service() {
             .build()
         p.addListener(playerListener)
         player = p
+        eqAttach(p.audioSessionId)
         return p
+    }
+
+    // —— 3.24.0 音效：安卓系统 Equalizer 挂 ExoPlayer 音频会话 ——
+    // 段数/中心频率/可调范围全由设备硬件定，这里只读不编：freq 存
+    // getCenterFreq 原值（毫赫兹），levels/min/max 存毫分贝原值。
+    // 状态真相在 eq_state.json：桥 getEqState 原样回给网页；网页的
+    // 每次调节经 cmdEq 送回来即时应用并重写该文件。构造抛异常
+    // （设备不支持）时只记 available=false，其余全线 no-op。
+    private var eq: Equalizer? = null
+    private var eqSessionId: Int = 0
+    private var eqAvailable: Boolean = false
+    private var eqEnabled: Boolean = false
+    private var eqPreset: Int = -1
+
+    /** 播放器音频会话就绪/变化时（重）建 Equalizer 并重应用已存状态 */
+    private fun eqAttach(sessionId: Int) {
+        if (sessionId == 0) return
+        if (eq != null && eqSessionId == sessionId) return
+        try {
+            eq?.release()
+        } catch (_: Exception) {
+        }
+        eq = null
+        try {
+            val e = Equalizer(0, sessionId)
+            eq = e
+            eqSessionId = sessionId
+            eqAvailable = true
+            eqApplySaved(e)
+        } catch (_: Exception) {
+            eq = null
+            eqAvailable = false
+        }
+        eqWriteState()
+    }
+
+    /** 把 eq_state.json 里存的 {enabled,preset,levels} 应用到新建的 Equalizer：
+     * preset>=0 用 usePreset（实际电平落盘时回读）；自定义则逐段 setBandLevel */
+    private fun eqApplySaved(e: Equalizer) {
+        try {
+            val f = java.io.File(filesDir, "eq_state.json")
+            if (f.exists()) {
+                val o = JSONObject(f.readText(Charsets.UTF_8))
+                eqEnabled = o.optBoolean("enabled", false)
+                eqPreset = o.optInt("preset", -1)
+                if (eqPreset in 0 until e.numberOfPresets.toInt()) {
+                    e.usePreset(eqPreset.toShort())
+                } else {
+                    eqPreset = -1
+                    val lv = o.optJSONArray("levels")
+                    if (lv != null) {
+                        val n = minOf(e.numberOfBands.toInt(), lv.length())
+                        for (b in 0 until n) {
+                            try {
+                                e.setBandLevel(b.toShort(), lv.optInt(b, 0).toShort())
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            e.setEnabled(eqEnabled)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 完整状态（可用性/开关/预设/各段元数据/当前电平）落盘 eq_state.json，
+     * 并推 {t:"eqstate"} 让网页开着面板时能跟着刷新 */
+    private fun eqWriteState() {
+        try {
+            val o = JSONObject()
+            val e = eq
+            if (e == null || !eqAvailable) {
+                o.put("available", false)
+            } else {
+                o.put("available", true)
+                o.put("enabled", eqEnabled)
+                o.put("preset", eqPreset)
+                val presets = JSONArray()
+                for (i in 0 until e.numberOfPresets.toInt()) {
+                    presets.put(e.getPresetName(i.toShort()))
+                }
+                o.put("presets", presets)
+                val range = e.bandLevelRange
+                val bands = JSONArray()
+                val levels = JSONArray()
+                for (b in 0 until e.numberOfBands.toInt()) {
+                    bands.put(
+                        JSONObject()
+                            .put("freq", e.getCenterFreq(b.toShort()))
+                            .put("min", range[0].toInt())
+                            .put("max", range[1].toInt())
+                    )
+                    levels.put(e.getBandLevel(b.toShort()).toInt())
+                }
+                o.put("bands", bands)
+                o.put("levels", levels)
+            }
+            java.io.File(filesDir, "eq_state.json")
+                .writeText(o.toString(), Charsets.UTF_8)
+            pushSync(JSONObject().put("t", "eqstate"))
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 网页音效命令（经 BRAIN_CMD 的 "eq"）：{"enabled":bool} /
+     * {"preset":int} / {"band":int,"level":int}——立即应用并落盘；
+     * 动了单段即转自定义（preset=-1） */
+    private fun handleEqCmd(json: String) {
+        if (eq == null) {
+            val p = player ?: return
+            eqAttach(p.audioSessionId)
+        }
+        val e = eq ?: return
+        try {
+            val o = JSONObject(json)
+            when {
+                o.has("enabled") -> {
+                    eqEnabled = o.optBoolean("enabled", false)
+                    try {
+                        e.setEnabled(eqEnabled)
+                    } catch (_: Exception) {
+                    }
+                }
+                o.has("preset") -> {
+                    val pr = o.optInt("preset", -1)
+                    if (pr in 0 until e.numberOfPresets.toInt()) {
+                        try {
+                            e.usePreset(pr.toShort())
+                            eqPreset = pr
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                o.has("band") -> {
+                    val b = o.optInt("band", -1)
+                    if (b in 0 until e.numberOfBands.toInt()) {
+                        try {
+                            e.setBandLevel(
+                                b.toShort(), o.optInt("level", 0).toShort()
+                            )
+                            eqPreset = -1
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        eqWriteState()
     }
 
     private fun playerDurationMs(): Long {
@@ -2119,6 +2279,11 @@ class KeepAliveService : Service() {
             tickHandler.removeCallbacks(tickRunnable)
         } catch (_: Exception) {
         }
+        try {
+            eq?.release()
+        } catch (_: Exception) {
+        }
+        eq = null
         try {
             player?.release()
         } catch (_: Exception) {
@@ -2407,6 +2572,7 @@ class KeepAliveService : Service() {
                     "next" -> if (brainActive) brainManualNext() else sendControl("next")
                     "prev" -> if (brainActive) brainManualPrev() else sendControl("prev")
                     "playkey" -> brainPlayKey(intent.getStringExtra("key").orEmpty())
+                    "eq" -> handleEqCmd(intent.getStringExtra("json").orEmpty())
                 }
             }
             ACTION_BRAIN_SLEEP -> {
