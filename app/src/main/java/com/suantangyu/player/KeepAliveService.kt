@@ -1034,6 +1034,7 @@ class KeepAliveService : Service() {
             // 3.5.5：看门狗动作留痕——此前两击都不写引擎日志，缓冲挂死在
             // 日志里毫无踪影（2026-11-04 Nevada 断播复盘的记录盲区）
             engineLog("引擎：看门狗重拉 " + title + "（缓冲无进展）" + probeSummary(p))
+            dnsProbeAsync(nativeUrl)
             // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
             // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
             // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
@@ -1317,6 +1318,40 @@ class KeepAliveService : Service() {
         }
 
         override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {}
+    }
+
+    // 3.28.0 解析探针：看门狗触发时后台解析当前媒体域名，把地址列表与
+    // 耗时打进日志——若 Chromium 通道下仍卡死，一眼能看到系统解析给了
+    // 什么地址（与 Cronet 自带解析对照）
+    @Volatile
+    private var dnsProbeBusy = false
+
+    private fun dnsProbeAsync(rawUrl: String) {
+        if (dnsProbeBusy) return
+        val host = try {
+            URL(rawUrl).host ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+        if (host.isEmpty()) return
+        dnsProbeBusy = true
+        Thread {
+            val t0 = SystemClock.elapsedRealtime()
+            try {
+                val addrs = java.net.InetAddress.getAllByName(host)
+                val dt = SystemClock.elapsedRealtime() - t0
+                engineLog(
+                    "引擎：解析探针 " + host + " → " +
+                        addrs.joinToString(", ") { it.hostAddress ?: "?" } +
+                        "（" + dt + "ms）"
+                )
+            } catch (e: Exception) {
+                val dt = SystemClock.elapsedRealtime() - t0
+                engineLog("引擎：解析探针 " + host + " 失败 " + e.javaClass.simpleName + "（" + dt + "ms）")
+            } finally {
+                dnsProbeBusy = false
+            }
+        }.start()
     }
 
     private fun probeSummary(p: ExoPlayer): String {
@@ -1966,23 +2001,50 @@ class KeepAliveService : Service() {
         } catch (_: Exception) {
             "Mozilla/5.0 (Linux; Android)"
         }
-        // 请求头尽量模拟网页 <audio> 直连时的样子，降低 CDN 因 UA/Referer 拦截的概率
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(ua)
-            .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(20000)
+        // 3.28.0：播放通道换 Chromium 网络栈（Cronet 内嵌版）——与落雪
+        // （Electron/Chromium）、上游（WebView 播）对齐：自带解析器 + 双栈
+        // 快速回退，不再让安卓 HttpURLConnection 的解析/选址把整首歌无声
+        // 挂死（2026-11-09 念心探针实锤：30 秒 0 字节、传输从未开始、无
+        // 任何错误）。Cronet 建不起来时回落原 HttpURLConnection 通道。
+        // 请求头仍模拟网页 <audio> 直连时的样子（UA/Referer 沿用）。
+        val upstreamFactory: DataSource.Factory = try {
+            val engine = org.chromium.net.CronetEngine.Builder(this)
+                .enableHttp2(true)
+                .enableQuic(true)
+                .build()
+            engineLog(
+                "引擎：播放通道 Cronet（Chromium）就绪 " +
+                    try {
+                        engine.versionString
+                    } catch (_: Exception) {
+                        ""
+                    }
+            )
+            androidx.media3.datasource.cronet.CronetDataSource.Factory(
+                engine,
+                java.util.concurrent.Executors.newCachedThreadPool()
+            )
+                .setUserAgent(ua)
+                .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
+        } catch (e: Exception) {
+            engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + e.javaClass.simpleName + "）")
+            DefaultHttpDataSource.Factory()
+                .setUserAgent(ua)
+                .setAllowCrossProtocolRedirects(true)
+                .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
+                .setConnectTimeoutMs(15000)
+                .setReadTimeoutMs(20000)
+        }
         val attrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
         // 数据源必须按协议分发：DefaultDataSource 认 file:// 等本地协议，
-        // http(s) 才走上面的 httpFactory（UA/Referer/超时全不变）。此前直接把
-        // httpFactory 设给媒体源工厂，file:// 被 HttpDataSource 当场拒收——
+        // http(s) 才走上面的上游工厂。此前直接把 http 工厂设给媒体源工厂，
+        // file:// 被当场拒收——
         // 3.9.0 原生下载的本地文件就是这样播不了的（2026-11-05 美人鱼抓现行）
         val rawDataSourceFactory =
-            androidx.media3.datasource.DefaultDataSource.Factory(this, httpFactory)
+            androidx.media3.datasource.DefaultDataSource.Factory(this, upstreamFactory)
         // 3.27.0：探针挂在数据源上数实际下到的字节
         val dataSourceFactory = DataSource.Factory {
             val ds = rawDataSourceFactory.createDataSource()

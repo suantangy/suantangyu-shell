@@ -11,8 +11,8 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 69
-        versionName = "3.27.0"
+        versionCode = 70
+        versionName = "3.28.0"
     }
 
     // 固定签名：工作流把 Secrets 里的固定 keystore 还原成 app/debug.keystore 时，debug 构建就用它签，
@@ -56,6 +56,9 @@ dependencies {
     // phase-2 原生播放：ExoPlayer 在前台服务里解码，音频脱离 WebView
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-common:1.4.1")
+    // 3.28.0：Chromium 网络栈（Cronet 内嵌版）作播放通道
+    implementation("androidx.media3:media3-datasource-cronet:1.4.1")
+    implementation("org.chromium.net:cronet-embedded:119.6045.31")
     // 3.3.0 原生解析：QuickJS 引擎（LX 音源脚本在服务内运行，不依赖 WebView）
     implementation("wang.harlon.quickjs:wrapper-android:3.2.3")
 }
