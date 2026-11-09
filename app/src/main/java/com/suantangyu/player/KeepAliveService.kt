@@ -1354,6 +1354,27 @@ class KeepAliveService : Service() {
         }.start()
     }
 
+    // 3.29.0 重定向跟随账：同一首歌内 3xx 手动跟随的跳数（换歌/出声清零）
+    private var redirectKey = ""
+    private var redirectHops = 0
+
+    /** 从播放错误里挖 3xx 响应的 Location 头（顺 cause 链找 InvalidResponseCodeException）。 */
+    private fun redirectLocationOf(error: PlaybackException): String? {
+        var c: Throwable? = error
+        while (c != null) {
+            if (c is HttpDataSource.InvalidResponseCodeException) {
+                for ((k, v) in c.headerFields) {
+                    if (k.equals("Location", ignoreCase = true)) {
+                        return v.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+                    }
+                }
+                return null
+            }
+            c = c.cause
+        }
+        return null
+    }
+
     private fun probeSummary(p: ExoPlayer): String {
         val pos = try {
             p.bufferedPosition
@@ -1383,6 +1404,9 @@ class KeepAliveService : Service() {
             playing = isPlaying
             if (isPlaying) {
                 errSkipCount = 0
+                // 3.29.0：真出声了，重定向跳数清零
+                redirectKey = ""
+                redirectHops = 0
                 // 3.18.0：回链候选真正出声才记「回链成功」并收工关会话
                 // （3.17.0 记在拿到新址时——《半壶纱》那种拿到址没出声
                 // 又死的也被记成成功，日后数自救占比会虚高）；别的歌
@@ -1537,6 +1561,52 @@ class KeepAliveService : Service() {
                             (if (httpCode > 0) " http=" + httpCode else "") +
                             (if (host.isNotEmpty()) " host=" + host else "")
                     )
+                }
+                // 3.29.0：3xx 带 Location 是服务器让改道（念心 wy.php
+                // 对网易歌回的 302 即如此）——Cronet 数据源对最终落点
+                // 仍是 3xx 的响应不跟随、原样当错误抛上来。脑内手动
+                // 跟随：同歌换到 Location 重播，不作废原址、不进回链；
+                // 上限 3 跳，无 Location/超限照旧走下面的报错处理
+                if (p != null && httpCode in 300..399 && curKey.isNotEmpty()) {
+                    val loc0 = redirectLocationOf(error)
+                    val loc = loc0?.let {
+                        if (it.startsWith("http", ignoreCase = true)) it
+                        else try {
+                            java.net.URI(nativeUrl).resolve(it).toString()
+                        } catch (_: Exception) {
+                            it
+                        }
+                    }
+                    if (curKey != redirectKey) {
+                        redirectKey = curKey
+                        redirectHops = 0
+                    }
+                    engineLog(
+                        "引擎：重定向 " + title + " http=" + httpCode + " → " +
+                            (loc?.let {
+                                try {
+                                    java.net.URI(it).host ?: it.take(60)
+                                } catch (_: Exception) {
+                                    it.take(60)
+                                }
+                            } ?: "（无 Location）")
+                    )
+                    if (loc != null && redirectHops < 3 && loc != nativeUrl) {
+                        redirectHops++
+                        try {
+                            val idx = p.currentMediaItemIndex
+                            val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { curKey }
+                            p.replaceMediaItem(
+                                idx,
+                                MediaItem.Builder().setUri(loc).setMediaId(mid).build()
+                            )
+                            nativeUrl = loc
+                            if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                            p.play()
+                        } catch (_: Exception) {
+                        }
+                        return
+                    }
                 }
                 // 报错即救——死址作废、原歌钻回解析链重走（报错
                 // 回链）；3.18.0 起一次发动内部续走：换上的址没出声
