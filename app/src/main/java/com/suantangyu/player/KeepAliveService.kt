@@ -25,6 +25,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
@@ -1916,22 +1917,49 @@ class KeepAliveService : Service() {
             "Mozilla/5.0 (Linux; Android)"
         }
         // 请求头尽量模拟网页 <audio> 直连时的样子，降低 CDN 因 UA/Referer 拦截的概率
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(ua)
-            .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(20000)
+        // 3.33.0：播放通道换 Chromium 网络栈（Cronet 内嵌版）——即 3.28.0 的
+        // 通道改动单独加回（3.32.0 整树回滚时撤下；不含 3.27 探针与解析探针）。
+        // HttpURLConnection 通道对 mcp.nianxinxz.com 会静默挂死（2026-11-09
+        // 两度实锤：缓冲无进展、0 字节、无任何错误，app 内网易全灭而浏览器
+        // 同址能播）；Cronet 与浏览器同栈。建不起来时回落原通道。
+        val upstreamFactory: DataSource.Factory = try {
+            val engine = org.chromium.net.CronetEngine.Builder(this)
+                .enableHttp2(true)
+                .enableQuic(true)
+                .build()
+            engineLog(
+                "引擎：播放通道 Cronet（Chromium）就绪 " +
+                    try {
+                        engine.versionString
+                    } catch (_: Exception) {
+                        ""
+                    }
+            )
+            androidx.media3.datasource.cronet.CronetDataSource.Factory(
+                engine,
+                java.util.concurrent.Executors.newCachedThreadPool()
+            )
+                .setUserAgent(ua)
+                .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
+        } catch (e: Exception) {
+            engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + e.javaClass.simpleName + "）")
+            DefaultHttpDataSource.Factory()
+                .setUserAgent(ua)
+                .setAllowCrossProtocolRedirects(true)
+                .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
+                .setConnectTimeoutMs(15000)
+                .setReadTimeoutMs(20000)
+        }
         val attrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
         // 数据源必须按协议分发：DefaultDataSource 认 file:// 等本地协议，
-        // http(s) 才走上面的 httpFactory（UA/Referer/超时全不变）。此前直接把
-        // httpFactory 设给媒体源工厂，file:// 被 HttpDataSource 当场拒收——
+        // http(s) 才走上面的上游工厂。此前直接把 http 工厂设给媒体源工厂，
+        // file:// 被当场拒收——
         // 3.9.0 原生下载的本地文件就是这样播不了的（2026-11-05 美人鱼抓现行）
         val dataSourceFactory =
-            androidx.media3.datasource.DefaultDataSource.Factory(this, httpFactory)
+            androidx.media3.datasource.DefaultDataSource.Factory(this, upstreamFactory)
         val p = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
