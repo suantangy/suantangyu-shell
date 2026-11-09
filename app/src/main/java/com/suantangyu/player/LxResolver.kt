@@ -606,8 +606,9 @@ object LxResolver {
         }
 
         // —— 玉宁熙（星河入梦）：四平台接口 ——
-        if (src.id == "ynx" ||
-            Regex("玉宁熙|星河入梦|yuafeng", RegexOption.IGNORE_CASE).containsMatchIn(src.name + src.url)
+        // cx（屿溪·沉音脚本版星河入梦）不进这里：它走上面的脚本运行时，失败即失败
+        if (src.id != "cx" && (src.id == "ynx" ||
+            Regex("玉宁熙|星河入梦|yuafeng", RegexOption.IGNORE_CASE).containsMatchIn(src.name + src.url))
         ) {
             return ynxResolve(src, song, q, mid)
         }
