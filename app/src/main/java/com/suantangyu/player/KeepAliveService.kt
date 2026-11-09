@@ -78,6 +78,7 @@ class KeepAliveService : Service() {
         // 3.3.0 原生解析：网页把音源配置与后续队列交给服务，服务用 QuickJS
         // 引擎自己解析回填预置跑道，界面页熄屏冻结时连播不再断链
         const val ACTION_SOURCES_CONFIG = "com.suantangyu.player.SOURCES_CONFIG"
+        const val ACTION_REDIRECT_PROBE = "com.suantangyu.player.REDIRECT_PROBE"
         const val ACTION_QUEUE_AHEAD = "com.suantangyu.player.QUEUE_AHEAD"
         const val ACTION_CURRENT_SONG = "com.suantangyu.player.CURRENT_SONG"
         // 单脑第 0 步（3.6.0）：完整队列快照（影子队列，只收存对账）
@@ -1357,6 +1358,8 @@ class KeepAliveService : Service() {
     // 3.29.0 重定向跟随账：同一首歌内 3xx 手动跟随的跳数（换歌/出声清零）
     private var redirectKey = ""
     private var redirectHops = 0
+    // 3.31.0 网页探针已派发的歌（每首一次，避免反复打扰页面）
+    private var redirectProbeKey = ""
 
     /**
      * 3.30.0：3xx 错误的响应转储——全部响应头（名=值截断）+ 响应体长度、
@@ -1412,6 +1415,45 @@ class KeepAliveService : Service() {
             c = c.cause
         }
         return null
+    }
+
+    /**
+     * 3.31.0：派网页侧重定向探针——注入 JS 对 [url] 做两件事：
+     * fetch(redirect:follow, Range 0-0, 带 cookie) 报最终状态/落点/类型；
+     * 静音 <audio> 试播报 canplay/error 与 currentSrc。结果经
+     * BaoBus.postRedirectProbe 回传、ACTION_REDIRECT_PROBE 落日志。
+     */
+    private fun dispatchWebRedirectProbe(url: String) {
+        val inst = MainActivity.instance ?: return
+        val jsBody = """
+var out={u:url};var pending=2;var sent=false;
+function send(){if(sent)return;sent=true;try{BaoBus.postRedirectProbe(JSON.stringify(out))}catch(e){}}
+function fin(){pending--;if(pending<=0)send()}
+setTimeout(send,14000);
+try{
+var ctl=new AbortController();setTimeout(function(){try{ctl.abort()}catch(e){}},12000);
+fetch(url,{redirect:"follow",credentials:"include",headers:{"Range":"bytes=0-0"},signal:ctl.signal}).then(function(r){out.f={s:r.status,u:r.url,ct:r.headers.get("content-type")};fin()}).catch(function(e){out.f={err:String(e).slice(0,60)};fin()});
+}catch(e){out.f={err:String(e).slice(0,60)};fin()}
+try{
+var a=document.createElement("audio");a.muted=true;a.preload="auto";var dn=false;
+function afin(r){if(dn)return;dn=true;clearTimeout(to);out.a={r:r,src:a.currentSrc};try{a.pause();a.removeAttribute("src");a.load()}catch(e){}fin()}
+var to=setTimeout(function(){afin("timeout")},7000);
+a.addEventListener("canplay",function(){afin("canplay")});
+a.addEventListener("error",function(){afin("error")});
+a.src=url;
+}catch(e){out.a={err:String(e).slice(0,60)};fin()}
+"""
+        val js = "(function(){var url=" + JSONObject.quote(url) + ";\n" + jsBody + "})()"
+        try {
+            inst.runJsOnPage(js)
+            val host = try {
+                java.net.URI(url).host ?: ""
+            } catch (_: Exception) {
+                ""
+            }
+            engineLog("引擎：已派网页探针 " + host)
+        } catch (_: Exception) {
+        }
     }
 
     private fun probeSummary(p: ExoPlayer): String {
@@ -1631,6 +1673,14 @@ class KeepAliveService : Service() {
                             } ?: "（无 Location）") +
                             (if (loc == null) " " + httpErrorDump(error) else "")
                     )
+                    if (loc == null && curKey != redirectProbeKey) {
+                        // 3.31.0：裸 302（Location 为空）时派网页侧探针：
+                        // 让 WebView 对同一 URL 做 fetch 跟随 + 静音 audio
+                        // 试播——浏览器能播而播放器不能，就当场 A/B 出
+                        // 差异在请求上下文还是在服务端间歇性
+                        redirectProbeKey = curKey
+                        dispatchWebRedirectProbe(nativeUrl)
+                    }
                     if (loc != null && redirectHops < 3 && loc != nativeUrl) {
                         redirectHops++
                         try {
@@ -2738,6 +2788,11 @@ class KeepAliveService : Service() {
                     lxEngine().configure(configSources.filter { it.isScript() })
                     engineLog("引擎：已接收音源配置 " + configSources.size + " 个源")
                 }
+            }
+            ACTION_REDIRECT_PROBE -> {
+                // 3.31.0 诊断：网页侧探针结果（fetch 跟随 + 静音 audio 试播）
+                val s = intent.getStringExtra("json").orEmpty()
+                if (s.isNotEmpty()) engineLog("引擎：网页探针 " + s.take(400))
             }
             // ACTION_QUEUE_AHEAD 已退役（单脑第 3 步）：队列真相只走快照
             // ACTION_CURRENT_SONG 已退役（单脑第 3 步）：当前曲档案在快照队列里

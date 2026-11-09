@@ -285,6 +285,16 @@ class BaoBridge(private val activity: MainActivity) {
 
     // —— 3.3.0 原生解析：网页把音源配置与后续队列交给服务里的 QuickJS 引擎 ——
 
+    /** 3.31.0 诊断：网页侧重定向探针结果回传（fetch 跟随 + 静音 audio 试播同一 URL） */
+    @JavascriptInterface
+    fun postRedirectProbe(json: String) {
+        val intent = Intent(activity, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_REDIRECT_PROBE
+            putExtra("json", json)
+        }
+        activity.startService(intent)
+    }
+
     /** 音源配置（JSON：{quality, autoDowngrade, sources:[{id,name,type,url,script,platforms,jsUrl,fromFile}]}） */
     @JavascriptInterface
     fun postSourcesConfig(json: String) {
