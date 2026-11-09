@@ -83,6 +83,8 @@ class KeepAliveService : Service() {
         const val ACTION_BRAIN_CMD = "com.suantangyu.player.BRAIN_CMD"
         const val ACTION_BRAIN_SLEEP = "com.suantangyu.player.BRAIN_SLEEP"
         const val ACTION_DOWNLOAD = "com.suantangyu.player.DOWNLOAD"
+        // 3.34.0：网页端 fetch 探针结果回报
+        const val ACTION_PROBE_REPORT = "com.suantangyu.player.PROBE_REPORT"
     }
 
     private var title: String = "酸汤鱼音乐"
@@ -1909,40 +1911,339 @@ class KeepAliveService : Service() {
         }
     }
 
-    private fun ensurePlayer(): ExoPlayer {
-        player?.let { return it }
-        val ua = try {
+    // ===== 3.34.0 探针矩阵（一次性取证） =====
+    // 背景：3.33 通道换 Cronet 后，app 播念心网易仍多拿空 302、最终落 QQ，
+    // 而同机浏览器网页端同址整天直出流——服务端在按请求形态分人。嫌疑三项：
+    // cookie（壳引擎冷启无证）/ UA（壳是 WebView 的）/ Referer（壳写死
+    // m.858600.xyz，网页是 yinyue-bfq.pages.dev）。本矩阵在每次服务生命内
+    // 第一首 nianxinxz 歌起播时，对同一地址发只取头的对照请求，一轮日志
+    // 隔离变量：A 壳脸独立新引擎冷→温（验 cookie 次访放行）、B 浏览器脸
+    // 冷→温、C 只换 Referer、D 只换 UA、W App 内网页 fetch（含其 cookie）。
+    // 探针不跟随重定向、禁用缓存；Set-Cookie 只记名与 Domain/Path、不记值。
+    // 行为改动仅一处中性项：Cronet 引擎改单例（obtainCronetEngine），
+    // 否则 cookie 存活无从观察；UA/Referer/存储一律不动。
+    @Volatile
+    private var cronetEngine: org.chromium.net.CronetEngine? = null
+
+    @Volatile
+    private var cronetEngineFailed = false
+
+    private fun obtainCronetEngine(): org.chromium.net.CronetEngine? {
+        cronetEngine?.let { return it }
+        if (cronetEngineFailed) return null
+        synchronized(this) {
+            cronetEngine?.let { return it }
+            if (cronetEngineFailed) return null
+            return try {
+                val e = org.chromium.net.CronetEngine.Builder(this)
+                    .enableHttp2(true)
+                    .enableQuic(true)
+                    .build()
+                cronetEngine = e
+                engineLog(
+                    "引擎：播放通道 Cronet（Chromium）就绪 " +
+                        try {
+                            e.versionString
+                        } catch (_: Exception) {
+                            ""
+                        }
+                )
+                e
+            } catch (ex: Exception) {
+                cronetEngineFailed = true
+                engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + ex.javaClass.simpleName + "）")
+                null
+            }
+        }
+    }
+
+    private fun shellUserAgent(): String =
+        try {
             android.webkit.WebSettings.getDefaultUserAgent(this)
         } catch (_: Exception) {
             "Mozilla/5.0 (Linux; Android)"
         }
+
+    // 浏览器脸 UA：WebView UA 去掉 "Version/4.0 " 即 Chrome for Android 的形状
+    private fun chromeUserAgent(): String {
+        val wv = shellUserAgent()
+        return wv.replace("Version/4.0 ", "")
+    }
+
+    @Volatile
+    private var probeMatrixDone = false
+
+    private fun maybeFireProbeMatrix(url: String, key: String) {
+        if (probeMatrixDone) return
+        val host =
+            try {
+                java.net.URI(url).host ?: ""
+            } catch (_: Exception) {
+                ""
+            }
+        if (!host.contains("nianxinxz.com")) return
+        probeMatrixDone = true
+        val nm =
+            try {
+                brainNameOf(key)
+            } catch (_: Exception) {
+                ""
+            }
+        Thread { runProbeMatrix(url, nm) }.start()
+    }
+
+    private fun newProbeEngine(): org.chromium.net.CronetEngine? =
+        try {
+            org.chromium.net.CronetEngine.Builder(this)
+                .enableHttp2(true)
+                .enableQuic(true)
+                .build()
+        } catch (_: Exception) {
+            null
+        }
+
+    private fun runProbeMatrix(url: String, songName: String) {
+        val exec = java.util.concurrent.Executors.newCachedThreadPool()
+        try {
+            engineLog("引擎：探针矩阵开始 → " + songName + "（正片结果看紧随的播放/出错行）")
+            val uaShell = shellUserAgent()
+            val uaChrome = chromeUserAgent()
+            val refShell = "https://m.858600.xyz/"
+            val refPage = "https://yinyue-bfq.pages.dev/"
+            val eA = newProbeEngine()
+            if (eA != null) {
+                cronetProbe(eA, "A1 壳脸·冷", url, uaShell, refShell, exec)
+                cronetProbe(eA, "A2 壳脸·温", url, uaShell, refShell, exec)
+                try { eA.shutdown() } catch (_: Exception) {}
+            } else {
+                engineLog("引擎：探针 A 跳过（引擎建不起来）")
+            }
+            val eB = newProbeEngine()
+            if (eB != null) {
+                cronetProbe(eB, "B1 浏览器脸·冷", url, uaChrome, refPage, exec)
+                cronetProbe(eB, "B2 浏览器脸·温", url, uaChrome, refPage, exec)
+                try { eB.shutdown() } catch (_: Exception) {}
+            } else {
+                engineLog("引擎：探针 B 跳过（引擎建不起来）")
+            }
+            val eC = newProbeEngine()
+            if (eC != null) {
+                cronetProbe(eC, "C1 只换Referer·冷", url, uaShell, refPage, exec)
+                try { eC.shutdown() } catch (_: Exception) {}
+            } else {
+                engineLog("引擎：探针 C 跳过（引擎建不起来）")
+            }
+            val eD = newProbeEngine()
+            if (eD != null) {
+                cronetProbe(eD, "D1 只换UA·冷", url, uaChrome, refShell, exec)
+                try { eD.shutdown() } catch (_: Exception) {}
+            } else {
+                engineLog("引擎：探针 D 跳过（引擎建不起来）")
+            }
+            val inst = MainActivity.instance
+            if (inst != null) {
+                val js =
+                    "(function(){var t0=Date.now();try{fetch(" + JSONObject.quote(url) +
+                        ",{headers:{'Range':'bytes=0-0'},credentials:'include'}).then(function(r){" +
+                        "BaoBus.probeReport(JSON.stringify({status:r.status,final:(r.url||''),ct:(r.headers.get('content-type')||''),ms:Date.now()-t0}))" +
+                        "}).catch(function(e){BaoBus.probeReport(JSON.stringify({error:''+e,ms:Date.now()-t0}))})}catch(e){" +
+                        "BaoBus.probeReport(JSON.stringify({error:'sync '+e}))}})()"
+                inst.runJsOnPage(js)
+                engineLog("引擎：探针 W 已发出（App 内网页 fetch，结果异步回）")
+            } else {
+                engineLog("引擎：探针 W 跳过（页面未就绪）")
+            }
+            engineLog("引擎：探针矩阵结束")
+        } catch (e: Exception) {
+            engineLog("引擎：探针矩阵异常 " + e.javaClass.simpleName + " " + (e.message ?: ""))
+        } finally {
+            try { exec.shutdown() } catch (_: Exception) {}
+        }
+    }
+
+    private fun cronetProbe(
+        engine: org.chromium.net.CronetEngine,
+        tag: String,
+        url: String,
+        ua: String,
+        ref: String,
+        exec: java.util.concurrent.Executor
+    ) {
+        val t0 = SystemClock.elapsedRealtime()
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val logged = java.util.concurrent.atomic.AtomicBoolean(false)
+        var req: org.chromium.net.UrlRequest? = null
+        fun done(line: String) {
+            if (logged.compareAndSet(false, true)) engineLog(line)
+            latch.countDown()
+        }
+        val cb =
+            object : org.chromium.net.UrlRequest.Callback() {
+                override fun onRedirectReceived(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo,
+                    newLocationUrl: String
+                ) {
+                    done(probeLine(tag, info, newLocationUrl, SystemClock.elapsedRealtime() - t0, -1))
+                    request.cancel()
+                }
+
+                override fun onResponseStarted(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo
+                ) {
+                    try {
+                        request.read(java.nio.ByteBuffer.allocateDirect(16384))
+                    } catch (e: Exception) {
+                        done(probeLine(tag, info, null, SystemClock.elapsedRealtime() - t0, -2))
+                        request.cancel()
+                    }
+                }
+
+                override fun onReadCompleted(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo,
+                    byteBuffer: java.nio.ByteBuffer
+                ) {
+                    done(probeLine(tag, info, null, SystemClock.elapsedRealtime() - t0, byteBuffer.position()))
+                    request.cancel()
+                }
+
+                override fun onSucceeded(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo
+                ) {
+                    done(probeLine(tag, info, null, SystemClock.elapsedRealtime() - t0, -3))
+                }
+
+                override fun onFailed(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo?,
+                    error: org.chromium.net.CronetException
+                ) {
+                    done(
+                        "引擎：探针 " + tag + " → 失败 " + error.javaClass.simpleName + " " +
+                            (error.message ?: "") + " " + (SystemClock.elapsedRealtime() - t0) + "ms"
+                    )
+                }
+
+                override fun onCanceled(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo?
+                ) {
+                    latch.countDown()
+                }
+            }
+        try {
+            req =
+                engine.newUrlRequestBuilder(url, cb, exec)
+                    .addHeader("User-Agent", ua)
+                    .addHeader("Referer", ref)
+                    .addHeader("Range", "bytes=0-0")
+                    .addHeader("Accept", "*/*")
+                    .disableCache()
+                    .build()
+            req?.start()
+        } catch (e: Exception) {
+            done("引擎：探针 " + tag + " → 发起失败 " + e.javaClass.simpleName)
+            return
+        }
+        if (!latch.await(9, java.util.concurrent.TimeUnit.SECONDS)) {
+            try { req?.cancel() } catch (_: Exception) {}
+            done("引擎：探针 " + tag + " → 超时 9000ms（无响应）")
+        }
+    }
+
+    private fun probeLine(
+        tag: String,
+        info: org.chromium.net.UrlResponseInfo,
+        locationUrl: String?,
+        ms: Long,
+        readBytes: Int
+    ): String {
+        val h = HashMap<String, List<String>>()
+        try {
+            for ((k, v) in info.allHeaders) h[k.lowercase()] = v
+        } catch (_: Exception) {
+        }
+        fun first(name: String): String = h[name]?.firstOrNull() ?: ""
+        val sb = StringBuilder()
+        sb.append("引擎：探针 ").append(tag).append(" → ").append(info.httpStatusCode)
+        if (info.httpStatusCode in 300..399) {
+            val loc = locationUrl ?: first("location")
+            val lh =
+                try {
+                    java.net.URI(loc).host ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+            sb.append(if (loc.isEmpty()) " Location=（空）" else " Location→" + lh)
+        }
+        val cookies = h["set-cookie"] ?: emptyList()
+        if (cookies.isNotEmpty()) {
+            val parts =
+                cookies.map { c ->
+                    val nm = c.substringBefore("=").trim()
+                    val dm = Regex("(?i)domain=([^;]+)").find(c)?.groupValues?.get(1) ?: ""
+                    val pa = Regex("(?i)path=([^;]+)").find(c)?.groupValues?.get(1) ?: ""
+                    nm + "(D=" + dm + " P=" + pa + ")"
+                }
+            sb.append(" Set-Cookie=[").append(parts.joinToString(", ")).append("]")
+        } else {
+            sb.append(" Set-Cookie=无")
+        }
+        val ct = first("content-type")
+        if (ct.isNotEmpty()) sb.append(" CT=").append(ct)
+        val cl = first("content-length")
+        if (cl.isNotEmpty()) sb.append(" CL=").append(cl)
+        val eo = first("eo-cache-status")
+        if (eo.isNotEmpty()) sb.append(" EO=").append(eo)
+        if (readBytes >= 0) sb.append(" 已读=").append(readBytes).append("B")
+        sb.append(" ").append(ms).append("ms")
+        return sb.toString()
+    }
+
+    private fun logWebProbe(json: String) {
+        try {
+            val o = JSONObject(json)
+            if (o.has("error")) {
+                engineLog("引擎：探针 W 网页端 → 失败 " + o.optString("error") + " " + o.optLong("ms") + "ms")
+                return
+            }
+            val fin = o.optString("final")
+            val fh =
+                try {
+                    java.net.URI(fin).host ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+            engineLog(
+                "引擎：探针 W 网页端 → " + o.optInt("status") + " 最终→" + fh +
+                    " CT=" + o.optString("ct") + " " + o.optLong("ms") + "ms"
+            )
+        } catch (_: Exception) {
+            engineLog("引擎：探针 W 网页端 → 回报解析失败 " + json.take(200))
+        }
+    }
+
+    private fun ensurePlayer(): ExoPlayer {
+        player?.let { return it }
+        val ua = shellUserAgent()
         // 请求头尽量模拟网页 <audio> 直连时的样子，降低 CDN 因 UA/Referer 拦截的概率
         // 3.33.0：播放通道换 Chromium 网络栈（Cronet 内嵌版）——即 3.28.0 的
         // 通道改动单独加回（3.32.0 整树回滚时撤下；不含 3.27 探针与解析探针）。
         // HttpURLConnection 通道对 mcp.nianxinxz.com 会静默挂死（2026-11-09
         // 两度实锤：缓冲无进展、0 字节、无任何错误，app 内网易全灭而浏览器
         // 同址能播）；Cronet 与浏览器同栈。建不起来时回落原通道。
-        val upstreamFactory: DataSource.Factory = try {
-            val engine = org.chromium.net.CronetEngine.Builder(this)
-                .enableHttp2(true)
-                .enableQuic(true)
-                .build()
-            engineLog(
-                "引擎：播放通道 Cronet（Chromium）就绪 " +
-                    try {
-                        engine.versionString
-                    } catch (_: Exception) {
-                        ""
-                    }
-            )
+        val cronetEng = obtainCronetEngine()
+        val upstreamFactory: DataSource.Factory = if (cronetEng != null) {
             androidx.media3.datasource.cronet.CronetDataSource.Factory(
-                engine,
+                cronetEng,
                 java.util.concurrent.Executors.newCachedThreadPool()
             )
                 .setUserAgent(ua)
                 .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
-        } catch (e: Exception) {
-            engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + e.javaClass.simpleName + "）")
+        } else {
             DefaultHttpDataSource.Factory()
                 .setUserAgent(ua)
                 .setAllowCrossProtocolRedirects(true)
@@ -2187,6 +2488,7 @@ class KeepAliveService : Service() {
         nativeUrl = url
         nativeKey = key
         nativeActive = true
+        maybeFireProbeMatrix(url, key)
         playing = false
         positionMs = 0
         anchorPosMs = 0
@@ -2333,6 +2635,9 @@ class KeepAliveService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_PROBE_REPORT -> {
+                logWebProbe(intent.getStringExtra("json").orEmpty())
+            }
             ACTION_UPDATE_TRACK -> {
                 title = intent.getStringExtra("title").orEmpty().ifEmpty { "酸汤鱼音乐" }
                 artist = intent.getStringExtra("artist").orEmpty()
