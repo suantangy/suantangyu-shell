@@ -25,8 +25,11 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.TransferListener
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import org.json.JSONArray
@@ -1030,7 +1033,7 @@ class KeepAliveService : Service() {
         if (watchdogStall == 1) {
             // 3.5.5：看门狗动作留痕——此前两击都不写引擎日志，缓冲挂死在
             // 日志里毫无踪影（2026-11-04 Nevada 断播复盘的记录盲区）
-            engineLog("引擎：看门狗重拉 " + title + "（缓冲无进展）")
+            engineLog("引擎：看门狗重拉 " + title + "（缓冲无进展）" + probeSummary(p))
             // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
             // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
             // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
@@ -1055,7 +1058,7 @@ class KeepAliveService : Service() {
             // 第二次仍卡：停掉播放器（网页重试须走整条装载，别在坏连接上复用），
             // 发 error 同步交网页的重试/换源降级链处理
             watchdogStall = 0
-            engineLog("引擎：看门狗停机 " + title + "（缓冲无进展，错误已交网页）")
+            engineLog("引擎：看门狗停机 " + title + "（缓冲无进展，错误已交网页）" + probeSummary(p))
             try {
                 p.stop()
             } catch (_: Exception) {
@@ -1287,8 +1290,50 @@ class KeepAliveService : Service() {
         if (sleepStop) fireBrainSleepStop()
     }
 
+    // 3.27.0 播放探针：记当前曲实际下到的字节数与末次播放错误，看门狗
+    // 重拉/停机时一并打进日志——治「缓冲无进展」在日志里毫无踪影的盲区
+    // （2026-11-09 念心全场静默卡死：没报错也没失败，无从判通道还是断供）
+    @Volatile
+    private var probeBytes = 0L
+
+    @Volatile
+    private var probeLastError = ""
+
+    @Volatile
+    private var probeHost = ""
+    private val probeTransfer = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {}
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+            if (isNetwork) {
+                try {
+                    probeHost = dataSpec.uri.host ?: ""
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            if (isNetwork) probeBytes += bytesTransferred.toLong()
+        }
+
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {}
+    }
+
+    private fun probeSummary(p: ExoPlayer): String {
+        val pos = try {
+            p.bufferedPosition
+        } catch (_: Exception) {
+            -1L
+        }
+        return "探针：已下 " + probeBytes + " 字节@" + probeHost +
+            " 缓冲位 " + pos + "ms" +
+            if (probeLastError.isNotEmpty()) " 末次错误 " + probeLastError else " 无加载错误"
+    }
+
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            probeBytes = 0L
+            probeLastError = ""
             // phase-3：播放列表原生接播在这里记账（服务自发 seek 接播同理）
             handlePlaylistTransition(mediaItem, reason)
         }
@@ -1388,13 +1433,19 @@ class KeepAliveService : Service() {
             // 顺着 cause 链找 HTTP 状态码，网页垫片打日志/判失败要用
             var httpCode = 0
             var c: Throwable? = error
+            var deepest: Throwable = error
             while (c != null) {
+                deepest = c
                 if (c is HttpDataSource.InvalidResponseCodeException) {
                     httpCode = c.responseCode
                     break
                 }
                 c = c.cause
             }
+            // 3.27.0 探针留痕：末次错误摘要（看门狗日志引用）
+            probeLastError = "err=" + error.errorCode + " http=" + httpCode + " " +
+                deepest.javaClass.simpleName + ": " +
+                (deepest.message ?: "").take(80)
             pushSync(
                 JSONObject()
                     .put("t", "error")
@@ -1930,8 +1981,17 @@ class KeepAliveService : Service() {
         // http(s) 才走上面的 httpFactory（UA/Referer/超时全不变）。此前直接把
         // httpFactory 设给媒体源工厂，file:// 被 HttpDataSource 当场拒收——
         // 3.9.0 原生下载的本地文件就是这样播不了的（2026-11-05 美人鱼抓现行）
-        val dataSourceFactory =
+        val rawDataSourceFactory =
             androidx.media3.datasource.DefaultDataSource.Factory(this, httpFactory)
+        // 3.27.0：探针挂在数据源上数实际下到的字节
+        val dataSourceFactory = DataSource.Factory {
+            val ds = rawDataSourceFactory.createDataSource()
+            try {
+                ds.addTransferListener(probeTransfer)
+            } catch (_: Exception) {
+            }
+            ds
+        }
         val p = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
