@@ -1358,6 +1358,45 @@ class KeepAliveService : Service() {
     private var redirectKey = ""
     private var redirectHops = 0
 
+    /**
+     * 3.30.0：3xx 错误的响应转储——全部响应头（名=值截断）+ 响应体长度、
+     * 头 12 字节十六进制与可打印预览。区分「裸 302」到底是什么：体带
+     * ID3/fLaC/FFFB 魔数 = 状态行造假、正文就是音频；体为空 = 纯空壳
+     * （UA 分待遇坐实方向）；体里藏 URL/HTML = 按内容再跟随。
+     */
+    private fun httpErrorDump(error: PlaybackException): String {
+        var c: Throwable? = error
+        while (c != null) {
+            if (c is HttpDataSource.InvalidResponseCodeException) {
+                val sb = StringBuilder()
+                sb.append("头[")
+                var first = true
+                for ((k, v) in c.headerFields) {
+                    if (!first) sb.append("; ")
+                    first = false
+                    sb.append(k).append("=").append(v.joinToString(",").take(80))
+                    if (sb.length > 400) break
+                }
+                sb.append("]")
+                val body = c.responseBody
+                sb.append(" 体长=").append(body.size)
+                if (body.isNotEmpty()) {
+                    sb.append(" 体首=")
+                    for (i in 0 until minOf(12, body.size)) {
+                        sb.append("%02X".format(body[i]))
+                    }
+                    val txt = String(body, 0, minOf(80, body.size), Charsets.UTF_8)
+                        .map { ch -> if (ch.code in 32..126) ch else '·' }
+                        .joinToString("")
+                    sb.append(" 体文=\"").append(txt).append("\"")
+                }
+                return sb.toString()
+            }
+            c = c.cause
+        }
+        return ""
+    }
+
     /** 从播放错误里挖 3xx 响应的 Location 头（顺 cause 链找 InvalidResponseCodeException）。 */
     private fun redirectLocationOf(error: PlaybackException): String? {
         var c: Throwable? = error
@@ -1589,7 +1628,8 @@ class KeepAliveService : Service() {
                                 } catch (_: Exception) {
                                     it.take(60)
                                 }
-                            } ?: "（无 Location）")
+                            } ?: "（无 Location）") +
+                            (if (loc == null) " " + httpErrorDump(error) else "")
                     )
                     if (loc != null && redirectHops < 3 && loc != nativeUrl) {
                         redirectHops++
@@ -2066,11 +2106,12 @@ class KeepAliveService : Service() {
 
     private fun ensurePlayer(): ExoPlayer {
         player?.let { return it }
-        val ua = try {
-            android.webkit.WebSettings.getDefaultUserAgent(this)
-        } catch (_: Exception) {
-            "Mozilla/5.0 (Linux; Android)"
-        }
+        // 3.30.0：播放 UA 从 WebView 默认串换成完整 Chrome 串（与下载/
+        // 脚本请求同款）——念心 wy.php 对网易歌回「无 Location 的裸
+        // 302」，疑似按 UA 分待遇（浏览器拿真跳转、播放器 UA 拿空壳）；
+        // 换串后若直接出声即坐实，若仍 302 看错误转储判响应体
+        val ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         // 3.28.0：播放通道换 Chromium 网络栈（Cronet 内嵌版）——与落雪
         // （Electron/Chromium）、上游（WebView 播）对齐：自带解析器 + 双栈
         // 快速回退，不再让安卓 HttpURLConnection 的解析/选址把整首歌无声
