@@ -1767,11 +1767,18 @@ class KeepAliveService : Service() {
         rescueSettled = false
         rescueStartMs = android.os.SystemClock.elapsedRealtime()
         swapExec.execute {
+            var candViaQq = false
             val newUrl = try {
-                LxResolver.resolve(
+                val prov = LxResolver.resolveProv(
                     dd, configSources, configQuality, configAutoDown,
                     lxEngine(), remain, bans
-                ) { m -> engineLog(m) }?.toString() ?: ""
+                ) { m -> engineLog(m) }
+                if (prov != null) {
+                    candViaQq = prov.viaQq
+                    prov.url
+                } else {
+                    ""
+                }
             } catch (_: Exception) {
                 ""
             }
@@ -1795,8 +1802,11 @@ class KeepAliveService : Service() {
                     } catch (_: Exception) {
                         ""
                     }
-                    // 成色先记在会话里，出声时才落「回链成功」账
-                    val viaQq = plat != "qq" && host3.contains("qqmusic")
+                    // 成色按解析出身记（3.36.0）：候选出自链内 QQ 兜底
+                    // 就是兜底、出自本平台链就是本平台。旧法按域名含
+                    // qqmusic 猜——念心 tx.php 的 mcp 域名被误标成本
+                    // 平台（2026-11-09 助手据此误报本平台自救），废弃
+                    val viaQq = candViaQq
                     rescueSessCandHost = host3
                     rescueSessCandViaQq = viaQq
                     rescueSessAwaitingUrl = newUrl
