@@ -450,4 +450,75 @@ class BaoBridge(private val activity: MainActivity) {
             "[]"
         }
     }
+
+    // —— 原生 HTTP 桥（3.25.0）——
+    // 网页 adapterRequest 的原生通道：上游 hasNativeHttpBridge 只认 AQNative/fm/WebToApp 等桥名，
+    // 网页侧垫片把 AQNative.request 转发到这里，原生直连目标 API（无 CORS、不绕 /proxy 与公共代理）。
+    // 异步执行，响应体以 Base64 经 window.__baoHttpDone(id, b64) 回传；任何失败回空串，
+    // 网页会据此自动降级回原来的浏览器兜底链，行为不比从前差。
+    private val httpPool = java.util.concurrent.Executors.newFixedThreadPool(8)
+
+    @JavascriptInterface
+    fun httpReq(id: Int, url: String, method: String, headersJson: String, body: String, timeoutSec: Int) {
+        httpPool.execute {
+            var text = ""
+            try {
+                val to = timeoutSec.coerceIn(3, 60) * 1000
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.connectTimeout = to
+                conn.readTimeout = to
+                conn.instanceFollowRedirects = true
+                val m = method.uppercase().ifEmpty { "GET" }
+                conn.requestMethod = m
+                var hasUa = false
+                try {
+                    val hj = org.json.JSONObject(headersJson.ifEmpty { "{}" })
+                    val keys = hj.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (k.equals("User-Agent", ignoreCase = true)) hasUa = true
+                        conn.setRequestProperty(k, hj.optString(k, ""))
+                    }
+                } catch (_: Exception) {
+                }
+                if (!hasUa) {
+                    conn.setRequestProperty(
+                        "User-Agent",
+                        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
+                            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                    )
+                }
+                if (m != "GET" && m != "HEAD") {
+                    conn.doOutput = true
+                    conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                }
+                val code = conn.responseCode
+                val stream = if (code >= 400) conn.errorStream else conn.inputStream
+                if (stream != null) {
+                    val buf = java.io.ByteArrayOutputStream()
+                    val chunk = ByteArray(8192)
+                    var total = 0
+                    stream.use { ins ->
+                        while (true) {
+                            val n = ins.read(chunk)
+                            if (n <= 0) break
+                            total += n
+                            if (total > 8 * 1024 * 1024) break
+                            buf.write(chunk, 0, n)
+                        }
+                    }
+                    text = String(buf.toByteArray(), Charsets.UTF_8)
+                }
+                conn.disconnect()
+            } catch (_: Exception) {
+                text = ""
+            }
+            val b64 = try {
+                android.util.Base64.encodeToString(text.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+            } catch (_: Exception) {
+                ""
+            }
+            activity.runJsOnPage("window.__baoHttpDone && window.__baoHttpDone($id,\"$b64\")")
+        }
+    }
 }
