@@ -124,12 +124,6 @@ class LxEngine(private val log: (String) -> Unit) {
         })
         installNativeHooks(sc, ctx)
         ctx.evaluate(GLUE_JS)
-        // currentScriptInfo 必须是脚本自己的头信息（与落雪一致）：有些脚本（如屿溪·沉音）
-        // 会校验 homepage 等字段，写死宿主名会让它拒绝初始化
-        try {
-            ctx.evaluate("globalThis.lx.currentScriptInfo = " + scriptInfoJson(scriptText) + ";")
-        } catch (e: Exception) {
-        }
         ctx.evaluate(scriptText)
         val t = try {
             ctx.evaluate("typeof globalThis.__lxH")
@@ -359,22 +353,6 @@ class LxEngine(private val log: (String) -> Unit) {
     }
 
     companion object {
-        /** 从脚本头部注释解析 @name/@version/@description/@author/@homepage，拼成 currentScriptInfo 的 JSON。 */
-        private fun scriptInfoJson(scriptText: String): String {
-            val head = scriptText.substring(0, minOf(3000, scriptText.length))
-            fun grab(key: String): String {
-                val m = Regex("@" + key + "\\s+(.+)").find(head) ?: return ""
-                return m.groupValues[1].trim()
-            }
-            val o = JSONObject()
-            o.put("name", grab("name"))
-            o.put("version", grab("version"))
-            o.put("description", grab("description"))
-            o.put("author", grab("author"))
-            o.put("homepage", grab("homepage"))
-            return o.toString()
-        }
-
         private fun md5Hex(data: ByteArray): String {
             val digest = MessageDigest.getInstance("MD5").digest(data)
             val sb = StringBuilder(digest.size * 2)

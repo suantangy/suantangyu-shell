@@ -25,11 +25,8 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
-import androidx.media3.datasource.TransferListener
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import org.json.JSONArray
@@ -78,7 +75,6 @@ class KeepAliveService : Service() {
         // 3.3.0 原生解析：网页把音源配置与后续队列交给服务，服务用 QuickJS
         // 引擎自己解析回填预置跑道，界面页熄屏冻结时连播不再断链
         const val ACTION_SOURCES_CONFIG = "com.suantangyu.player.SOURCES_CONFIG"
-        const val ACTION_REDIRECT_PROBE = "com.suantangyu.player.REDIRECT_PROBE"
         const val ACTION_QUEUE_AHEAD = "com.suantangyu.player.QUEUE_AHEAD"
         const val ACTION_CURRENT_SONG = "com.suantangyu.player.CURRENT_SONG"
         // 单脑第 0 步（3.6.0）：完整队列快照（影子队列，只收存对账）
@@ -1034,8 +1030,7 @@ class KeepAliveService : Service() {
         if (watchdogStall == 1) {
             // 3.5.5：看门狗动作留痕——此前两击都不写引擎日志，缓冲挂死在
             // 日志里毫无踪影（2026-11-04 Nevada 断播复盘的记录盲区）
-            engineLog("引擎：看门狗重拉 " + title + "（缓冲无进展）" + probeSummary(p))
-            dnsProbeAsync(nativeUrl)
+            engineLog("引擎：看门狗重拉 " + title + "（缓冲无进展）")
             // 第一次卡住：只换当前项整条重拉（换一条新连接），中途卡住的
             // 先 seek 回原位置。phase-3.1 改用 replaceMediaItem：给当前项换
             // 一份全新的媒体源，取 2.7 setMediaItem 整条重装的救法语义（那
@@ -1060,7 +1055,7 @@ class KeepAliveService : Service() {
             // 第二次仍卡：停掉播放器（网页重试须走整条装载，别在坏连接上复用），
             // 发 error 同步交网页的重试/换源降级链处理
             watchdogStall = 0
-            engineLog("引擎：看门狗停机 " + title + "（缓冲无进展，错误已交网页）" + probeSummary(p))
+            engineLog("引擎：看门狗停机 " + title + "（缓冲无进展，错误已交网页）")
             try {
                 p.stop()
             } catch (_: Exception) {
@@ -1292,185 +1287,8 @@ class KeepAliveService : Service() {
         if (sleepStop) fireBrainSleepStop()
     }
 
-    // 3.27.0 播放探针：记当前曲实际下到的字节数与末次播放错误，看门狗
-    // 重拉/停机时一并打进日志——治「缓冲无进展」在日志里毫无踪影的盲区
-    // （2026-11-09 念心全场静默卡死：没报错也没失败，无从判通道还是断供）
-    @Volatile
-    private var probeBytes = 0L
-
-    @Volatile
-    private var probeLastError = ""
-
-    @Volatile
-    private var probeHost = ""
-    private val probeTransfer = object : TransferListener {
-        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {}
-        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-            if (isNetwork) {
-                try {
-                    probeHost = dataSpec.uri.host ?: ""
-                } catch (_: Exception) {
-                }
-            }
-        }
-
-        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-            if (isNetwork) probeBytes += bytesTransferred.toLong()
-        }
-
-        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {}
-    }
-
-    // 3.28.0 解析探针：看门狗触发时后台解析当前媒体域名，把地址列表与
-    // 耗时打进日志——若 Chromium 通道下仍卡死，一眼能看到系统解析给了
-    // 什么地址（与 Cronet 自带解析对照）
-    @Volatile
-    private var dnsProbeBusy = false
-
-    private fun dnsProbeAsync(rawUrl: String) {
-        if (dnsProbeBusy) return
-        val host = try {
-            URL(rawUrl).host ?: ""
-        } catch (_: Exception) {
-            ""
-        }
-        if (host.isEmpty()) return
-        dnsProbeBusy = true
-        Thread {
-            val t0 = SystemClock.elapsedRealtime()
-            try {
-                val addrs = java.net.InetAddress.getAllByName(host)
-                val dt = SystemClock.elapsedRealtime() - t0
-                engineLog(
-                    "引擎：解析探针 " + host + " → " +
-                        addrs.joinToString(", ") { it.hostAddress ?: "?" } +
-                        "（" + dt + "ms）"
-                )
-            } catch (e: Exception) {
-                val dt = SystemClock.elapsedRealtime() - t0
-                engineLog("引擎：解析探针 " + host + " 失败 " + e.javaClass.simpleName + "（" + dt + "ms）")
-            } finally {
-                dnsProbeBusy = false
-            }
-        }.start()
-    }
-
-    // 3.29.0 重定向跟随账：同一首歌内 3xx 手动跟随的跳数（换歌/出声清零）
-    private var redirectKey = ""
-    private var redirectHops = 0
-    // 3.31.0 网页探针已派发的歌（每首一次，避免反复打扰页面）
-    private var redirectProbeKey = ""
-
-    /**
-     * 3.30.0：3xx 错误的响应转储——全部响应头（名=值截断）+ 响应体长度、
-     * 头 12 字节十六进制与可打印预览。区分「裸 302」到底是什么：体带
-     * ID3/fLaC/FFFB 魔数 = 状态行造假、正文就是音频；体为空 = 纯空壳
-     * （UA 分待遇坐实方向）；体里藏 URL/HTML = 按内容再跟随。
-     */
-    private fun httpErrorDump(error: PlaybackException): String {
-        var c: Throwable? = error
-        while (c != null) {
-            if (c is HttpDataSource.InvalidResponseCodeException) {
-                val sb = StringBuilder()
-                sb.append("头[")
-                var first = true
-                for ((k, v) in c.headerFields) {
-                    if (!first) sb.append("; ")
-                    first = false
-                    sb.append(k).append("=").append(v.joinToString(",").take(80))
-                    if (sb.length > 400) break
-                }
-                sb.append("]")
-                val body = c.responseBody
-                sb.append(" 体长=").append(body.size)
-                if (body.isNotEmpty()) {
-                    sb.append(" 体首=")
-                    for (i in 0 until minOf(12, body.size)) {
-                        sb.append("%02X".format(body[i]))
-                    }
-                    val txt = String(body, 0, minOf(80, body.size), Charsets.UTF_8)
-                        .map { ch -> if (ch.code in 32..126) ch else '·' }
-                        .joinToString("")
-                    sb.append(" 体文=\"").append(txt).append("\"")
-                }
-                return sb.toString()
-            }
-            c = c.cause
-        }
-        return ""
-    }
-
-    /** 从播放错误里挖 3xx 响应的 Location 头（顺 cause 链找 InvalidResponseCodeException）。 */
-    private fun redirectLocationOf(error: PlaybackException): String? {
-        var c: Throwable? = error
-        while (c != null) {
-            if (c is HttpDataSource.InvalidResponseCodeException) {
-                for ((k, v) in c.headerFields) {
-                    if (k.equals("Location", ignoreCase = true)) {
-                        return v.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
-                    }
-                }
-                return null
-            }
-            c = c.cause
-        }
-        return null
-    }
-
-    /**
-     * 3.31.0：派网页侧重定向探针——注入 JS 对 [url] 做两件事：
-     * fetch(redirect:follow, Range 0-0, 带 cookie) 报最终状态/落点/类型；
-     * 静音 <audio> 试播报 canplay/error 与 currentSrc。结果经
-     * BaoBus.postRedirectProbe 回传、ACTION_REDIRECT_PROBE 落日志。
-     */
-    private fun dispatchWebRedirectProbe(url: String) {
-        val inst = MainActivity.instance ?: return
-        val jsBody = """
-var out={u:url};var pending=2;var sent=false;
-function send(){if(sent)return;sent=true;try{BaoBus.postRedirectProbe(JSON.stringify(out))}catch(e){}}
-function fin(){pending--;if(pending<=0)send()}
-setTimeout(send,14000);
-try{
-var ctl=new AbortController();setTimeout(function(){try{ctl.abort()}catch(e){}},12000);
-fetch(url,{redirect:"follow",credentials:"include",headers:{"Range":"bytes=0-0"},signal:ctl.signal}).then(function(r){out.f={s:r.status,u:r.url,ct:r.headers.get("content-type")};fin()}).catch(function(e){out.f={err:String(e).slice(0,60)};fin()});
-}catch(e){out.f={err:String(e).slice(0,60)};fin()}
-try{
-var a=document.createElement("audio");a.muted=true;a.preload="auto";var dn=false;
-function afin(r){if(dn)return;dn=true;clearTimeout(to);out.a={r:r,src:a.currentSrc};try{a.pause();a.removeAttribute("src");a.load()}catch(e){}fin()}
-var to=setTimeout(function(){afin("timeout")},7000);
-a.addEventListener("canplay",function(){afin("canplay")});
-a.addEventListener("error",function(){afin("error")});
-a.src=url;
-}catch(e){out.a={err:String(e).slice(0,60)};fin()}
-"""
-        val js = "(function(){var url=" + JSONObject.quote(url) + ";\n" + jsBody + "})()"
-        try {
-            inst.runJsOnPage(js)
-            val host = try {
-                java.net.URI(url).host ?: ""
-            } catch (_: Exception) {
-                ""
-            }
-            engineLog("引擎：已派网页探针 " + host)
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun probeSummary(p: ExoPlayer): String {
-        val pos = try {
-            p.bufferedPosition
-        } catch (_: Exception) {
-            -1L
-        }
-        return "探针：已下 " + probeBytes + " 字节@" + probeHost +
-            " 缓冲位 " + pos + "ms" +
-            if (probeLastError.isNotEmpty()) " 末次错误 " + probeLastError else " 无加载错误"
-    }
-
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-            probeBytes = 0L
-            probeLastError = ""
             // phase-3：播放列表原生接播在这里记账（服务自发 seek 接播同理）
             handlePlaylistTransition(mediaItem, reason)
         }
@@ -1485,9 +1303,6 @@ a.src=url;
             playing = isPlaying
             if (isPlaying) {
                 errSkipCount = 0
-                // 3.29.0：真出声了，重定向跳数清零
-                redirectKey = ""
-                redirectHops = 0
                 // 3.18.0：回链候选真正出声才记「回链成功」并收工关会话
                 // （3.17.0 记在拿到新址时——《半壶纱》那种拿到址没出声
                 // 又死的也被记成成功，日后数自救占比会虚高）；别的歌
@@ -1573,19 +1388,13 @@ a.src=url;
             // 顺着 cause 链找 HTTP 状态码，网页垫片打日志/判失败要用
             var httpCode = 0
             var c: Throwable? = error
-            var deepest: Throwable = error
             while (c != null) {
-                deepest = c
                 if (c is HttpDataSource.InvalidResponseCodeException) {
                     httpCode = c.responseCode
                     break
                 }
                 c = c.cause
             }
-            // 3.27.0 探针留痕：末次错误摘要（看门狗日志引用）
-            probeLastError = "err=" + error.errorCode + " http=" + httpCode + " " +
-                deepest.javaClass.simpleName + ": " +
-                (deepest.message ?: "").take(80)
             pushSync(
                 JSONObject()
                     .put("t", "error")
@@ -1642,61 +1451,6 @@ a.src=url;
                             (if (httpCode > 0) " http=" + httpCode else "") +
                             (if (host.isNotEmpty()) " host=" + host else "")
                     )
-                }
-                // 3.29.0：3xx 带 Location 是服务器让改道（念心 wy.php
-                // 对网易歌回的 302 即如此）——Cronet 数据源对最终落点
-                // 仍是 3xx 的响应不跟随、原样当错误抛上来。脑内手动
-                // 跟随：同歌换到 Location 重播，不作废原址、不进回链；
-                // 上限 3 跳，无 Location/超限照旧走下面的报错处理
-                if (p != null && httpCode in 300..399 && curKey.isNotEmpty()) {
-                    val loc0 = redirectLocationOf(error)
-                    val loc = loc0?.let {
-                        if (it.startsWith("http", ignoreCase = true)) it
-                        else try {
-                            java.net.URI(nativeUrl).resolve(it).toString()
-                        } catch (_: Exception) {
-                            it
-                        }
-                    }
-                    if (curKey != redirectKey) {
-                        redirectKey = curKey
-                        redirectHops = 0
-                    }
-                    engineLog(
-                        "引擎：重定向 " + title + " http=" + httpCode + " → " +
-                            (loc?.let {
-                                try {
-                                    java.net.URI(it).host ?: it.take(60)
-                                } catch (_: Exception) {
-                                    it.take(60)
-                                }
-                            } ?: "（无 Location）") +
-                            (if (loc == null) " " + httpErrorDump(error) else "")
-                    )
-                    if (loc == null && curKey != redirectProbeKey) {
-                        // 3.31.0：裸 302（Location 为空）时派网页侧探针：
-                        // 让 WebView 对同一 URL 做 fetch 跟随 + 静音 audio
-                        // 试播——浏览器能播而播放器不能，就当场 A/B 出
-                        // 差异在请求上下文还是在服务端间歇性
-                        redirectProbeKey = curKey
-                        dispatchWebRedirectProbe(nativeUrl)
-                    }
-                    if (loc != null && redirectHops < 3 && loc != nativeUrl) {
-                        redirectHops++
-                        try {
-                            val idx = p.currentMediaItemIndex
-                            val mid = p.getMediaItemAt(idx).mediaId.ifEmpty { curKey }
-                            p.replaceMediaItem(
-                                idx,
-                                MediaItem.Builder().setUri(loc).setMediaId(mid).build()
-                            )
-                            nativeUrl = loc
-                            if (p.playbackState == Player.STATE_IDLE) p.prepare()
-                            p.play()
-                        } catch (_: Exception) {
-                        }
-                        return
-                    }
                 }
                 // 报错即救——死址作废、原歌钻回解析链重走（报错
                 // 回链）；3.18.0 起一次发动内部续走：换上的址没出声
@@ -2156,65 +1910,28 @@ a.src=url;
 
     private fun ensurePlayer(): ExoPlayer {
         player?.let { return it }
-        // 3.30.0：播放 UA 从 WebView 默认串换成完整 Chrome 串（与下载/
-        // 脚本请求同款）——念心 wy.php 对网易歌回「无 Location 的裸
-        // 302」，疑似按 UA 分待遇（浏览器拿真跳转、播放器 UA 拿空壳）；
-        // 换串后若直接出声即坐实，若仍 302 看错误转储判响应体
-        val ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-        // 3.28.0：播放通道换 Chromium 网络栈（Cronet 内嵌版）——与落雪
-        // （Electron/Chromium）、上游（WebView 播）对齐：自带解析器 + 双栈
-        // 快速回退，不再让安卓 HttpURLConnection 的解析/选址把整首歌无声
-        // 挂死（2026-11-09 念心探针实锤：30 秒 0 字节、传输从未开始、无
-        // 任何错误）。Cronet 建不起来时回落原 HttpURLConnection 通道。
-        // 请求头仍模拟网页 <audio> 直连时的样子（UA/Referer 沿用）。
-        val upstreamFactory: DataSource.Factory = try {
-            val engine = org.chromium.net.CronetEngine.Builder(this)
-                .enableHttp2(true)
-                .enableQuic(true)
-                .build()
-            engineLog(
-                "引擎：播放通道 Cronet（Chromium）就绪 " +
-                    try {
-                        engine.versionString
-                    } catch (_: Exception) {
-                        ""
-                    }
-            )
-            androidx.media3.datasource.cronet.CronetDataSource.Factory(
-                engine,
-                java.util.concurrent.Executors.newCachedThreadPool()
-            )
-                .setUserAgent(ua)
-                .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
-        } catch (e: Exception) {
-            engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + e.javaClass.simpleName + "）")
-            DefaultHttpDataSource.Factory()
-                .setUserAgent(ua)
-                .setAllowCrossProtocolRedirects(true)
-                .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
-                .setConnectTimeoutMs(15000)
-                .setReadTimeoutMs(20000)
+        val ua = try {
+            android.webkit.WebSettings.getDefaultUserAgent(this)
+        } catch (_: Exception) {
+            "Mozilla/5.0 (Linux; Android)"
         }
+        // 请求头尽量模拟网页 <audio> 直连时的样子，降低 CDN 因 UA/Referer 拦截的概率
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent(ua)
+            .setAllowCrossProtocolRedirects(true)
+            .setDefaultRequestProperties(mapOf("Referer" to "https://m.858600.xyz/"))
+            .setConnectTimeoutMs(15000)
+            .setReadTimeoutMs(20000)
         val attrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
         // 数据源必须按协议分发：DefaultDataSource 认 file:// 等本地协议，
-        // http(s) 才走上面的上游工厂。此前直接把 http 工厂设给媒体源工厂，
-        // file:// 被当场拒收——
+        // http(s) 才走上面的 httpFactory（UA/Referer/超时全不变）。此前直接把
+        // httpFactory 设给媒体源工厂，file:// 被 HttpDataSource 当场拒收——
         // 3.9.0 原生下载的本地文件就是这样播不了的（2026-11-05 美人鱼抓现行）
-        val rawDataSourceFactory =
-            androidx.media3.datasource.DefaultDataSource.Factory(this, upstreamFactory)
-        // 3.27.0：探针挂在数据源上数实际下到的字节
-        val dataSourceFactory = DataSource.Factory {
-            val ds = rawDataSourceFactory.createDataSource()
-            try {
-                ds.addTransferListener(probeTransfer)
-            } catch (_: Exception) {
-            }
-            ds
-        }
+        val dataSourceFactory =
+            androidx.media3.datasource.DefaultDataSource.Factory(this, httpFactory)
         val p = ExoPlayer.Builder(this)
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(this).setDataSourceFactory(dataSourceFactory)
@@ -2788,11 +2505,6 @@ a.src=url;
                     lxEngine().configure(configSources.filter { it.isScript() })
                     engineLog("引擎：已接收音源配置 " + configSources.size + " 个源")
                 }
-            }
-            ACTION_REDIRECT_PROBE -> {
-                // 3.31.0 诊断：网页侧探针结果（fetch 跟随 + 静音 audio 试播）
-                val s = intent.getStringExtra("json").orEmpty()
-                if (s.isNotEmpty()) engineLog("引擎：网页探针 " + s.take(400))
             }
             // ACTION_QUEUE_AHEAD 已退役（单脑第 3 步）：队列真相只走快照
             // ACTION_CURRENT_SONG 已退役（单脑第 3 步）：当前曲档案在快照队列里
