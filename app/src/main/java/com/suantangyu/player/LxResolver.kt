@@ -29,7 +29,7 @@ object LxResolver {
         fun isScript(): Boolean = script.length >= 30
     }
 
-    private class R(val url: String, val lx: Boolean)
+    private class R(val url: String, val lx: Boolean, val construct: Boolean = false)
 
     fun parseSources(configJson: String): List<SrcCfg> {
         val out = ArrayList<SrcCfg>()
@@ -372,6 +372,22 @@ object LxResolver {
                 ScriptSeg.note("引擎：死址重现，作废继续")
                 continue
             }
+            if (r.construct) {
+                // 3.35.0 预验：已验死缓存命中、或探针确认空 302 → 当这个
+                // 源在本档没答，继续走链；不冷却——源没错，是这一档
+                // 没货（同「没有这首歌」不凉的规矩）
+                if (deadConstructUrls.contains(r.url)) {
+                    ScriptSeg.note("引擎：构造址已验死，跳过 " + src.name)
+                    continue
+                }
+                val chk = constructDeadCheck
+                if (chk != null && chk(r.url)) {
+                    deadConstructUrls.add(r.url)
+                    log("引擎：预验作废 " + src.name + "（" + q + " 档空 302、该档无货）→ 继续走链")
+                    ScriptSeg.note("引擎：预验作废 " + src.name + " " + q + " 档（空 302）")
+                    continue
+                }
+            }
             if (r.lx) return r.url
             val det = detectQualityFromUrl(r.url)
             if (det == null || qualityMeets(det, q)) return r.url
@@ -403,6 +419,18 @@ object LxResolver {
         }
         log("引擎：源冷却 " + src.name + " 平台 " + plat + "（3 分钟）")
     }
+
+    // 3.35.0 构造源预验：构造型源（念心/淡月疏星）拼址永不失败，链在
+    // 所选档「成功」停步，空档（母带缺货回空 302）要到播放才暴露、只能
+    // 靠报错回链事后降档。预验钩子由服务注入（走 Cronet 单例引擎发只
+    // 取头的请求）：只有确认空 302 才判死、链当场继续走（下一源→QQ
+    // 兜底→下一档）；超时/无回音/其它状态一律放行。判死地址会话内
+    // 缓存、不重复探。钩子未注入时行为与旧版一致。
+    @Volatile
+    var constructDeadCheck: ((String) -> Boolean)? = null
+
+    private val deadConstructUrls =
+        java.util.Collections.synchronizedSet(HashSet<String>())
 
     /** QQ 兜底搜索：歌名+歌手搜 QQ，取首个可建描述符的结果 */
     private fun searchQqAltDesc(song: JSONObject): JSONObject? {
@@ -523,7 +551,7 @@ object LxResolver {
             val cqUrl = "https://yinyue.haitangw.net" + cqPath +
                 "?type=mp3&id=" + enc(cqId) + "&level=" + enc(cqLevel)
             val cqQ = apiLevelToPlayQ(cqLevel) ?: (if (q == "master") "master" else q)
-            return R(tagPlayUrl(cqUrl, cqQ) ?: cqUrl, false)
+            return R(tagPlayUrl(cqUrl, cqQ) ?: cqUrl, false, construct = true)
         }
 
         // —— 雾隐青山：POST /v1/music/resolve-url，level 链最多试 4 档 ——
@@ -652,7 +680,7 @@ object LxResolver {
             val nxQ = apiLevelToPlayQ(level) ?: when (level) {
                 "master" -> "master"; "hires" -> "hires"; "lossless" -> "flac"; else -> null
             }
-            return R(nxQ?.let { tagPlayUrl(nxPlayUrl, it) } ?: nxPlayUrl, false)
+            return R(nxQ?.let { tagPlayUrl(nxPlayUrl, it) } ?: nxPlayUrl, false, construct = true)
         }
 
         // —— 通用 API 源：常见路径形态挨个试（最多 4 个） ——

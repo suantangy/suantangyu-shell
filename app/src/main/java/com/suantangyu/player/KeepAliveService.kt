@@ -1911,6 +1911,92 @@ class KeepAliveService : Service() {
         }
     }
 
+    // 3.35.0 构造址预验探针：走生产 Cronet 单例，只问一件事——这条构造
+    // 址是不是空 302（3xx 且无 Location，即「该档无货」，2026-11-09 矩阵
+    // 实证）。302 带 Location＝有货（跳转即交付）；2xx＝有货；超时/失败/
+    // 4xx/5xx＝不知道，一律放行（坏相位不误杀）。请求头与正片一致。
+    private val constructProbeExec = java.util.concurrent.Executors.newCachedThreadPool()
+
+    private fun probeConstructDead(url: String): Boolean {
+        val engine = obtainCronetEngine() ?: return false
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val dead = java.util.concurrent.atomic.AtomicBoolean(false)
+        var req: org.chromium.net.UrlRequest? = null
+        val cb =
+            object : org.chromium.net.UrlRequest.Callback() {
+                override fun onRedirectReceived(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo,
+                    newLocationUrl: String
+                ) {
+                    dead.set(newLocationUrl.isEmpty())
+                    latch.countDown()
+                    request.cancel()
+                }
+
+                override fun onResponseStarted(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo
+                ) {
+                    // 走到这里的 3xx 必然没有可跟随的 Location（有的话先进
+                    // onRedirectReceived），即空跳转；2xx/4xx/5xx 都放行
+                    dead.set(info.httpStatusCode in 300..399)
+                    latch.countDown()
+                    request.cancel()
+                }
+
+                override fun onReadCompleted(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo,
+                    byteBuffer: java.nio.ByteBuffer
+                ) {
+                    latch.countDown()
+                    request.cancel()
+                }
+
+                override fun onSucceeded(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo
+                ) {
+                    latch.countDown()
+                }
+
+                override fun onFailed(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo?,
+                    error: org.chromium.net.CronetException
+                ) {
+                    latch.countDown()
+                }
+
+                override fun onCanceled(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo?
+                ) {
+                    latch.countDown()
+                }
+            }
+        return try {
+            req =
+                engine.newUrlRequestBuilder(url, cb, constructProbeExec)
+                    .addHeader("User-Agent", shellUserAgent())
+                    .addHeader("Referer", "https://m.858600.xyz/")
+                    .addHeader("Range", "bytes=0-0")
+                    .addHeader("Accept", "*/*")
+                    .disableCache()
+                    .build()
+            req?.start()
+            if (!latch.await(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                try { req?.cancel() } catch (_: Exception) {}
+                false
+            } else {
+                dead.get()
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     // ===== 3.34.0 探针矩阵（一次性取证） =====
     // 背景：3.33 通道换 Cronet 后，app 播念心网易仍多拿空 302、最终落 QQ，
     // 而同机浏览器网页端同址整天直出流——服务端在按请求形态分人。嫌疑三项：
@@ -2538,6 +2624,8 @@ class KeepAliveService : Service() {
         createChannel()
         ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
         restoreBrainState()
+        // 3.35.0：给解析器装构造址预验钩子（实现见 obtainCronetEngine 旁）
+        LxResolver.constructDeadCheck = { url -> probeConstructDead(url) }
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
