@@ -317,54 +317,32 @@ object LxResolver {
         val deadline = System.currentTimeMillis() + budgetMs
         val tiers = if (autoDown) qualityFallbacks(wantQ) else listOf(wantQ)
         val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
-        // 3.15.0：非 QQ 曲的 QQ 兜底（网页版顺序）——每档同平台全灭后
-        // 在同一档问一次 QQ；整首只搜一次，搜到的 QQ 版描述符各档复用
-        var qqAlt: JSONObject? = null
-        var qqAltTried = false
-        fun qqAltOnce(): JSONObject? {
-            if (!qqAltTried) {
-                qqAltTried = true
-                qqAlt = searchQqAltDesc(song)
-            }
-            return qqAlt
-        }
-        // 3.36.0：某档同平台失败若带「构造判死」，那是档缺货、不是平台
-        // 没这首歌——本档 QQ 兜底让路给降档，本平台各档问完仍无果才
-        // 统一兜底（3.35 实测：母带判死后同档 QQ 抢在网易 Hi-Res 前
-        // 命中，歌在低档有真原曲却垫了 QQ 版）
-        var qqDeferred = false
+        // 3.37.0：QQ 兜底垫底（cheng 2026-11-10 定调：「既然选择某个
+        // 平台听歌，不管单脚本或者多脚本，就要先接受那个平台降档，
+        // 最后才到 QQ 平台」）——本平台各档先按序问完，全灭才搜一次
+        // QQ 版、按档走一遍；降档不数档数、128k 封底（旧规矩保留）。
+        // 3.15 的每档交替与 3.36 的构造判死例外至此并成这一条：高档
+        // 缺货时同档 QQ 抢在低档真原曲前命中的路，从结构上断掉
         for (q in tiers) {
             if (System.currentTimeMillis() > deadline) {
                 log("引擎：单曲解析超时跳过 " + song.optString("name"))
                 ScriptSeg.note("引擎：单曲解析超时跳过 " + song.optString("name"))
                 return null
             }
-            val r1 = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls)
-            if (r1.url != null) return Prov(r1.url, false)
-            if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
-                if (r1.constructDeath) {
-                    qqDeferred = true
-                } else {
-                    val alt = qqAltOnce()
-                    if (alt != null) {
-                        val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls)
-                        if (u2.url != null) {
-                            log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
-                            return Prov(u2.url, true)
-                        }
-                    }
-                }
-            }
+            val url = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls)
+            if (url != null) return Prov(url, false)
         }
-        if (qqDeferred && songPlat != "qq") {
-            val alt = qqAltOnce()
+        if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
+            val alt = searchQqAltDesc(song)
             if (alt != null) {
+                log("引擎：本平台各档已尽，启用 QQ 兜底 " + song.optString("name"))
+                ScriptSeg.note("引擎：本平台各档已尽，启用 QQ 兜底 " + song.optString("name"))
                 for (q in tiers) {
                     if (System.currentTimeMillis() > deadline) break
                     val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls)
-                    if (u2.url != null) {
-                        log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "·降档后）")
-                        return Prov(u2.url, true)
+                    if (u2 != null) {
+                        log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
+                        return Prov(u2, true)
                     }
                 }
             }
@@ -380,16 +358,15 @@ object LxResolver {
         log: (String) -> Unit,
         deadline: Long = Long.MAX_VALUE,
         banUrls: Set<String> = emptySet()
-    ): AtQ {
+    ): String? {
         val mid = cleanPlayMid(song)
-        if (mid.isEmpty()) return AtQ(null, false)
+        if (mid.isEmpty()) return null
         val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
         val chain = sources.filter { s ->
             s.platforms.isEmpty() || s.platforms.contains("all") || s.platforms.contains(songPlat)
         }
-        var constructDeath = false
         for (src in chain) {
-            if (System.currentTimeMillis() > deadline) return AtQ(null, constructDeath)
+            if (System.currentTimeMillis() > deadline) return null
             if (isCooling(src, songPlat)) continue
             val t0 = System.currentTimeMillis()
             var threw = false
@@ -420,32 +397,25 @@ object LxResolver {
                 // 源在本档没答，继续走链；不冷却——源没错，是这一档
                 // 没货（同「没有这首歌」不凉的规矩）
                 if (deadConstructUrls.contains(r.url)) {
-                    constructDeath = true
                     ScriptSeg.note("引擎：构造址已验死，跳过 " + src.name)
                     continue
                 }
                 val chk = constructDeadCheck
                 if (chk != null && chk(r.url)) {
-                    constructDeath = true
                     deadConstructUrls.add(r.url)
                     log("引擎：预验作废 " + src.name + "（" + q + " 档空 302、该档无货）→ 继续走链")
                     ScriptSeg.note("引擎：预验作废 " + src.name + " " + q + " 档（空 302）")
                     continue
                 }
             }
-            if (r.lx) return AtQ(r.url, constructDeath)
+            if (r.lx) return r.url
             val det = detectQualityFromUrl(r.url)
-            if (det == null || qualityMeets(det, q)) return AtQ(r.url, constructDeath)
+            if (det == null || qualityMeets(det, q)) return r.url
             // 3.15.0 对齐网页：音质不达标只毙这个源、继续问下一个源；
             // 旧行为整档判败，会让排第一的源一个低音质址带死整档
         }
-        return AtQ(null, constructDeath)
+        return null
     }
-
-    /** resolveAtQuality 的回执：url 为本档同平台结果（null=没拿到）；
-     * constructDeath=本档有构造址被预验判死（档缺货信号，3.36.0 起
-     * 主链据此让同档 QQ 兜底给降档让路） */
-    private class AtQ(val url: String?, val constructDeath: Boolean)
 
     // ---------- 3.15.0：源×平台冷却 + QQ 兜底搜索 ----------
 

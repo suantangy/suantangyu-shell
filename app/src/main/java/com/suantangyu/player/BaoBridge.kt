@@ -157,16 +157,6 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
-    /** 3.34.0 探针：网页端 fetch 对照结果回报（服务记入引擎日志） */
-    @JavascriptInterface
-    fun probeReport(json: String) {
-        val intent = Intent(activity, KeepAliveService::class.java).apply {
-            action = KeepAliveService.ACTION_PROBE_REPORT
-            putExtra("json", json)
-        }
-        activity.startService(intent)
-    }
-
     /** 播放进度（毫秒），网页每秒上报一次，服务只更新会话状态不重发通知 */
     @JavascriptInterface
     fun postProgress(positionMs: Long, durationMs: Long) {
