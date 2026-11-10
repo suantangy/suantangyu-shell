@@ -296,6 +296,9 @@ class KeepAliveService : Service() {
     private var pipeParkLastTryMs: Long = 0L
     private var pipeParkWaitLoggedMin = 0
     private var pipeProbeBusy = false
+    // 3.39.0 自纠出口：探针轮数与停车来源（参照歌翻案要用）
+    private var pipeParkProbeCount = 0
+    private var pipeParkCause = ""
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -1660,6 +1663,8 @@ class KeepAliveService : Service() {
         pipeParkKey = ""
         pipeParkTitle = ""
         pipeParkFromStart = false
+        pipeParkProbeCount = 0
+        pipeParkCause = ""
         pipeParkSinceMs = 0L
         pipeParkLastTryMs = 0L
         pipeParkWaitLoggedMin = 0
@@ -1677,12 +1682,14 @@ class KeepAliveService : Service() {
 
     /** 进解析停车场：记账＋留痕＋通知页面（pipark 不是失败回执，
      * 页面不走老路，只显示状态等 advanced） */
-    private fun enterPipePark(key: String, title: String, fromStart: Boolean) {
+    private fun enterPipePark(key: String, title: String, cause: String) {
         if (key.isEmpty()) return
         val now = SystemClock.elapsedRealtime()
         pipeParkKey = key
         pipeParkTitle = title.ifEmpty { brainNameOf(key) }
-        pipeParkFromStart = fromStart
+        pipeParkFromStart = cause == "start"
+        pipeParkCause = cause
+        pipeParkProbeCount = 0
         pipeParkSinceMs = now
         // 首次重探在进场后约 30 秒：lastTry 回拨，看门狗按 60 秒
         // 间隔判定时首探落在 +30 秒，其后以探针起点计每 60 秒一次
@@ -1698,7 +1705,12 @@ class KeepAliveService : Service() {
     /** 解析停车场重探：整条链重走一次（探的是整条管线，不是单
      * 条腿——单腿活不等于这首歌有救），拿到地址即原地起播收场；
      * 仍走空就继续停，探空不逐条记日志（进场行与每 10 分钟等待
-     * 行已够对账，重探自身的解析段照常进脚本日志渠道） */
+     * 行已够对账，重探自身的解析段照常进脚本日志渠道）。
+     * 3.39.0 自纠出口：第 2 轮起同轮顺带探一首参照歌（目标的下
+     * 一首）——参照出地址而目标仍空 = 管线无恙、独这首无货（冤
+     * 案），撤销定罪、跳过此歌续播；参照也空 = 定罪维持。翻案
+     * 只凭阳性证据（参照真出货），真故障时参照同样出不来，不
+     * 会误触发 */
     private fun probePipePark() {
         val key = pipeParkKey
         if (key.isEmpty() || pipeProbeBusy) return
@@ -1707,7 +1719,27 @@ class KeepAliveService : Service() {
         if (desc == null || configSources.isEmpty()) return
         pipeProbeBusy = true
         pipeParkLastTryMs = SystemClock.elapsedRealtime()
+        pipeParkProbeCount++
+        // 参照歌：按现行模式算出的目标下一首；与目标同首（单曲
+        // 循环/独苗队列）等于没有参照，本轮只探目标
+        var refKey = ""
+        var refDesc: org.json.JSONObject? = null
+        if (pipeParkProbeCount >= 2) {
+            val savedCur = brainCurKey
+            brainCurKey = key
+            val nk = computeBrainNextKey(true)
+            brainCurKey = savedCur
+            if (nk != null && nk != key) {
+                val ri = brainQueueKeys.indexOf(nk)
+                if (ri >= 0) {
+                    refKey = nk
+                    refDesc = brainQueue[ri]
+                }
+            }
+        }
         val gen = brainOpGen
+        val rk = refKey
+        val rd = refDesc
         resolveExec.execute {
             val url = try {
                 LxResolver.resolve(
@@ -1716,6 +1748,18 @@ class KeepAliveService : Service() {
                 ) { m -> engineLog(m) }
             } catch (_: Exception) {
                 null
+            }
+            // 目标探到了就不用参照；仍空且本轮有参照，才探参照
+            var refUrl: String? = null
+            if (url.isNullOrEmpty() && rd != null) {
+                refUrl = try {
+                    LxResolver.resolve(
+                        rd, configSources, configQuality,
+                        configAutoDown, lxEngine()
+                    ) { m -> engineLog(m) }
+                } catch (_: Exception) {
+                    null
+                }
             }
             tickHandler.post {
                 pipeProbeBusy = false
@@ -1734,7 +1778,55 @@ class KeepAliveService : Service() {
                         false, true
                     )
                     applyAdvance(item, playIt = true)
+                } else if (rd != null && !refUrl.isNullOrEmpty()) {
+                    // 翻案：同轮参照当场出货、目标独空——管线无恙，
+                    // 死的只是这首。撤销定罪，跳过它往下续播
+                    val t2 = desc.optString("name")
+                    val rt = rd.optString("name")
+                    engineLog(
+                        "引擎：撤销定罪 " + t2 + "（管线无恙：参照 " +
+                            rt + " 可解析，是这首无货）→ 跳过此歌"
+                    )
+                    val cause0 = pipeParkCause
+                    // 下一首按撤销时刻的队列现算；与探针选的参照
+                    // 一致就直接用探到的地址起播，不浪费这一探
+                    val savedCur2 = brainCurKey
+                    brainCurKey = key
+                    val nk2 = computeBrainNextKey(true)
+                    brainCurKey = savedCur2
+                    when {
+                        nk2 != null && nk2 == rk -> {
+                            if (key == brainStartKey) brainStartKey = ""
+                            clearPipePark()
+                            val item = ArmedItem(
+                                refUrl!!, rk,
+                                rt, rd.optString("artist"),
+                                rd.optString("cover")
+                                    .ifEmpty { rd.optString("img") },
+                                false, true
+                            )
+                            applyAdvance(item, playIt = true)
+                        }
+                        nk2 != null && nk2 != key -> {
+                            clearPipePark()
+                            if (cause0 == "start") {
+                                // 点播来源：走正规起播入口，终点账
+                                // （brainStartKey/失败回执）才对得上
+                                brainPlayKey(nk2)
+                            } else {
+                                executeBrainAdvance(nk2, cause0, 0)
+                            }
+                        }
+                        cause0 == "start" -> {
+                            // 无处可跳（队列只剩这首）：停车解除，
+                            // 点播给终点回执，页面照旧提示
+                            clearPipePark()
+                            failBrainStart(t2)
+                        }
+                        else -> clearPipePark()
+                    }
                 }
+                // 目标空、参照空或无参照：定罪维持，继续停
             }
         }
     }
@@ -1750,7 +1842,7 @@ class KeepAliveService : Service() {
             closeRescueSession()
             rescueInFlight = false
             rescueSettled = true
-            enterPipePark(pk, pn, false)
+            enterPipePark(pk, pn, "ended")
         } else {
             closeRescueSession()
             rescueInFlight = false
@@ -3258,7 +3350,7 @@ class KeepAliveService : Service() {
                         targetKey,
                         desc.optString("name")
                             .ifEmpty { brainNameOf(targetKey) },
-                        cause == "start"
+                        cause
                     )
                 }
             }
