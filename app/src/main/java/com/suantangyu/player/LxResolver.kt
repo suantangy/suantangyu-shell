@@ -408,7 +408,33 @@ object LxResolver {
                     continue
                 }
             }
-            if (r.lx) return r.url
+            if (r.lx) {
+                // 3.42.0 验档：LX 脚本结果原本免音质关，答不出高档的
+                // 脚本会闷头交低档文件冒充本档成功、堵死后面源的高档
+                // 出货（2026-11-11 网易实证：酸汤鱼在母带档交 320k，
+                // 念心的 hires 永远轮不到）。只在无损及以上档验文件
+                // 本体：探针确认是有损文件才毙这一源的这一档、继续
+                // 走链；探不准一律放行。不冷却（同音质不达标规矩），
+                // 降到 320k 档时同一文件会被正当地收下。
+                val ct = canonTier(q)
+                if (ct == "master" || ct == "hires" || ct == "flac") {
+                    if (lossyLxUrls.contains(r.url)) {
+                        ScriptSeg.note("引擎：验档已验有损，跳过 " + src.name)
+                        continue
+                    }
+                    if (!okLxUrls.contains(r.url)) {
+                        val lc = lossyCheck
+                        if (lc != null && lc(r.url)) {
+                            lossyLxUrls.add(r.url)
+                            log("引擎：验档作废 " + src.name + "（" + ct + " 档交回有损文件）→ 继续走链")
+                            ScriptSeg.note("引擎：验档作废 " + src.name + " " + ct + " 档（有损文件）")
+                            continue
+                        }
+                        okLxUrls.add(r.url)
+                    }
+                }
+                return r.url
+            }
             val det = detectQualityFromUrl(r.url)
             if (det == null || qualityMeets(det, q)) return r.url
             // 3.15.0 对齐网页：音质不达标只毙这个源、继续问下一个源；
@@ -450,6 +476,20 @@ object LxResolver {
     var constructDeadCheck: ((String) -> Boolean)? = null
 
     private val deadConstructUrls =
+        java.util.Collections.synchronizedSet(HashSet<String>())
+
+    // 3.42.0 LX 验档钩子（由服务注入，走 Cronet 单例只读文件头几字
+    // 节）：返回 true 只代表「铁证有损」（MP3 的 ID3/帧同步头、m4a
+    // 的 ftyp 盒）；无损头、认不出、超时、失败一律 false 放行。判
+    // 决按地址在会话内缓存：同一地址在母带→Hi-Res→flac 逐档重问
+    // 时不重复探。钩子未注入时行为与旧版一致。
+    @Volatile
+    var lossyCheck: ((String) -> Boolean)? = null
+
+    private val lossyLxUrls =
+        java.util.Collections.synchronizedSet(HashSet<String>())
+
+    private val okLxUrls =
         java.util.Collections.synchronizedSet(HashSet<String>())
 
     /** QQ 兜底搜索：歌名+歌手搜 QQ，取首个可建描述符的结果 */

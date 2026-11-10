@@ -2319,6 +2319,127 @@ class KeepAliveService : Service() {
         }
     }
 
+    // 3.42.0 LX 验档探针：走生产 Cronet 单例，只问一件事——这条地址
+    // 的文件本体是不是铁证有损（MP3 的 ID3/帧同步头、m4a 的 ftyp
+    // 盒）。fLaC 等无损头、认不出的格式、超时/失败/非 2xx 一律「不
+    // 是铁证有损」放行（坏相位不误杀，与构造预验同一脾气）。跟随跳
+    // 转到真文件，只读开头几个字节就收工，不下整文件。
+    private fun probeLossyFile(url: String): Boolean {
+        val engine = obtainCronetEngine() ?: return false
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val lossy = java.util.concurrent.atomic.AtomicBoolean(false)
+        var req: org.chromium.net.UrlRequest? = null
+        val cb =
+            object : org.chromium.net.UrlRequest.Callback() {
+                override fun onRedirectReceived(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo,
+                    newLocationUrl: String
+                ) {
+                    try {
+                        request.followRedirect()
+                    } catch (e: Exception) {
+                        latch.countDown()
+                    }
+                }
+
+                override fun onResponseStarted(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo
+                ) {
+                    if (info.httpStatusCode !in 200..299) {
+                        latch.countDown()
+                        request.cancel()
+                        return
+                    }
+                    try {
+                        request.read(java.nio.ByteBuffer.allocateDirect(1024))
+                    } catch (e: Exception) {
+                        latch.countDown()
+                    }
+                }
+
+                override fun onReadCompleted(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo,
+                    byteBuffer: java.nio.ByteBuffer
+                ) {
+                    try {
+                        byteBuffer.flip()
+                        val n = minOf(byteBuffer.remaining(), 16)
+                        if (n >= 4) {
+                            val b = ByteArray(n)
+                            byteBuffer.get(b)
+                            lossy.set(isProvenLossyHead(b))
+                        }
+                    } catch (_: Exception) {
+                    }
+                    latch.countDown()
+                    request.cancel()
+                }
+
+                override fun onSucceeded(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo
+                ) {
+                    latch.countDown()
+                }
+
+                override fun onFailed(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo?,
+                    error: org.chromium.net.CronetException
+                ) {
+                    latch.countDown()
+                }
+
+                override fun onCanceled(
+                    request: org.chromium.net.UrlRequest,
+                    info: org.chromium.net.UrlResponseInfo?
+                ) {
+                    latch.countDown()
+                }
+            }
+        return try {
+            req =
+                engine.newUrlRequestBuilder(url, cb, constructProbeExec)
+                    .addHeader("User-Agent", shellUserAgent())
+                    .addHeader("Referer", "https://m.858600.xyz/")
+                    .addHeader("Range", "bytes=0-1023")
+                    .addHeader("Accept", "*/*")
+                    .disableCache()
+                    .build()
+            req?.start()
+            if (!latch.await(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                try { req?.cancel() } catch (_: Exception) {}
+                false
+            } else {
+                lossy.get()
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // 文件头铁证判定：只认「绝不可能是无损」的开头，其余一律不算。
+    // MP3=ID3 标签或帧同步头（0xFF + 高 3 位全 1，含 ADTS AAC）；
+    // m4a/MP4 容器=第 5 字节起的 ftyp 盒（此生态里装的都是 AAC）。
+    private fun isProvenLossyHead(b: ByteArray): Boolean {
+        fun at(i: Int): Int = b[i].toInt() and 0xFF
+        fun str(i: Int, s: String): Boolean {
+            if (b.size < i + s.length) return false
+            for (j in s.indices) {
+                if (b[i + j] != s[j].code.toByte()) return false
+            }
+            return true
+        }
+        if (str(0, "fLaC")) return false
+        if (str(0, "ID3")) return true
+        if (b.size >= 8 && str(4, "ftyp")) return true
+        if (b.size >= 2 && at(0) == 0xFF && (at(1) and 0xE0) == 0xE0) return true
+        return false
+    }
+
     // ===== 3.34.0 探针矩阵（一次性取证） =====
     // 背景：3.33 通道换 Cronet 后，app 播念心网易仍多拿空 302、最终落 QQ，
     // 而同机浏览器网页端同址整天直出流——服务端在按请求形态分人。嫌疑三项：
@@ -2685,6 +2806,8 @@ class KeepAliveService : Service() {
         restoreBrainState()
         // 3.35.0：给解析器装构造址预验钩子（实现见 obtainCronetEngine 旁）
         LxResolver.constructDeadCheck = { url -> probeConstructDead(url) }
+        // 3.42.0：给解析器装 LX 验档钩子（实现见 obtainCronetEngine 旁）
+        LxResolver.lossyCheck = { url -> probeLossyFile(url) }
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
