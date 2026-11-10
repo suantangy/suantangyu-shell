@@ -299,6 +299,7 @@ class KeepAliveService : Service() {
     // 3.39.0 自纠出口：探针轮数与停车来源（参照歌翻案要用）
     private var pipeParkProbeCount = 0
     private var pipeParkCause = ""
+    private var pipeParkRefUsedKey = ""
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -994,17 +995,24 @@ class KeepAliveService : Service() {
                 voidPipePark()
             } else {
                 val nowP = SystemClock.elapsedRealtime()
-                val waitedBucketP =
-                    ((nowP - pipeParkSinceMs) / 600_000L).toInt()
-                if (waitedBucketP > pipeParkWaitLoggedMin) {
-                    pipeParkWaitLoggedMin = waitedBucketP
-                    engineLog(
-                        "引擎：仍在等管线恢复 " + pipeParkTitle +
-                            "（已等 " + (waitedBucketP * 10) + " 分钟）"
-                    )
-                }
-                if (nowP - pipeParkLastTryMs >= 60_000L) {
-                    probePipePark()
+                // 3.40.0：自探只有两轮——两轮探完（probeCount 到
+                // 2）就不再探、也不再记等待行（结束行已在第二轮探
+                // 针里记明）；停车本身保留，继续堵住补仓与看门狗
+                // 其它处置，等用户新意图作废
+                if (pipeParkProbeCount < 2) {
+                    val waitedBucketP =
+                        ((nowP - pipeParkSinceMs) / 600_000L).toInt()
+                    if (waitedBucketP > pipeParkWaitLoggedMin) {
+                        pipeParkWaitLoggedMin = waitedBucketP
+                        engineLog(
+                            "引擎：仍在等管线恢复 " + pipeParkTitle +
+                                "（已等 " + (waitedBucketP * 10) +
+                                " 分钟）"
+                        )
+                    }
+                    if (nowP - pipeParkLastTryMs >= 60_000L) {
+                        probePipePark()
+                    }
                 }
                 return
             }
@@ -1665,6 +1673,7 @@ class KeepAliveService : Service() {
         pipeParkFromStart = false
         pipeParkProbeCount = 0
         pipeParkCause = ""
+        pipeParkRefUsedKey = ""
         pipeParkSinceMs = 0L
         pipeParkLastTryMs = 0L
         pipeParkWaitLoggedMin = 0
@@ -1690,6 +1699,7 @@ class KeepAliveService : Service() {
         pipeParkFromStart = cause == "start"
         pipeParkCause = cause
         pipeParkProbeCount = 0
+        pipeParkRefUsedKey = ""
         pipeParkSinceMs = now
         // 首次重探在进场后约 30 秒：lastTry 回拨，看门狗按 60 秒
         // 间隔判定时首探落在 +30 秒，其后以探针起点计每 60 秒一次
@@ -1706,11 +1716,15 @@ class KeepAliveService : Service() {
      * 条腿——单腿活不等于这首歌有救），拿到地址即原地起播收场；
      * 仍走空就继续停，探空不逐条记日志（进场行与每 10 分钟等待
      * 行已够对账，重探自身的解析段照常进脚本日志渠道）。
-     * 3.39.0 自纠出口：第 2 轮起同轮顺带探一首参照歌（目标的下
-     * 一首）——参照出地址而目标仍空 = 管线无恙、独这首无货（冤
-     * 案），撤销定罪、跳过此歌续播；参照也空 = 定罪维持。翻案
-     * 只凭阳性证据（参照真出货），真故障时参照同样出不来，不
-     * 会误触发 */
+     * 自纠出口（3.39.0 立、3.40.0 改两轮定案，cheng 拍板）：自
+     * 探共两轮，每轮同轮顺带探一首参照歌——第 1 轮探上一首
+     * （最后真正起播过的那首，校准过的样本；回链停车时它就是
+     * 目标自己，自动落空），第 2 轮探下一首（续播落点）。参照
+     * 出地址而目标仍空 = 管线无恙、独这首无货（冤案），撤销定
+     * 罪、跳过此歌续播；两轮皆空（目标＋两首参照都验过）= 证
+     * 据链完整、管线未恢复，停止自探、停车保留待用户新意图。
+     * 翻案只凭阳性证据（参照真出货），真故障时参照同样出不
+     * 来，不会误触发 */
     private fun probePipePark() {
         val key = pipeParkKey
         if (key.isEmpty() || pipeProbeBusy) return
@@ -1720,23 +1734,33 @@ class KeepAliveService : Service() {
         pipeProbeBusy = true
         pipeParkLastTryMs = SystemClock.elapsedRealtime()
         pipeParkProbeCount++
-        // 参照歌：按现行模式算出的目标下一首；与目标同首（单曲
-        // 循环/独苗队列）等于没有参照，本轮只探目标
+        // 参照歌：上一首 = 此刻脑内当前键（最后真正起播过的那
+        // 首）；下一首按现行模式算。第 1 轮先上一首、第 2 轮先
+        // 下一首，先选的不可用（是目标自己/不在队列/上一轮用
+        // 过）就拿另一首顶，两轮不重复用同一首参照
         var refKey = ""
         var refDesc: org.json.JSONObject? = null
-        if (pipeParkProbeCount >= 2) {
+        run {
             val savedCur = brainCurKey
             brainCurKey = key
             val nk = computeBrainNextKey(true)
             brainCurKey = savedCur
-            if (nk != null && nk != key) {
-                val ri = brainQueueKeys.indexOf(nk)
-                if (ri >= 0) {
-                    refKey = nk
-                    refDesc = brainQueue[ri]
+            val order = if (pipeParkProbeCount == 1)
+                listOf(savedCur, nk) else listOf(nk, savedCur)
+            for (cand in order) {
+                if (cand != null && cand.isNotEmpty() &&
+                    cand != key && cand != pipeParkRefUsedKey
+                ) {
+                    val ri = brainQueueKeys.indexOf(cand)
+                    if (ri >= 0) {
+                        refKey = cand
+                        refDesc = brainQueue[ri]
+                        break
+                    }
                 }
             }
         }
+        if (refKey.isNotEmpty()) pipeParkRefUsedKey = refKey
         val gen = brainOpGen
         val rk = refKey
         val rd = refDesc
@@ -1825,8 +1849,16 @@ class KeepAliveService : Service() {
                         }
                         else -> clearPipePark()
                     }
+                } else if (pipeParkProbeCount >= 2) {
+                    // 两轮皆空：目标＋两首参照都验过，证据链完整
+                    // ——管线未恢复，停止自探（停车保留，等新意图）
+                    engineLog(
+                        "引擎：两轮探针皆空，管线未恢复，停止自探 " +
+                            desc.optString("name") +
+                            "（点任意歌或切歌即重试）"
+                    )
                 }
-                // 目标空、参照空或无参照：定罪维持，继续停
+                // 第 1 轮空：定罪维持，等第 2 轮
             }
         }
     }
