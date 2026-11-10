@@ -282,6 +282,20 @@ class KeepAliveService : Service() {
     private var netParkLastTryMs: Long = 0L
     private var netParkWaitLoggedMin = 0
     private var netProbeInFlight = false
+    // 3.38.0 解析停车场：解析全灭（本平台全档多源＋QQ 兜底全走空）
+    // 即停——cheng 2026-11-10 定案：一首在架的歌全灭，本身就是脚
+    // 本/平台管线整体故障的硬证据（歌是平台自己列出来的、QQ 曲库
+    // 又全），再往下跳歌验的还是同一批坏管线，纯烧时间与电。停在
+    // 目标歌上，看门狗周期重探整条链（首次约 30 秒、之后每 60
+    // 秒），探到地址即原地续播；不限时（歌没错、错的是管线），新
+    // 意图/切歌/暂停即作废，与网络停车场同规矩
+    private var pipeParkKey = ""
+    private var pipeParkTitle = ""
+    private var pipeParkFromStart = false
+    private var pipeParkSinceMs: Long = 0L
+    private var pipeParkLastTryMs: Long = 0L
+    private var pipeParkWaitLoggedMin = 0
+    private var pipeProbeBusy = false
     private var engineFailCount = 0
     private var engineBatchCount = 0
     private var stallSinceMs: Long = 0L
@@ -691,6 +705,9 @@ class KeepAliveService : Service() {
         // 3.21.0：停车期间（已证全网断）补仓暂停——问也白问，只会每
         // 十几秒刷一批解析失败、白耗电波；网回来停车解除后自动恢复
         if (netParkKey.isNotEmpty()) return
+        // 3.38.0：解析停车期间同理暂停补仓——管线已判全灭，补仓只
+        // 会对着坏管线反复走空；停车解除（探到恢复）后自动恢复
+        if (pipeParkKey.isNotEmpty()) return
         if (configSources.isEmpty() || !brainActive) return
         if (armedItems.size > 1) return
         val now = android.os.SystemClock.elapsedRealtime()
@@ -963,6 +980,30 @@ class KeepAliveService : Service() {
                     }
                     return
                 }
+            }
+        }
+        // 解析停车场值班（3.38.0）：停在全灭的目标歌上，周期重探
+        // 整条链，出地址即续播（probePipePark 内收账）；无播放意图
+        // （用户暂停）或目标已被移出队列即作废；每等满 10 分钟留一
+        // 行等待日志。值班期间看门狗其它处置让路（同网络停车场）
+        if (pipeParkKey.isNotEmpty()) {
+            if (!wantPlay || !brainQueueKeys.contains(pipeParkKey)) {
+                voidPipePark()
+            } else {
+                val nowP = SystemClock.elapsedRealtime()
+                val waitedBucketP =
+                    ((nowP - pipeParkSinceMs) / 600_000L).toInt()
+                if (waitedBucketP > pipeParkWaitLoggedMin) {
+                    pipeParkWaitLoggedMin = waitedBucketP
+                    engineLog(
+                        "引擎：仍在等管线恢复 " + pipeParkTitle +
+                            "（已等 " + (waitedBucketP * 10) + " 分钟）"
+                    )
+                }
+                if (nowP - pipeParkLastTryMs >= 60_000L) {
+                    probePipePark()
+                }
+                return
             }
         }
         // 用户暂停（无播放意图）不干预
@@ -1615,6 +1656,109 @@ class KeepAliveService : Service() {
         netParkWaitLoggedMin = 0
     }
 
+    private fun clearPipePark() {
+        pipeParkKey = ""
+        pipeParkTitle = ""
+        pipeParkFromStart = false
+        pipeParkSinceMs = 0L
+        pipeParkLastTryMs = 0L
+        pipeParkWaitLoggedMin = 0
+        pipeProbeBusy = false
+    }
+
+    /** 停车作废（用户改了主意/目标没了）：点播停的车若终究没播
+     * 成，脚本段照 failBrainStart 的规矩落盘，别查无此歌 */
+    private fun voidPipePark() {
+        val k = pipeParkKey
+        val fromStart = pipeParkFromStart
+        clearPipePark()
+        if (k.isNotEmpty() && fromStart) ScriptSeg.flushFor(k)
+    }
+
+    /** 进解析停车场：记账＋留痕＋通知页面（pipark 不是失败回执，
+     * 页面不走老路，只显示状态等 advanced） */
+    private fun enterPipePark(key: String, title: String, fromStart: Boolean) {
+        if (key.isEmpty()) return
+        val now = SystemClock.elapsedRealtime()
+        pipeParkKey = key
+        pipeParkTitle = title.ifEmpty { brainNameOf(key) }
+        pipeParkFromStart = fromStart
+        pipeParkSinceMs = now
+        // 首次重探在进场后约 30 秒：lastTry 回拨，看门狗按 60 秒
+        // 间隔判定时首探落在 +30 秒，其后以探针起点计每 60 秒一次
+        pipeParkLastTryMs = now - 30_000L
+        pipeParkWaitLoggedMin = 0
+        engineLog(
+            "引擎：解析全灭，疑似音源/平台整体故障，暂停跳歌 " +
+                pipeParkTitle + "（恢复后自动续播）"
+        )
+        pushSync(JSONObject().put("t", "pipark").put("key", key))
+    }
+
+    /** 解析停车场重探：整条链重走一次（探的是整条管线，不是单
+     * 条腿——单腿活不等于这首歌有救），拿到地址即原地起播收场；
+     * 仍走空就继续停，探空不逐条记日志（进场行与每 10 分钟等待
+     * 行已够对账，重探自身的解析段照常进脚本日志渠道） */
+    private fun probePipePark() {
+        val key = pipeParkKey
+        if (key.isEmpty() || pipeProbeBusy) return
+        val di = brainQueueKeys.indexOf(key)
+        val desc = if (di >= 0) brainQueue[di] else null
+        if (desc == null || configSources.isEmpty()) return
+        pipeProbeBusy = true
+        pipeParkLastTryMs = SystemClock.elapsedRealtime()
+        val gen = brainOpGen
+        resolveExec.execute {
+            val url = try {
+                LxResolver.resolve(
+                    desc, configSources, configQuality, configAutoDown,
+                    lxEngine()
+                ) { m -> engineLog(m) }
+            } catch (_: Exception) {
+                null
+            }
+            tickHandler.post {
+                pipeProbeBusy = false
+                if (pipeParkKey != key) return@post
+                if (gen != brainOpGen) return@post
+                if (!url.isNullOrEmpty()) {
+                    val t2 = desc.optString("name")
+                    engineLog("引擎：管线恢复，续播 " + t2)
+                    if (key == brainStartKey) brainStartKey = ""
+                    clearPipePark()
+                    val item = ArmedItem(
+                        url, key,
+                        t2, desc.optString("artist"),
+                        desc.optString("cover")
+                            .ifEmpty { desc.optString("img") },
+                        false, true
+                    )
+                    applyAdvance(item, playIt = true)
+                }
+            }
+        }
+    }
+
+    /** 回链收工分流（3.38.0）：整场没拿到过一把候选（一把都没
+     * 有）= 链什么都给不出来，属管线全灭——关会话进解析停车场自
+     * 探恢复，不再跳过这首；拿到过候选、只是装上一把死一把 =
+     * 文件级死亡，照旧关会话按出错跳过收账 */
+    private fun rescueExhausted(p: ExoPlayer) {
+        if (rescueSessTries == 0 && rescueSessKey.isNotEmpty()) {
+            val pk = rescueSessKey
+            val pn = rescueSessName
+            closeRescueSession()
+            rescueInFlight = false
+            rescueSettled = true
+            enterPipePark(pk, pn, false)
+        } else {
+            closeRescueSession()
+            rescueInFlight = false
+            rescueSettled = true
+            doSkipAfterError(p)
+        }
+    }
+
     /** 关闭回链会话（3.18.0）：清会话账面。发动记账 rescueDoneKey
      * 不在这里清——它管的是「这首已发动过一次」，只在真出声时清 */
     private fun closeRescueSession() {
@@ -1725,10 +1869,7 @@ class KeepAliveService : Service() {
                 nativeUrl == firstDeadUrl
             ) {
                 engineLog("引擎：回链无果 " + rescueSessName + "（12 秒超时）")
-                closeRescueSession()
-                rescueInFlight = false
-                rescueSettled = true
-                doSkipAfterError(pp)
+                rescueExhausted(pp)
             }
         }, 12000L)
         rescueWalkStep(p)
@@ -1751,8 +1892,7 @@ class KeepAliveService : Service() {
             android.os.SystemClock.elapsedRealtime()
         if (remain < 1000L) {
             engineLog("引擎：回链无果 " + rescueSessName + "（12 秒超时）")
-            closeRescueSession()
-            doSkipAfterError(p)
+            rescueExhausted(p)
             return
         }
         val sessGen = rescueSessGen
@@ -1857,8 +1997,7 @@ class KeepAliveService : Service() {
                     }
                 } else {
                     engineLog("引擎：回链无果 " + name)
-                    closeRescueSession()
-                    doSkipAfterError(pp)
+                    rescueExhausted(pp)
                 }
             }
         }
@@ -3014,7 +3153,7 @@ class KeepAliveService : Service() {
         return key.substringAfter("|")
     }
 
-    /** 脑内切歌执行：跑道命中直接接播；未命中用脑内描述符现解析；解析失败顺延下一候选（最多 3 跳） */
+    /** 脑内切歌执行：跑道命中直接接播；未命中用脑内描述符现解析；解析全灭即停，进解析停车场自探恢复（3.38.0，不再顺延跳歌） */
     private fun executeBrainAdvance(targetKey: String, cause: String, depth: Int) {
         val fromKey = brainCurrentKey()
         engineLog("引擎：脑切歌 " + cause + " → " + brainNameOf(targetKey) + "（" + brainMode + "）" + if (cause == "start") " key=" + targetKey else "")
@@ -3110,23 +3249,17 @@ class KeepAliveService : Service() {
                             applyAdvance(item, playIt = true)
                 } else {
                     engineLog("引擎：脑切歌解析失败 " + brainNameOf(targetKey))
-                    if (depth < 3) {
-                        val savedCur = brainCurKey
-                        brainCurKey = targetKey
-                        val nxt = computeBrainNextKey(true)
-                        brainCurKey = savedCur
-                        if (nxt != null && nxt != targetKey) {
-                            executeBrainAdvance(nxt, cause, depth + 1)
-                        } else if (armedItems.isNotEmpty()) {
-                            doArmedAdvance()
-                        } else if (cause == "start") {
-                            failBrainStart(brainNameOf(if (brainStartKey.isNotEmpty()) brainStartKey else targetKey))
-                        }
-                    } else if (armedItems.isNotEmpty()) {
-                        doArmedAdvance()
-                    } else if (cause == "start") {
-                        failBrainStart(brainNameOf(if (brainStartKey.isNotEmpty()) brainStartKey else targetKey))
-                    }
+                    // 3.38.0：解析全灭即停（cheng 定案）——链已走完
+                    // 本平台全档多源＋QQ 兜底，全空即管线整体故障的
+                    // 硬证据，不再顺延跳歌（往下验的还是同一批坏管
+                    // 线）；有跑道存货也不先播，顺序不乱、恢复后仍
+                    // 从这首起。停进解析停车场，看门狗自探恢复
+                    enterPipePark(
+                        targetKey,
+                        desc.optString("name")
+                            .ifEmpty { brainNameOf(targetKey) },
+                        cause == "start"
+                    )
                 }
             }
         }
@@ -3182,6 +3315,7 @@ class KeepAliveService : Service() {
 
     private fun brainManualNext() {
         clearNetPark()
+        voidPipePark()
         brainSleepAfterTrack = false
         brainOpGen++
         val t = computeBrainNextKey(true) ?: return
@@ -3190,6 +3324,7 @@ class KeepAliveService : Service() {
 
     private fun brainManualPrev() {
         clearNetPark()
+        voidPipePark()
         brainSleepAfterTrack = false
         brainOpGen++
         val t = computeBrainPrevKey() ?: return
@@ -3205,6 +3340,7 @@ class KeepAliveService : Service() {
     private fun brainPlayKey(keyIn: String) {
         if (keyIn.isEmpty()) return
         clearNetPark()
+        voidPipePark()
         brainSleepAfterTrack = false
         // 单脑第 3 步：陈旧页面拿换源前旧编号点播 → 翻译成脑内新编号再执行
         val key = brainAliases[keyIn] ?: keyIn
