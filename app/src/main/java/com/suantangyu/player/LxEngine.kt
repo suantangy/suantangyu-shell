@@ -48,7 +48,8 @@ class LxEngine(private val log: (String) -> Unit) {
 
     // 仅 JS 线程读写
     private val scripts = LinkedHashMap<String, ScriptCtx>()
-    private val pending = HashMap<Int, (String?) -> Unit>()
+    // 3.43.0：回调同时带回脚本亲口报的错（err），不再只交一个空结果
+    private val pending = HashMap<Int, (String?, String?) -> Unit>()
     private var callSeq = 0
 
     private fun ensureLoader() {
@@ -67,10 +68,10 @@ class LxEngine(private val log: (String) -> Unit) {
             // 旧上下文整体销毁重建：LX 宿主语义里脚本是一次性装载的
             for ((_, sc) in scripts) destroyCtx(sc)
             scripts.clear()
-            val done = ArrayList<(String?) -> Unit>()
+            val done = ArrayList<(String?, String?) -> Unit>()
             done.addAll(pending.values)
             pending.clear()
-            done.forEach { it(null) }
+            done.forEach { it(null, null) }
             var okCount = 0
             for (src in scriptSources) {
                 val script = src.script
@@ -166,7 +167,7 @@ class LxEngine(private val log: (String) -> Unit) {
                 if (err.isNotEmpty()) {
                     log("引擎：脚本[" + sc.name + "]解析报错 " + err.take(120))
                 }
-                cb(if (url.isEmpty()) null else url)
+                cb(if (url.isEmpty()) null else url, err)
             }
             null
         })
@@ -306,9 +307,14 @@ class LxEngine(private val log: (String) -> Unit) {
      * 同步调用某脚本的 musicUrl 处理函数（在调用方线程阻塞等待）。
      * payloadJson 为页面同款事件对象 {action, source, info:{musicInfo, type}}。
      */
+    // 3.43.0：脚本亲口报错（无址且带错）时由 callMusicUrlBlocking 抛出，
+    // 让解析层按「抛异常」口径处理；脚本只是没找到歌仍返回普通空
+    class ScriptCallException(message: String) : Exception(message)
+
     fun callMusicUrlBlocking(scriptKey: String, payloadJson: String, timeoutMs: Long): String? {
         val latch = CountDownLatch(1)
         val box = arrayOfNulls<String>(1)
+        val errBox = arrayOfNulls<String>(1)
         jsHandler.post {
             val sc = scripts[scriptKey]
             if (sc == null || !sc.handlerReady || sc.ctx == null) {
@@ -316,8 +322,9 @@ class LxEngine(private val log: (String) -> Unit) {
                 return@post
             }
             val id = ++callSeq
-            pending[id] = { url ->
+            pending[id] = { url, err ->
                 box[0] = url
+                errBox[0] = err
                 latch.countDown()
             }
             try {
@@ -329,12 +336,16 @@ class LxEngine(private val log: (String) -> Unit) {
             }
             jsHandler.postDelayed({
                 val cb = pending.remove(id)
-                if (cb != null) cb(null)
+                if (cb != null) cb(null, null)
             }, timeoutMs)
         }
         try {
             latch.await(timeoutMs + 5000, TimeUnit.MILLISECONDS)
         } catch (_: Exception) {
+        }
+        val callErr = errBox[0]
+        if (box[0] == null && !callErr.isNullOrEmpty()) {
+            throw ScriptCallException(callErr)
         }
         return box[0]
     }

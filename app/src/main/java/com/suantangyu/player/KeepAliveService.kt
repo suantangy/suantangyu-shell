@@ -188,6 +188,26 @@ class KeepAliveService : Service() {
     private var nativeActive: Boolean = false
     private var pendingRate: Float = 1f
 
+    // 3.43.0：倍速进脑存档——RATE 到达即落盘、服务 onCreate 读回；
+    // 此前只存内存，服务一重启就掉回 1.0（既定捎带项）
+    private fun persistRate() {
+        try {
+            java.io.File(filesDir, "rate_state.txt").writeText(pendingRate.toString())
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun loadPersistedRate() {
+        try {
+            val f = java.io.File(filesDir, "rate_state.txt")
+            if (f.exists()) {
+                val v = f.readText().trim().toFloatOrNull()
+                if (v != null && v in 0.25f..4.0f) pendingRate = v
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     // —— phase-2.5 预置续播：网页提前把接下来 1~2 首的流地址预置给服务。
     // 当前曲播完时先等一个宽限期（网页醒着会自己切歌，PLAY_URL 一到就取消）；
     // 宽限期满网页还没接上（熄屏被冻/解析卡住），服务按预置自己接播下一首，
@@ -2801,6 +2821,7 @@ class KeepAliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        loadPersistedRate()
         createChannel()
         ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
         restoreBrainState()
@@ -3026,6 +3047,7 @@ class KeepAliveService : Service() {
             }
             ACTION_NATIVE_RATE -> {
                 pendingRate = intent.getFloatExtra("rate", 1f)
+                persistRate()
                 try {
                     player?.setPlaybackSpeed(pendingRate)
                 } catch (_: Exception) {

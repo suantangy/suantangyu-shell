@@ -380,6 +380,9 @@ object LxResolver {
                 // 3.15.0 源×平台冷却：硬失败（抛异常、或耗满 8 秒超时级
                 // 时长仍无果）才凉这个源在这个平台 3 分钟；快速答
                 // 「没有」不凉——那是歌的问题不是源死了
+                // 3.43.0：脚本源亲口报的错经引擎回传为异常、同样算抛
+                // 异常（此前被引擎吞成普通空结果，只有耗满 8 秒才凉，
+                // 秒断永远不凉——2026-11-11 xcvts 失联实证）
                 if (threw || System.currentTimeMillis() - t0 >= 8000L) {
                     benchSource(src, songPlat, log)
                 }
@@ -1043,6 +1046,7 @@ object LxResolver {
         for (t in listOf(q0, "flac", "320k", "128k")) {
             if (!attempts.contains(t)) attempts.add(t)
         }
+        var scriptErr: String? = null
         for (tq in attempts) {
             val payload = JSONObject()
                 .put("action", "musicUrl")
@@ -1052,11 +1056,20 @@ object LxResolver {
                         .put("musicInfo", musicInfo)
                         .put("type", tq)
                 )
-            val url = engine.callMusicUrlBlocking(src.key(), payload.toString(), 30000L)
+            val url = try {
+                engine.callMusicUrlBlocking(src.key(), payload.toString(), 30000L)
+            } catch (e: LxEngine.ScriptCallException) {
+                // 3.43.0：这一档脚本亲口报错——先记下，其余档照旧试
+                // 完（档间差异归脚本自己管）；全灭且出过错才在下面把
+                // 错抛给解析层，按「抛异常」口径冷却这个源×平台
+                if (scriptErr == null) scriptErr = e.message
+                null
+            }
             if (url != null && url.trim().startsWith("http", true)) {
                 return url.trim()
             }
         }
+        if (scriptErr != null) throw LxEngine.ScriptCallException(scriptErr)
         return null
     }
 }
