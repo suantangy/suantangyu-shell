@@ -2827,11 +2827,8 @@ class KeepAliveService : Service() {
         restoreBrainState()
         // 3.35.0：给解析器装构造址预验钩子（实现见 obtainCronetEngine 旁）
         LxResolver.constructDeadCheck = { url -> probeConstructDead(url) }
-        // 3.45.0 实验：验档钩子先不装（lossyCheck 保持 null，LX 结果
-        // 直接收下、不探文件头）——只为量验档到底占了起播多少时间；
-        // 测完凭结果定去留，probeLossyFile 本体留着、随时能接回来。
         // 3.42.0：给解析器装 LX 验档钩子（实现见 obtainCronetEngine 旁）
-        // LxResolver.lossyCheck = { url -> probeLossyFile(url) }
+        LxResolver.lossyCheck = { url -> probeLossyFile(url) }
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
