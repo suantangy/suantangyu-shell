@@ -3347,6 +3347,8 @@ class KeepAliveService : Service() {
     private var brainStartBusy: Boolean = false
     private var brainOpGen: Int = 0 // 意图代次：新意图一来，旧解析落地作废（与落雪 gettingUrlId 同构）
     private var brainStartKey: String = "" // 正在办的起播键（终点回执 startfailed 按它回）
+    private var brainIntendedKey: String = "" // 3.47.0：手动切歌想去的目标——快速连点时「当前在播」还没跟上，用它接着往后算；歌出声即清
+    private var brainIntendedCause: String = "" // 3.47.0：想去的目标是哪种切歌来的（next/prev），补解析时原样带回
     private var brainSaveRunnable: Runnable? = null
 
     private fun feedBrainFromSnapshot(o: org.json.JSONObject) {
@@ -3410,6 +3412,9 @@ class KeepAliveService : Service() {
     /** 每有一首真正开始播（页面起播/原生接播/脑内切歌/回链成功都经此）记一笔 */
     private fun noteBrainStarted(key: String) {
         if (key.isEmpty()) return
+        // 3.47.0：歌真正出声了，手动切歌的意图已兑现（或被别的起播顶掉），清掉
+        brainIntendedKey = ""
+        brainIntendedCause = ""
         sleepStopParked = false
         brainCurKey = key
         brainPlayed.add(key)
@@ -3422,9 +3427,9 @@ class KeepAliveService : Service() {
         ScriptSeg.flushFor(key)
     }
 
-    private fun computeBrainNextKey(manual: Boolean): String? {
+    private fun computeBrainNextKey(manual: Boolean, baseKey: String? = null): String? {
         if (brainQueueKeys.isEmpty()) return null
-        val cur = brainCurrentKey()
+        val cur = baseKey?.takeIf { it.isNotEmpty() && brainQueueKeys.contains(it) } ?: brainCurrentKey()
         val idx = brainQueueKeys.indexOf(cur)
         if (brainMode == "single" && !manual) {
             return if (idx >= 0) cur else brainQueueKeys.first()
@@ -3444,9 +3449,9 @@ class KeepAliveService : Service() {
         return brainQueueKeys[(idx + 1) % brainQueueKeys.size]
     }
 
-    private fun computeBrainPrevKey(): String? {
+    private fun computeBrainPrevKey(baseKey: String? = null): String? {
         if (brainQueueKeys.isEmpty()) return null
-        val cur = brainCurrentKey()
+        val cur = baseKey?.takeIf { it.isNotEmpty() && brainQueueKeys.contains(it) } ?: brainCurrentKey()
         if (brainMode == "shuffle") {
             // 落雪式：按已播历史往回走（随机模式的上一首是「刚听过的那首」）
             val pos = brainHistory.lastIndexOf(cur)
@@ -3553,7 +3558,19 @@ class KeepAliveService : Service() {
             tickHandler.post {
                 if (isStart) brainStartBusy = false else brainAdvanceBusy = false
                 // 意图代次已变（用户又点了别的）：整跳作废，终点由新意图负责
-                if (gen != brainOpGen) return@post
+                if (gen != brainOpGen) {
+                    // 3.47.0：快速连点攒下的意图——在飞的解析被新点作废，但最新想去
+                    // 的那首还没排上解析，在这里给它补一轮（只补最新的一首，不攒多轮）
+                    if (!isStart && brainIntendedKey.isNotEmpty()
+                        && brainQueueKeys.contains(brainIntendedKey)
+                        && brainIntendedKey != brainCurrentKey()
+                    ) {
+                        val pk = brainIntendedKey
+                        val pc = if (brainIntendedCause == "prev") "prev" else "next"
+                        executeBrainAdvance(pk, pc, 0)
+                    }
+                    return@post
+                }
                 // 起播在原生未激活时正是冷启动常态（全天第一首），不能按切歌的作废规矩丢掉
                 if (!nativeActive && !isStart) return@post
                 // 期间用户/页面已换歌：这一跳作废，别把人家的新歌顶掉
@@ -3638,7 +3655,11 @@ class KeepAliveService : Service() {
         voidPipePark()
         brainSleepAfterTrack = false
         brainOpGen++
-        val t = computeBrainNextKey(true) ?: return
+        // 3.47.0：快速连点时「当前在播」还没跟上新目标，从上次想去的接着往后算
+        val base = brainIntendedKey.takeIf { it.isNotEmpty() && brainQueueKeys.contains(it) } ?: brainCurrentKey()
+        val t = computeBrainNextKey(true, base) ?: return
+        brainIntendedKey = t
+        brainIntendedCause = "next"
         executeBrainAdvance(t, "next", 0)
     }
 
@@ -3647,7 +3668,11 @@ class KeepAliveService : Service() {
         voidPipePark()
         brainSleepAfterTrack = false
         brainOpGen++
-        val t = computeBrainPrevKey() ?: return
+        // 3.47.0：快速连点时「当前在播」还没跟上新目标，从上次想去的接着往后算
+        val base = brainIntendedKey.takeIf { it.isNotEmpty() && brainQueueKeys.contains(it) } ?: brainCurrentKey()
+        val t = computeBrainPrevKey(base) ?: return
+        brainIntendedKey = t
+        brainIntendedCause = "prev"
         executeBrainAdvance(t, "prev", 0)
     }
 
@@ -3659,6 +3684,9 @@ class KeepAliveService : Service() {
      */
     private fun brainPlayKey(keyIn: String) {
         if (keyIn.isEmpty()) return
+        // 3.47.0：点播优先，之前手动切歌攒的意图作废
+        brainIntendedKey = ""
+        brainIntendedCause = ""
         clearNetPark()
         voidPipePark()
         brainSleepAfterTrack = false
