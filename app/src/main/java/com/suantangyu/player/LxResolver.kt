@@ -264,7 +264,9 @@ object LxResolver {
      * 链内 QQ 兜底（viaQq=true）。回链日志按出身标记，不再拿域名猜
      * （旧法按域名含 qqmusic 判，念心 tx.php 的 mcp 域名被误标成本
      * 平台，2026-11-09 助手据此误报「本平台自救」——事故在案） */
-    data class Prov(val url: String, val viaQq: Boolean)
+    data class Prov(val url: String, val viaQq: Boolean, val srcName: String = "", val tier: String = "")
+    // 3.48.0：resolveAtQuality 的命中（地址 + 赢的源），尾行要写脚本名和档
+    private data class Hit(val url: String, val srcName: String)
 
     fun resolve(
         song: JSONObject,
@@ -294,7 +296,7 @@ object LxResolver {
         try {
             out = resolveBody(song, sources, wantQ, autoDown, engine, budgetMs, banUrls, log)
         } finally {
-            ScriptSeg.end(out?.url)
+            ScriptSeg.end(out?.url, out?.srcName ?: "", out?.tier ?: "", out?.viaQq ?: false)
         }
         return out
     }
@@ -329,8 +331,8 @@ object LxResolver {
                 ScriptSeg.note("引擎：单曲解析超时跳过 " + song.optString("name"))
                 return null
             }
-            val url = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls)
-            if (url != null) return Prov(url, false)
+            val hit = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls)
+            if (hit != null) return Prov(hit.url, false, hit.srcName, canonTier(q))
         }
         if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
             val alt = searchQqAltDesc(song)
@@ -339,10 +341,10 @@ object LxResolver {
                 ScriptSeg.note("引擎：本平台各档已尽，启用 QQ 兜底 " + song.optString("name"))
                 for (q in tiers) {
                     if (System.currentTimeMillis() > deadline) break
-                    val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls)
-                    if (u2 != null) {
+                    val hit2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls)
+                    if (hit2 != null) {
                         log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
-                        return Prov(u2, true)
+                        return Prov(hit2.url, true, hit2.srcName, canonTier(q))
                     }
                 }
             }
@@ -358,7 +360,7 @@ object LxResolver {
         log: (String) -> Unit,
         deadline: Long = Long.MAX_VALUE,
         banUrls: Set<String> = emptySet()
-    ): String? {
+    ): Hit? {
         val mid = cleanPlayMid(song)
         if (mid.isEmpty()) return null
         val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
@@ -430,16 +432,16 @@ object LxResolver {
                         if (lc != null && lc(r.url)) {
                             lossyLxUrls.add(r.url)
                             log("引擎：验档作废 " + src.name + "（" + ct + " 档交回有损文件）→ 继续走链")
-                            ScriptSeg.note("引擎：验档作废 " + src.name + " " + ct + " 档（有损文件）")
+                            ScriptSeg.note("引擎：验档作废 " + src.name + " " + ct + " 档")
                             continue
                         }
                         okLxUrls.add(r.url)
                     }
                 }
-                return r.url
+                return Hit(r.url, src.name)
             }
             val det = detectQualityFromUrl(r.url)
-            if (det == null || qualityMeets(det, q)) return r.url
+            if (det == null || qualityMeets(det, q)) return Hit(r.url, src.name)
             // 3.15.0 对齐网页：音质不达标只毙这个源、继续问下一个源；
             // 旧行为整档判败，会让排第一的源一个低音质址带死整档
         }
@@ -1075,7 +1077,7 @@ object LxResolver {
 }
 
 /** 脚本日志分段（3.12.0 建，3.12.1 改暂存落盘）：resolve 一进一出记
- * 一段——段头（歌名-歌手）、段尾（解析成功 → host / 解析失败）；段
+ * 一段——段头（歌名-歌手）、段尾（✓ 解析成功 → host（脚本 档）/ ✗ 解析失败）；段
  * 进行中的脚本行由服务侧引擎回调转入。段先在内存暂存，歌真正起播
  * （或点播终点失败）才落盘进 lx_script.log——预置/补仓解析没被播到
  * 的段永不出现，与旧网页脚本日志「播到才并入」的规矩一致。fileSink
@@ -1149,7 +1151,9 @@ object ScriptSeg {
         }
     }
 
-    fun end(url: String?) {
+    // 3.48.0：尾行改 ✓/✗（段头 ▶ 播放留着，头尾一眼分开）；成功时括号里写
+    // 赢的脚本和档（链上第几档，与验档作废行的档同义；QQ 兜底赢的标 QQ兜底）
+    fun end(url: String?, srcName: String = "", tier: String = "", viaQq: Boolean = false) {
         synchronized(lock) {
             val seg = openSegs.remove(Thread.currentThread().id) ?: return
             if (url != null) {
@@ -1158,11 +1162,14 @@ object ScriptSeg {
                     host = java.net.URL(url).host ?: ""
                 } catch (_: Exception) {
                 }
+                val who = if (srcName.isNotEmpty() && tier.isNotEmpty()) {
+                    "（" + srcName + (if (viaQq) " QQ兜底" else "") + " " + tier + " 档）"
+                } else ""
                 seg.lines.add(
-                    stamp(if (host.isNotEmpty()) "▶ 解析成功 → " + host else "▶ 解析成功")
+                    stamp(if (host.isNotEmpty()) "✓ 解析成功 → " + host + who else "✓ 解析成功" + who)
                 )
             } else {
-                seg.lines.add(stamp("▶ 解析失败"))
+                seg.lines.add(stamp("✗ 解析失败"))
             }
             // 同 key 旧段先清掉，只留这一段（见 pending 注释）
             val pit = pending.iterator()
