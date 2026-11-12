@@ -317,8 +317,6 @@ object LxResolver {
         val deadline = System.currentTimeMillis() + budgetMs
         val tiers = if (autoDown) qualityFallbacks(wantQ) else listOf(wantQ)
         val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
-        // 3.44.0：探头流水线状态一次解析共用一个（跨档、跨 QQ 兜底都带着走）
-        val pipe = PipeState()
         // 3.37.0：QQ 兜底垫底（cheng 2026-11-10 定调：「既然选择某个
         // 平台听歌，不管单脚本或者多脚本，就要先接受那个平台降档，
         // 最后才到 QQ 平台」）——本平台各档先按序问完，全灭才搜一次
@@ -331,8 +329,8 @@ object LxResolver {
                 ScriptSeg.note("引擎：单曲解析超时跳过 " + song.optString("name"))
                 return null
             }
-            val p = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls, pipe, false)
-            if (p != null) return p
+            val url = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls)
+            if (url != null) return Prov(url, false)
         }
         if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
             val alt = searchQqAltDesc(song)
@@ -341,93 +339,13 @@ object LxResolver {
                 ScriptSeg.note("引擎：本平台各档已尽，启用 QQ 兜底 " + song.optString("name"))
                 for (q in tiers) {
                     if (System.currentTimeMillis() > deadline) break
-                    val p2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls, pipe, true)
-                    if (p2 != null) {
+                    val u2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls)
+                    if (u2 != null) {
                         log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
-                        return p2
+                        return Prov(u2, true)
                     }
                 }
             }
-        }
-        // 3.44.0：链走完了还有没取的探头——预算内就取了再定（通过就用它，
-        // 出身按探头自己的 viaQq，不按最后这圈算）。
-        if (System.currentTimeMillis() <= deadline) {
-            val last = awaitPending(pipe, deadline, log)
-            if (last != null) return Prov(last.url, last.viaQq)
-        }
-        return null
-    }
-
-    // ---------- 3.44.0：探头流水线 ----------
-    // 预验/验档不再原地等结果：探头一发出去就去问下一个候选，探头在
-    // 后台跑；取结果时严格按链的顺序，先到的候选永远赢——顺序和赢家
-    // 与串行版一字不差，省的只是等待重叠的时间。
-    // PipeState 一次解析共用一个（resolveBody 内建，跨档、跨 QQ 兜底
-    // 都带着走）；resolveExec/swapExec 可能同时各开一段，所以状态跟
-    // 调用走、不放共享字段。同一时刻最多挂一个没取的探头。
-    private class PipeState {
-        var pending: PendingProbe? = null
-    }
-
-    private class PendingProbe(
-        val url: String,
-        val fut: java.util.concurrent.Future<Boolean>,
-        // true = 构造预验（true=已验死），false = LX 验档（true=已验有损）
-        val isConstruct: Boolean,
-        val srcName: String,
-        val tier: String,
-        // 该地址出自本平台链还是链内 QQ 兜底（3.36 出身标记，取结果时用）
-        val viaQq: Boolean
-    )
-
-    // 探头任务池（与 Cronet 回调用的 constructProbeExec 不是一根线：
-    // 这里只跑同步探头 lambda，回调另有线程）。常驻 4 条守护线程，
-    // 两个并发解析段各挂一个探头也够；池线程只等探头自己的 3 秒封顶，
-    // 绝不反过来等解析线程，不会死锁。
-    private val probeExec: java.util.concurrent.ExecutorService =
-        java.util.concurrent.Executors.newFixedThreadPool(4) { r ->
-            Thread(r, "LxProbe").apply { isDaemon = true }
-        }
-
-    // 取一个挂起的探头结果（按剩余预算封顶等，最多 5 秒——探头自身
-    // 3 秒封顶，5 秒是给调度留的余量）。返回通过的探头（含出身），
-    // 没挂起、没通过都返回 null；没通过时把 verdict 行（预验作废/
-    // 验档作废）按链顺序补记——注意这行比现版晚半拍才写（可能落在
-    // 下一档的脚本行后面），时间戳是真实的判定时刻，内容一字不少。
-    // 超时/异常一律按「放行」处理，与探头自身的超时放行同一规矩。
-    // 构造探头通过后仍要过音质关（与旧版落到 detectQualityFromUrl
-    // 那行时一样）；没过就静默毙掉，无注记、无日志。
-    private fun awaitPending(
-        pipe: PipeState,
-        deadline: Long,
-        log: (String) -> Unit
-    ): PendingProbe? {
-        val p = pipe.pending ?: return null
-        pipe.pending = null
-        val remain = deadline - System.currentTimeMillis()
-        val waitMs = if (remain <= 0L) 0L else minOf(remain, 5000L)
-        val kill: Boolean = try {
-            p.fut.get(waitMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        } catch (_: Exception) {
-            false
-        }
-        if (!kill) {
-            if (p.isConstruct) {
-                val det = detectQualityFromUrl(p.url)
-                if (det != null && !qualityMeets(det, p.tier)) return null
-                return p
-            }
-            okLxUrls.add(p.url)
-            return p
-        }
-        if (p.isConstruct) {
-            deadConstructUrls.add(p.url)
-            log("引擎：预验作废 " + p.srcName + "（" + p.tier + " 档空 302、该档无货）→ 继续走链")
-            ScriptSeg.note("引擎：预验作废 " + p.srcName + " " + p.tier + " 档（空 302）")
-        } else {
-            lossyLxUrls.add(p.url)
-            log("引擎：验档作废 " + p.srcName + "（" + p.tier + " 档交回有损文件）→ 继续走链")
-            ScriptSeg.note("引擎：验档作废 " + p.srcName + " " + p.tier + " 档（有损文件）")
         }
         return null
     }
@@ -439,10 +357,8 @@ object LxResolver {
         engine: LxEngine?,
         log: (String) -> Unit,
         deadline: Long = Long.MAX_VALUE,
-        banUrls: Set<String> = emptySet(),
-        pipe: PipeState,
-        viaQq: Boolean
-    ): Prov? {
+        banUrls: Set<String> = emptySet()
+    ): String? {
         val mid = cleanPlayMid(song)
         if (mid.isEmpty()) return null
         val songPlat = normPlat(song.optString("source").ifEmpty { "qq" })
@@ -472,10 +388,6 @@ object LxResolver {
                 }
                 continue
             }
-            // 3.44.0 流水线：先把上一个候选的探头取了（它优先）；通过
-            // 就直接用它，当前候选连看都不看。
-            val won = awaitPending(pipe, deadline, log)
-            if (won != null) return Prov(won.url, won.viaQq)
             if (r.url in banUrls) {
                 // 报错回链死址名单（3.17.0 单址、3.18.0 累积成名单）：
                 // 死过的地址再交回来不算数，当这个源没答、继续问下一
@@ -492,13 +404,10 @@ object LxResolver {
                     continue
                 }
                 val chk = constructDeadCheck
-                if (chk != null) {
-                    // 3.44.0：探头发出去就去问下一个候选，不原地等。
-                    pipe.pending = PendingProbe(
-                        r.url,
-                        probeExec.submit(java.util.concurrent.Callable<Boolean> { chk(r.url) }),
-                        true, src.name, q, viaQq
-                    )
+                if (chk != null && chk(r.url)) {
+                    deadConstructUrls.add(r.url)
+                    log("引擎：预验作废 " + src.name + "（" + q + " 档空 302、该档无货）→ 继续走链")
+                    ScriptSeg.note("引擎：预验作废 " + src.name + " " + q + " 档（空 302）")
                     continue
                 }
             }
@@ -516,23 +425,21 @@ object LxResolver {
                         ScriptSeg.note("引擎：验档已验有损，跳过 " + src.name)
                         continue
                     }
-                    if (okLxUrls.contains(r.url)) return Prov(r.url, viaQq)
-                    val lc = lossyCheck
-                    if (lc != null) {
-                        // 3.44.0：探头发出去就去问下一个候选，不原地等。
-                        pipe.pending = PendingProbe(
-                            r.url,
-                            probeExec.submit(java.util.concurrent.Callable<Boolean> { lc(r.url) }),
-                            false, src.name, ct, viaQq
-                        )
-                        continue
+                    if (!okLxUrls.contains(r.url)) {
+                        val lc = lossyCheck
+                        if (lc != null && lc(r.url)) {
+                            lossyLxUrls.add(r.url)
+                            log("引擎：验档作废 " + src.name + "（" + ct + " 档交回有损文件）→ 继续走链")
+                            ScriptSeg.note("引擎：验档作废 " + src.name + " " + ct + " 档（有损文件）")
+                            continue
+                        }
+                        okLxUrls.add(r.url)
                     }
-                    okLxUrls.add(r.url)
                 }
-                return Prov(r.url, viaQq)
+                return r.url
             }
             val det = detectQualityFromUrl(r.url)
-            if (det == null || qualityMeets(det, q)) return Prov(r.url, viaQq)
+            if (det == null || qualityMeets(det, q)) return r.url
             // 3.15.0 对齐网页：音质不达标只毙这个源、继续问下一个源；
             // 旧行为整档判败，会让排第一的源一个低音质址带死整档
         }
