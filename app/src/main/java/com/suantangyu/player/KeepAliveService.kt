@@ -2253,100 +2253,40 @@ class KeepAliveService : Service() {
         }
     }
 
-    // 3.35.0 构造址预验探针：走生产 Cronet 单例，只问一件事——这条构造
-    // 址是不是空 302（3xx 且无 Location，即「该档无货」，2026-11-09 矩阵
-    // 实证）。302 带 Location＝有货（跳转即交付）；2xx＝有货；超时/失败/
-    // 4xx/5xx＝不知道，一律放行（坏相位不误杀）。请求头与正片一致。
+    // 3.52.0 预验＋验档合一探针：此前是两次串行 Cronet 请求（3.35 预验
+    // 只取头判空 302、3.42 验档跟随跳转读文件头），每首歌多花一次网络
+    // 来回。现合成一次请求同时判两件事：
+    //   - 空 302（3xx 无 Location，或重定向 Location 为空）→ 死址（预验
+    //     verdict，与旧版一致：只确认死才判死，超时/失败/4xx/5xx 放行）
+    //   - 跟随跳转到真文件读开头 16 字节，铁证有损（MP3/m4a 头）→ 假无
+    //     损（验档 verdict，与旧版一致：认不出/超时/失败/非 2xx 放行）
+    // 一次请求、一个 3 秒总封顶（旧版两探针各 3 秒、最坏 6 秒）；结论按
+    // 地址会话内缓存，预验与验档两钩子同一地址只发一次请求。钩子签名
+    // 与日志行一律不动（LxResolver 侧零改），适用范围也不变（预验只
+    // 用于构造源、验档只用于 master/hires/flac 档——不适用的那半 verdict
+    // 调用方本来就不会读）。
     private val constructProbeExec = java.util.concurrent.Executors.newCachedThreadPool()
 
-    private fun probeConstructDead(url: String): Boolean {
-        val engine = obtainCronetEngine() ?: return false
-        val latch = java.util.concurrent.CountDownLatch(1)
-        val dead = java.util.concurrent.atomic.AtomicBoolean(false)
-        var req: org.chromium.net.UrlRequest? = null
-        val cb =
-            object : org.chromium.net.UrlRequest.Callback() {
-                override fun onRedirectReceived(
-                    request: org.chromium.net.UrlRequest,
-                    info: org.chromium.net.UrlResponseInfo,
-                    newLocationUrl: String
-                ) {
-                    dead.set(newLocationUrl.isEmpty())
-                    latch.countDown()
-                    request.cancel()
-                }
-
-                override fun onResponseStarted(
-                    request: org.chromium.net.UrlRequest,
-                    info: org.chromium.net.UrlResponseInfo
-                ) {
-                    // 走到这里的 3xx 必然没有可跟随的 Location（有的话先进
-                    // onRedirectReceived），即空跳转；2xx/4xx/5xx 都放行
-                    dead.set(info.httpStatusCode in 300..399)
-                    latch.countDown()
-                    request.cancel()
-                }
-
-                override fun onReadCompleted(
-                    request: org.chromium.net.UrlRequest,
-                    info: org.chromium.net.UrlResponseInfo,
-                    byteBuffer: java.nio.ByteBuffer
-                ) {
-                    latch.countDown()
-                    request.cancel()
-                }
-
-                override fun onSucceeded(
-                    request: org.chromium.net.UrlRequest,
-                    info: org.chromium.net.UrlResponseInfo
-                ) {
-                    latch.countDown()
-                }
-
-                override fun onFailed(
-                    request: org.chromium.net.UrlRequest,
-                    info: org.chromium.net.UrlResponseInfo?,
-                    error: org.chromium.net.CronetException
-                ) {
-                    latch.countDown()
-                }
-
-                override fun onCanceled(
-                    request: org.chromium.net.UrlRequest,
-                    info: org.chromium.net.UrlResponseInfo?
-                ) {
-                    latch.countDown()
-                }
-            }
-        return try {
-            req =
-                engine.newUrlRequestBuilder(url, cb, constructProbeExec)
-                    .addHeader("User-Agent", shellUserAgent())
-                    .addHeader("Referer", "https://m.858600.xyz/")
-                    .addHeader("Range", "bytes=0-0")
-                    .addHeader("Accept", "*/*")
-                    .disableCache()
-                    .build()
-            req?.start()
-            if (!latch.await(3, java.util.concurrent.TimeUnit.SECONDS)) {
-                try { req?.cancel() } catch (_: Exception) {}
-                false
-            } else {
-                dead.get()
-            }
-        } catch (e: Exception) {
-            false
+    private data class ProbeVerdict(val dead: Boolean, val lossy: Boolean) {
+        companion object {
+            val OK = ProbeVerdict(false, false)
         }
     }
 
-    // 3.42.0 LX 验档探针：走生产 Cronet 单例，只问一件事——这条地址
-    // 的文件本体是不是铁证有损（MP3 的 ID3/帧同步头、m4a 的 ftyp
-    // 盒）。fLaC 等无损头、认不出的格式、超时/失败/非 2xx 一律「不
-    // 是铁证有损」放行（坏相位不误杀，与构造预验同一脾气）。跟随跳
-    // 转到真文件，只读开头几个字节就收工，不下整文件。
-    private fun probeLossyFile(url: String): Boolean {
-        val engine = obtainCronetEngine() ?: return false
+    private val probeVerdictCache =
+        java.util.Collections.synchronizedMap(HashMap<String, ProbeVerdict>())
+
+    private fun probeUrlOnce(url: String): ProbeVerdict {
+        probeVerdictCache[url]?.let { return it }
+        val verdict = probeUrlOnceUncached(url)
+        probeVerdictCache[url] = verdict
+        return verdict
+    }
+
+    private fun probeUrlOnceUncached(url: String): ProbeVerdict {
+        val engine = obtainCronetEngine() ?: return ProbeVerdict.OK
         val latch = java.util.concurrent.CountDownLatch(1)
+        val dead = java.util.concurrent.atomic.AtomicBoolean(false)
         val lossy = java.util.concurrent.atomic.AtomicBoolean(false)
         var req: org.chromium.net.UrlRequest? = null
         val cb =
@@ -2356,10 +2296,18 @@ class KeepAliveService : Service() {
                     info: org.chromium.net.UrlResponseInfo,
                     newLocationUrl: String
                 ) {
-                    try {
-                        request.followRedirect()
-                    } catch (e: Exception) {
+                    // 空 Location＝空 302 死址（预验旧行为：当场判死收工）；
+                    // 有 Location＝有货，继续跟随（验档旧行为：跟到真文件）。
+                    if (newLocationUrl.isEmpty()) {
+                        dead.set(true)
                         latch.countDown()
+                        request.cancel()
+                    } else {
+                        try {
+                            request.followRedirect()
+                        } catch (e: Exception) {
+                            latch.countDown()
+                        }
                     }
                 }
 
@@ -2367,6 +2315,14 @@ class KeepAliveService : Service() {
                     request: org.chromium.net.UrlRequest,
                     info: org.chromium.net.UrlResponseInfo
                 ) {
+                    // 走到这里的 3xx 必然没有可跟随的 Location，即空跳转
+                    // （预验旧行为：判死）；2xx 读头验档；4xx/5xx 放行。
+                    if (info.httpStatusCode in 300..399) {
+                        dead.set(true)
+                        latch.countDown()
+                        request.cancel()
+                        return
+                    }
                     if (info.httpStatusCode !in 200..299) {
                         latch.countDown()
                         request.cancel()
@@ -2432,12 +2388,12 @@ class KeepAliveService : Service() {
             req?.start()
             if (!latch.await(3, java.util.concurrent.TimeUnit.SECONDS)) {
                 try { req?.cancel() } catch (_: Exception) {}
-                false
+                ProbeVerdict.OK
             } else {
-                lossy.get()
+                ProbeVerdict(dead.get(), lossy.get())
             }
         } catch (e: Exception) {
-            false
+            ProbeVerdict.OK
         }
     }
 
@@ -2825,10 +2781,10 @@ class KeepAliveService : Service() {
         createChannel()
         ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
         restoreBrainState()
-        // 3.35.0：给解析器装构造址预验钩子（实现见 obtainCronetEngine 旁）
-        LxResolver.constructDeadCheck = { url -> probeConstructDead(url) }
-        // 3.42.0：给解析器装 LX 验档钩子（实现见 obtainCronetEngine 旁）
-        LxResolver.lossyCheck = { url -> probeLossyFile(url) }
+        // 3.52.0：预验＋验档合一探针（实现见 obtainCronetEngine 旁）：一次
+        // 请求同时判空 302 与文件头，两钩子同一地址共享一次探测结论。
+        LxResolver.constructDeadCheck = { url -> probeUrlOnce(url).dead }
+        LxResolver.lossyCheck = { url -> probeUrlOnce(url).lossy }
 
         // —— 媒体会话：系统级播放器卡片/灵动岛/锁屏/线控都认这个 ——
         mediaSession = MediaSessionCompat(this, "BaoBusSession").apply {
