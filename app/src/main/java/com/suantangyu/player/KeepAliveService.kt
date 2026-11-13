@@ -10,7 +10,6 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.audiofx.Equalizer
-import android.media.audiofx.Visualizer
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -958,15 +957,6 @@ class KeepAliveService : Service() {
             watchdogStall = 0
             watchdogEndedStall = 0
             watchdogLastPos = pos
-            // 3.50.0 频谱看门狗重试：起播时会话未就绪（audioSessionId==0）或
-            // Visualizer 构造失败会静默跳过，之后无人再试；每 10s 巡检在播
-            // 且频谱未建时补一次，spectrumStart 对 0 会话与重复会话都安全。
-            if (playing && spectrum == null) {
-                try {
-                    spectrumStart(p.audioSessionId)
-                } catch (_: Exception) {
-                }
-            }
             return
         }
         watchdogLastPos = pos
@@ -1395,8 +1385,6 @@ class KeepAliveService : Service() {
         override fun onAudioSessionIdChanged(audioSessionId: Int) {
             // 3.24.0：音频会话变化时重建系统均衡器并重应用音效状态
             eqAttach(audioSessionId)
-            // 3.49.0：会话变化时频谱跟新会话走（播着才重建，停着等起播）
-            if (playing) spectrumStart(audioSessionId)
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -1433,12 +1421,6 @@ class KeepAliveService : Service() {
                     engineLog("引擎：网络已恢复，继续播放 " + title)
                     clearNetPark()
                 }
-            }
-            // 3.49.0：频谱跟播放态走——起播抓会话，暂停/停播释放（省电、省桥流量）
-            if (isPlaying) {
-                spectrumStart(player?.audioSessionId ?: 0)
-            } else {
-                spectrumStop()
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -2614,142 +2596,6 @@ class KeepAliveService : Service() {
         eqWriteState()
     }
 
-    // —— 3.49.0 频谱：安卓 Visualizer 抓 ExoPlayer 音频会话的实时 FFT ——
-    // 只读不改音频；构造失败（无会话、无权限、设备不支持）时静默放弃，不影响播放。
-    // 回调线程把 FFT 转 24 段对数频带，节流 50ms 后经 pushSync 推给网页
-    // {"t":"spectrum","bands":[24 个 0..1]}；网页只在均衡器封面激活时消费。
-    private var spectrum: Visualizer? = null
-    private var spectrumSessionId: Int = 0
-    private var spectrumLastPushMs: Long = 0L
-    private val spectrumSmoothed = FloatArray(24)
-    // 3.50.0 诊断：每会话只记一次（spectrumStop 复位）
-    private var spectrumLoggedStart: Boolean = false
-    private var spectrumLoggedFail: Boolean = false
-    private var spectrumLoggedFlow: Boolean = false
-
-    /** 起播/会话变化时（重）建 Visualizer；同一会话重复调只开不建 */
-    private fun spectrumStart(sessionId: Int) {
-        if (sessionId == 0) {
-            // 3.50.0 诊断：会话未就绪（起播竞态）也记一次失败，之后看门狗重试
-            if (!spectrumLoggedFail) {
-                spectrumLoggedFail = true
-                engineLog("引擎：频谱启动失败")
-            }
-            return
-        }
-        if (spectrum != null && spectrumSessionId == sessionId) {
-            try {
-                spectrum?.enabled = true
-            } catch (_: Exception) {
-            }
-            return
-        }
-        spectrumStop()
-        try {
-            val v = Visualizer(sessionId)
-            val range = Visualizer.getCaptureSizeRange()
-            v.captureSize = 1024.coerceIn(range[0], range[1])
-            v.setDataCaptureListener(
-                object : Visualizer.OnDataCaptureListener {
-                    override fun onWaveFormDataCapture(vis: Visualizer?, waveform: ByteArray?, samplingRate: Int) {
-                    }
-
-                    override fun onFftDataCapture(vis: Visualizer?, fft: ByteArray?, samplingRate: Int) {
-                        if (fft != null) spectrumOnFft(fft, samplingRate)
-                    }
-                },
-                Visualizer.getMaxCaptureRate(),
-                false,
-                true
-            )
-            v.enabled = true
-            spectrum = v
-            spectrumSessionId = sessionId
-            // 3.50.0 诊断：Visualizer 建成并启用，记一次
-            if (!spectrumLoggedStart) {
-                spectrumLoggedStart = true
-                engineLog("引擎：频谱已启动")
-            }
-        } catch (_: Exception) {
-            spectrum = null
-            spectrumSessionId = 0
-            // 3.50.0 诊断：构造/监听/启用抛错，记一次失败
-            if (!spectrumLoggedFail) {
-                spectrumLoggedFail = true
-                engineLog("引擎：频谱启动失败")
-            }
-        }
-    }
-
-    /** 暂停/停播/销毁时释放；已停时空操作 */
-    private fun spectrumStop() {
-        try {
-            spectrum?.enabled = false
-        } catch (_: Exception) {
-        }
-        try {
-            spectrum?.release()
-        } catch (_: Exception) {
-        }
-        spectrum = null
-        spectrumSessionId = 0
-        // 3.50.0 诊断：会话结束，诊断位复位，下一首重新记一次
-        spectrumLoggedStart = false
-        spectrumLoggedFail = false
-        spectrumLoggedFlow = false
-    }
-
-    /** FFT 回调线程：频点 → 24 段对数频带（60Hz..16kHz），节流后推网页 */
-    private fun spectrumOnFft(fft: ByteArray, samplingRate: Int) {
-        if (!playing) return
-        val now = SystemClock.elapsedRealtime()
-        if (now - spectrumLastPushMs < 50) return
-        spectrumLastPushMs = now
-        val bins = fft.size / 2
-        if (bins < 2) return
-        val sr = if (samplingRate > 0) samplingRate.toDouble() else 44100.0
-        val fMin = 60.0
-        val fMax = 16000.0
-        val bands = FloatArray(24)
-        for (b in 0 until 24) {
-            val fLo = fMin * Math.pow(fMax / fMin, b / 24.0)
-            val fHi = fMin * Math.pow(fMax / fMin, (b + 1) / 24.0)
-            // 频点下标钳在 [1, bins] 内：低采样率（如 22050Hz）时高频段的
-            // fLo 对应 bin 会超 Nyquist，旧写法会在此越界
-            var binLo = (fLo * fft.size / sr).toInt().coerceIn(1, bins - 1)
-            var binHi = (fHi * fft.size / sr).toInt().coerceIn(binLo + 1, bins)
-            var sum = 0.0
-            var count = 0
-            for (i in binLo until binHi) {
-                val re = fft[i * 2].toInt()
-                val im = fft[i * 2 + 1].toInt()
-                sum += Math.sqrt((re * re + im * im).toDouble())
-                count++
-            }
-            var v = if (count > 0) sum / count / 128.0 else 0.0
-            // 轻度开方压缩：小声也动，大声不顶满
-            v = Math.sqrt(v.coerceIn(0.0, 1.0))
-            spectrumSmoothed[b] = (0.6f * v + 0.4f * spectrumSmoothed[b]).toFloat()
-            bands[b] = spectrumSmoothed[b].coerceIn(0f, 1f)
-        }
-        // 3.50.0 诊断：首帧有真实数据（任一段 > 0.05）记一次，证明回调在跑
-        if (!spectrumLoggedFlow) {
-            for (b in 0 until 24) {
-                if (bands[b] > 0.05f) {
-                    spectrumLoggedFlow = true
-                    engineLog("引擎：频谱数据流动中")
-                    break
-                }
-            }
-        }
-        try {
-            val arr = JSONArray()
-            for (b in 0 until 24) arr.put(bands[b].toDouble())
-            pushSync(JSONObject().put("t", "spectrum").put("bands", arr))
-        } catch (_: Exception) {
-        }
-    }
-
     /** 把 eq_state.json 里存的 {enabled,preset,levels} 应用到新建的 Equalizer：
      * preset>=0 用 usePreset（实际电平落盘时回读）；自定义则逐段 setBandLevel */
     private fun eqApplySaved(e: Equalizer) {
@@ -3059,7 +2905,6 @@ class KeepAliveService : Service() {
         } catch (_: Exception) {
         }
         eq = null
-        spectrumStop()
         try {
             player?.release()
         } catch (_: Exception) {
