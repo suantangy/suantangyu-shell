@@ -2680,11 +2680,10 @@ class KeepAliveService : Service() {
         for (b in 0 until 24) {
             val fLo = fMin * Math.pow(fMax / fMin, b / 24.0)
             val fHi = fMin * Math.pow(fMax / fMin, (b + 1) / 24.0)
-            var binLo = (fLo * fft.size / sr).toInt()
-            var binHi = (fHi * fft.size / sr).toInt()
-            if (binLo < 1) binLo = 1
-            if (binHi > bins) binHi = bins
-            if (binHi <= binLo) binHi = binLo + 1
+            // 频点下标钳在 [1, bins] 内：低采样率（如 22050Hz）时高频段的
+            // fLo 对应 bin 会超 Nyquist，旧写法会在此越界
+            var binLo = (fLo * fft.size / sr).toInt().coerceIn(1, bins - 1)
+            var binHi = (fHi * fft.size / sr).toInt().coerceIn(binLo + 1, bins)
             var sum = 0.0
             var count = 0
             for (i in binLo until binHi) {
