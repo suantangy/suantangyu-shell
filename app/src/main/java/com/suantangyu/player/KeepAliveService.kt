@@ -958,6 +958,15 @@ class KeepAliveService : Service() {
             watchdogStall = 0
             watchdogEndedStall = 0
             watchdogLastPos = pos
+            // 3.50.0 频谱看门狗重试：起播时会话未就绪（audioSessionId==0）或
+            // Visualizer 构造失败会静默跳过，之后无人再试；每 10s 巡检在播
+            // 且频谱未建时补一次，spectrumStart 对 0 会话与重复会话都安全。
+            if (playing && spectrum == null) {
+                try {
+                    spectrumStart(p.audioSessionId)
+                } catch (_: Exception) {
+                }
+            }
             return
         }
         watchdogLastPos = pos
@@ -2613,10 +2622,21 @@ class KeepAliveService : Service() {
     private var spectrumSessionId: Int = 0
     private var spectrumLastPushMs: Long = 0L
     private val spectrumSmoothed = FloatArray(24)
+    // 3.50.0 诊断：每会话只记一次（spectrumStop 复位）
+    private var spectrumLoggedStart: Boolean = false
+    private var spectrumLoggedFail: Boolean = false
+    private var spectrumLoggedFlow: Boolean = false
 
     /** 起播/会话变化时（重）建 Visualizer；同一会话重复调只开不建 */
     private fun spectrumStart(sessionId: Int) {
-        if (sessionId == 0) return
+        if (sessionId == 0) {
+            // 3.50.0 诊断：会话未就绪（起播竞态）也记一次失败，之后看门狗重试
+            if (!spectrumLoggedFail) {
+                spectrumLoggedFail = true
+                engineLog("引擎：频谱启动失败")
+            }
+            return
+        }
         if (spectrum != null && spectrumSessionId == sessionId) {
             try {
                 spectrum?.enabled = true
@@ -2645,9 +2665,19 @@ class KeepAliveService : Service() {
             v.enabled = true
             spectrum = v
             spectrumSessionId = sessionId
+            // 3.50.0 诊断：Visualizer 建成并启用，记一次
+            if (!spectrumLoggedStart) {
+                spectrumLoggedStart = true
+                engineLog("引擎：频谱已启动")
+            }
         } catch (_: Exception) {
             spectrum = null
             spectrumSessionId = 0
+            // 3.50.0 诊断：构造/监听/启用抛错，记一次失败
+            if (!spectrumLoggedFail) {
+                spectrumLoggedFail = true
+                engineLog("引擎：频谱启动失败")
+            }
         }
     }
 
@@ -2663,6 +2693,10 @@ class KeepAliveService : Service() {
         }
         spectrum = null
         spectrumSessionId = 0
+        // 3.50.0 诊断：会话结束，诊断位复位，下一首重新记一次
+        spectrumLoggedStart = false
+        spectrumLoggedFail = false
+        spectrumLoggedFlow = false
     }
 
     /** FFT 回调线程：频点 → 24 段对数频带（60Hz..16kHz），节流后推网页 */
@@ -2697,6 +2731,16 @@ class KeepAliveService : Service() {
             v = Math.sqrt(v.coerceIn(0.0, 1.0))
             spectrumSmoothed[b] = (0.6f * v + 0.4f * spectrumSmoothed[b]).toFloat()
             bands[b] = spectrumSmoothed[b].coerceIn(0f, 1f)
+        }
+        // 3.50.0 诊断：首帧有真实数据（任一段 > 0.05）记一次，证明回调在跑
+        if (!spectrumLoggedFlow) {
+            for (b in 0 until 24) {
+                if (bands[b] > 0.05f) {
+                    spectrumLoggedFlow = true
+                    engineLog("引擎：频谱数据流动中")
+                    break
+                }
+            }
         }
         try {
             val arr = JSONArray()
