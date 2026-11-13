@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.audiofx.Equalizer
+import android.media.audiofx.Visualizer
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -1385,6 +1386,8 @@ class KeepAliveService : Service() {
         override fun onAudioSessionIdChanged(audioSessionId: Int) {
             // 3.24.0：音频会话变化时重建系统均衡器并重应用音效状态
             eqAttach(audioSessionId)
+            // 3.49.0：会话变化时频谱跟新会话走（播着才重建，停着等起播）
+            if (playing) spectrumStart(audioSessionId)
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -1421,6 +1424,12 @@ class KeepAliveService : Service() {
                     engineLog("引擎：网络已恢复，继续播放 " + title)
                     clearNetPark()
                 }
+            }
+            // 3.49.0：频谱跟播放态走——起播抓会话，暂停/停播释放（省电、省桥流量）
+            if (isPlaying) {
+                spectrumStart(player?.audioSessionId ?: 0)
+            } else {
+                spectrumStop()
             }
             syncAnchorFromPlayer()
             updateSessionState()
@@ -2596,6 +2605,108 @@ class KeepAliveService : Service() {
         eqWriteState()
     }
 
+    // —— 3.49.0 频谱：安卓 Visualizer 抓 ExoPlayer 音频会话的实时 FFT ——
+    // 只读不改音频；构造失败（无会话、无权限、设备不支持）时静默放弃，不影响播放。
+    // 回调线程把 FFT 转 24 段对数频带，节流 50ms 后经 pushSync 推给网页
+    // {"t":"spectrum","bands":[24 个 0..1]}；网页只在均衡器封面激活时消费。
+    private var spectrum: Visualizer? = null
+    private var spectrumSessionId: Int = 0
+    private var spectrumLastPushMs: Long = 0L
+    private val spectrumSmoothed = FloatArray(24)
+
+    /** 起播/会话变化时（重）建 Visualizer；同一会话重复调只开不建 */
+    private fun spectrumStart(sessionId: Int) {
+        if (sessionId == 0) return
+        if (spectrum != null && spectrumSessionId == sessionId) {
+            try {
+                spectrum?.enabled = true
+            } catch (_: Exception) {
+            }
+            return
+        }
+        spectrumStop()
+        try {
+            val v = Visualizer(sessionId)
+            val range = Visualizer.getCaptureSizeRange()
+            v.captureSize = 1024.coerceIn(range[0], range[1])
+            v.setDataCaptureListener(
+                object : Visualizer.OnDataCaptureListener {
+                    override fun onWaveFormDataCapture(vis: Visualizer?, waveform: ByteArray?, samplingRate: Int) {
+                    }
+
+                    override fun onFftDataCapture(vis: Visualizer?, fft: ByteArray?, samplingRate: Int) {
+                        if (fft != null) spectrumOnFft(fft, samplingRate)
+                    }
+                },
+                Visualizer.getMaxCaptureRate(),
+                false,
+                true
+            )
+            v.enabled = true
+            spectrum = v
+            spectrumSessionId = sessionId
+        } catch (_: Exception) {
+            spectrum = null
+            spectrumSessionId = 0
+        }
+    }
+
+    /** 暂停/停播/销毁时释放；已停时空操作 */
+    private fun spectrumStop() {
+        try {
+            spectrum?.enabled = false
+        } catch (_: Exception) {
+        }
+        try {
+            spectrum?.release()
+        } catch (_: Exception) {
+        }
+        spectrum = null
+        spectrumSessionId = 0
+    }
+
+    /** FFT 回调线程：频点 → 24 段对数频带（60Hz..16kHz），节流后推网页 */
+    private fun spectrumOnFft(fft: ByteArray, samplingRate: Int) {
+        if (!playing) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - spectrumLastPushMs < 50) return
+        spectrumLastPushMs = now
+        val bins = fft.size / 2
+        if (bins < 2) return
+        val sr = if (samplingRate > 0) samplingRate.toDouble() else 44100.0
+        val fMin = 60.0
+        val fMax = 16000.0
+        val bands = FloatArray(24)
+        for (b in 0 until 24) {
+            val fLo = fMin * Math.pow(fMax / fMin, b / 24.0)
+            val fHi = fMin * Math.pow(fMax / fMin, (b + 1) / 24.0)
+            var binLo = (fLo * fft.size / sr).toInt()
+            var binHi = (fHi * fft.size / sr).toInt()
+            if (binLo < 1) binLo = 1
+            if (binHi > bins) binHi = bins
+            if (binHi <= binLo) binHi = binLo + 1
+            var sum = 0.0
+            var count = 0
+            for (i in binLo until binHi) {
+                val re = fft[i * 2].toInt()
+                val im = fft[i * 2 + 1].toInt()
+                sum += Math.sqrt((re * re + im * im).toDouble())
+                count++
+            }
+            var v = if (count > 0) sum / count / 128.0 else 0.0
+            // 轻度开方压缩：小声也动，大声不顶满
+            v = Math.sqrt(v.coerceIn(0.0, 1.0))
+            spectrumSmoothed[b] = (0.6f * v + 0.4f * spectrumSmoothed[b]).toFloat()
+            bands[b] = spectrumSmoothed[b].coerceIn(0f, 1f)
+        }
+        try {
+            val arr = JSONArray()
+            for (b in 0 until 24) arr.put(bands[b].toDouble())
+            pushSync(JSONObject().put("t", "spectrum").put("bands", arr))
+        } catch (_: Exception) {
+        }
+    }
+
     /** 把 eq_state.json 里存的 {enabled,preset,levels} 应用到新建的 Equalizer：
      * preset>=0 用 usePreset（实际电平落盘时回读）；自定义则逐段 setBandLevel */
     private fun eqApplySaved(e: Equalizer) {
@@ -2905,6 +3016,7 @@ class KeepAliveService : Service() {
         } catch (_: Exception) {
         }
         eq = null
+        spectrumStop()
         try {
             player?.release()
         } catch (_: Exception) {
