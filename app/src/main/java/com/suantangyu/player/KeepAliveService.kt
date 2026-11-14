@@ -231,6 +231,10 @@ class KeepAliveService : Service() {
     // （enginelog 同步，网页以 toast 呈现），便于真机定位。
     private var lastArmAtMs: Long = 0L
     private var lastEngineAtMs: Long = 0L
+    // 3.53.0：预取退避状态（cheng 定）——按首歌记失败次数与下次可试时间
+    // （elapsedRealtime 毫秒）。LongArray(2)：[0]=失败次数，[1]=下次可试时间。
+    // 只管补仓这一路，脑子现解析与停车场不动；内存态，服务重建即清零。
+    private val prefetchBackoff = HashMap<String, LongArray>()
     private var engineBusy: Boolean = false
     private var configSources: List<LxResolver.SrcCfg> = emptyList()
     private var configQuality: String = "master"
@@ -723,6 +727,37 @@ class KeepAliveService : Service() {
         }
     }
 
+    // 3.53.0：预取退避表（cheng 定）——1 次→5s，2 次→10s，3 次→20s，
+    // 4 次及以后→30s 封顶；解出即清零。
+    private fun prefetchBackoffMs(fails: Long): Long = when (fails) {
+        1L -> 5000L
+        2L -> 10000L
+        3L -> 20000L
+        else -> 30000L
+    }
+
+    // 3.53.0：这首歌现在能不能试（不在退避期内）
+    private fun prefetchDue(key: String, now: Long): Boolean {
+        synchronized(prefetchBackoff) {
+            val bo = prefetchBackoff[key] ?: return true
+            return now >= bo[1]
+        }
+    }
+
+    // 3.53.0：记一次预取失败，下次按表等
+    private fun prefetchNoteFail(key: String) {
+        synchronized(prefetchBackoff) {
+            val st = prefetchBackoff.getOrPut(key) { LongArray(2) }
+            st[0]++
+            st[1] = android.os.SystemClock.elapsedRealtime() + prefetchBackoffMs(st[0])
+        }
+    }
+
+    // 3.53.0：解出来了，退避清零
+    private fun prefetchNoteOk(key: String) {
+        synchronized(prefetchBackoff) { prefetchBackoff.remove(key) }
+    }
+
     private fun maybeEngineResolve() {
         val wantPlay = playing ||
             (try {
@@ -765,6 +800,8 @@ class KeepAliveService : Service() {
             // 3.9.0：已下载到本地的歌不占补仓解析，起播时脑子直接播文件
             if (localFileForKey(k) != null) continue
             if (s.optString("name").isEmpty()) continue
+            // 3.53.0：预取退避——这首歌还在退避期内就跳过，等时间到了再试
+            if (!prefetchDue(k, now)) continue
             todo.add(s)
         }
         if (todo.isEmpty()) return
@@ -778,7 +815,8 @@ class KeepAliveService : Service() {
             val ck = if (cs != null) LxResolver.keyOfJson(cs) else ""
             todo.clear()
             if (cs != null && ck.isNotEmpty() && !armedKeys.contains(ck) &&
-                cs.optString("name").isNotEmpty()
+                cs.optString("name").isNotEmpty() &&
+                prefetchDue(ck, now)
             ) {
                 todo.add(cs)
                 step4RepeatKey = ck
@@ -807,10 +845,14 @@ class KeepAliveService : Service() {
                     ) { m -> engineLog(m) }
                     if (url.isNullOrEmpty()) {
                         fN++
+                        // 3.53.0：预取退避——记一次失败，下次按表等
+                        prefetchNoteFail(sKey4)
                         engineLog("引擎解析失败：" + song.optString("name"))
                         continue
                     }
                     okN++
+                    // 3.53.0：解出来了，退避清零
+                    prefetchNoteOk(sKey4)
                     val item = ArmedItem(
                         url, LxResolver.keyOfJson(song),
                         song.optString("name"), song.optString("artist"),
@@ -2777,6 +2819,25 @@ class KeepAliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 3.53.0：崩溃捕获——崩了先把堆栈同步写进引擎日志再死，
+        // 下次熄屏退出一眼可定是崩了还是被杀（2026-11-14 实证：
+        // 壳无崩溃记录，无法区分）。写日志失败也不掩盖崩溃。
+        val prevCrashHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                engineLog(
+                    "引擎：进程崩溃 " + t.name + " " + e.javaClass.name + ": " + e.message +
+                        "\n" + sw.toString()
+                )
+            } catch (_: Exception) {
+            }
+            try {
+                prevCrashHandler?.uncaughtException(t, e)
+            } catch (_: Exception) {
+            }
+        }
         loadPersistedRate()
         createChannel()
         ScriptSeg.fileSink = { s -> scriptFileAppend(s) }
