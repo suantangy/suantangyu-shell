@@ -312,10 +312,11 @@ class KeepAliveService : Service() {
     // （歌是平台自己列出来的、QQ 曲库又全），再往下跳歌验的还
     // 是同一批坏管线，纯烧时间与电。停在目标歌上等管线恢复，
     // 新意图/切歌/暂停即作废，与网络停车场同规矩。探针双轨独
-    // 立（3.41.0，cheng 定案）：A 线自探目标（10 秒首探、之后
-    // 每 60 秒一轮、不限轮），探到即原地续播；B 线自纠定性
-    // （20 秒探上一首、80 秒探下一首），任一探活而目标未恢复
-    // 即撤销定罪、跳过此歌，两轮皆空即退场、只剩 A 线继续等
+    // 立（3.41.0，cheng 定案；3.55.0 提速）：A 线自探目标（5 秒
+    // 首探、之后每 10 秒一轮、不限轮），探到即原地续播；B 线
+    // 自纠定性（10 秒探上一首、20 秒探下一首），任一探活而目
+    // 标未恢复即撤销定罪、跳过此歌，两轮皆空即退场、只剩 A
+    // 线继续等；B 到期时串联在 A 跑完当场跟上
     private var pipeParkKey = ""
     private var pipeParkTitle = ""
     private var pipeParkFromStart = false
@@ -1077,18 +1078,19 @@ class KeepAliveService : Service() {
                             " 分钟）"
                     )
                 }
-                // A 先 B 后：同 tick 两条线都到期也先探目标，B
-                // 永远踩在 A 的探针之后约 10 秒（A 10/70/… 秒、
-                // B 20/80 秒），翻案时手里的目标证据不超过约 10
-                // 秒旧；pipeProbeBusy 是两条线共用的串行闸（脚
-                // 本引擎只有一条线，执行层照旧排队）
+                // A 先 B 后：同 tick 两条线都到期也先探目标；
+                // B 不等下一 tick，A 跑完当场串联跑 B（A 5/15/
+                // 25/… 秒、B 10/20 秒，两轮退场），翻案时手里
+                // 的目标证据就是刚探完的、最新鲜；pipeProbeBusy
+                // 是两条线共用的串行闸（脚本引擎只有一条线，
+                // 执行层照旧排队）
                 if (!pipeProbeBusy &&
-                    nowP - pipeParkLastTryMs >= 60_000L
+                    nowP - pipeParkLastTryMs >= 10_000L
                 ) {
                     probePipeParkTarget()
                 }
                 if (!pipeProbeBusy && pipeParkRefCount < 2 &&
-                    nowP - pipeParkRefLastTryMs >= 60_000L
+                    nowP - pipeParkRefLastTryMs >= 10_000L
                 ) {
                     probePipeParkRef()
                 }
@@ -1782,13 +1784,14 @@ class KeepAliveService : Service() {
         pipeParkRefUsedKey = ""
         pipeParkRefCount = 0
         pipeParkSinceMs = now
-        // 双轨各自回拨计时（看门狗一律按 60 秒间隔判定）：A 线
-        // lastTry 回拨 50 秒 → 首探落在 +10 秒，其后以探针起点
-        // 计每 60 秒一轮、不限轮；B 线回拨 40 秒 → 首探（上一
-        // 首）落在 +20 秒，第二轮（下一首）在首探起点 +60 秒，
-        // 即 +80 秒，两轮走完退场
-        pipeParkLastTryMs = now - 50_000L
-        pipeParkRefLastTryMs = now - 40_000L
+        // 双轨各自回拨计时（看门狗一律按 10 秒间隔判定）：A 线
+        // lastTry 回拨 5 秒 → 首探落在 +5 秒，其后以探针起点
+        // 计每 10 秒一轮、不限轮；B 线不回拨 → 首探（上一首）
+        // 落在 +10 秒，第二轮（下一首）在首探起点 +10 秒，即
+        // +20 秒，两轮走完退场；B 到期时串联在 A 跑完当场跟
+        // 上，不等下一 tick
+        pipeParkLastTryMs = now - 5_000L
+        pipeParkRefLastTryMs = now
         pipeParkWaitLoggedMin = 0
         engineLog(
             "引擎：解析全灭，疑似音源/平台整体故障，暂停跳歌 " +
@@ -1814,7 +1817,7 @@ class KeepAliveService : Service() {
         val gen = brainOpGen
         resolveExec.execute {
             val url = try {
-                // 3.54.0：探针绕过冻（cheng 定）——一分钟才问一次，
+                // 3.54.0：探针绕过冻（cheng 定）——十秒问一次，
                 // 本就是去测腿好了没，直接问；冻只管预取、点播
                 LxResolver.resolve(
                     desc, configSources, configQuality, configAutoDown,
@@ -1841,7 +1844,17 @@ class KeepAliveService : Service() {
                     )
                     applyAdvance(item, playIt = true)
                 }
-                // 仍空：定罪维持，等下一轮（60 秒后）
+                // 仍空：定罪维持，等下一轮（10 秒后）
+                // 3.55.0：B 线串联——A 跑完顺手看一眼 B 到没到
+                // 点，到了就接着跑（A 每 10 秒一轮、每 tick 都
+                // 到期，B 等下一 tick 永远轮不上；串联让两轮都
+                // 在 A 跑完当场跟上，A 不多等，B 不饿死；A 若
+                // 探活上面已清停车收场，不会走到这里）
+                if (url.isNullOrEmpty() && pipeParkRefCount < 2 &&
+                    SystemClock.elapsedRealtime() - pipeParkRefLastTryMs >= 10_000L
+                ) {
+                    probePipeParkRef()
+                }
             }
         }
     }
@@ -1975,7 +1988,7 @@ class KeepAliveService : Service() {
                             desc.optString("name") + "（目标自探继续）"
                     )
                 }
-                // 第 1 轮空：定罪维持，等第 2 轮（首探起点 +60 秒）
+                // 第 1 轮空：定罪维持，等第 2 轮（首探起点 +10 秒）
             }
         }
     }
