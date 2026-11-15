@@ -1814,9 +1814,11 @@ class KeepAliveService : Service() {
         val gen = brainOpGen
         resolveExec.execute {
             val url = try {
+                // 3.54.0：探针绕过冻（cheng 定）——一分钟才问一次，
+                // 本就是去测腿好了没，直接问；冻只管预取、点播
                 LxResolver.resolve(
                     desc, configSources, configQuality, configAutoDown,
-                    lxEngine()
+                    lxEngine(), ignoreCooling = true
                 ) { m -> engineLog(m) }
             } catch (_: Exception) {
                 null
@@ -1905,9 +1907,11 @@ class KeepAliveService : Service() {
         val gen = brainOpGen
         resolveExec.execute {
             val refUrl = try {
+                // 3.54.0：探针绕过冻（cheng 定）——同 A 线，B 线判
+                // 管线死活也要真问冻住的腿，不然探空被冻污染
                 LxResolver.resolve(
                     rd, configSources, configQuality, configAutoDown,
-                    lxEngine()
+                    lxEngine(), ignoreCooling = true
                 ) { m -> engineLog(m) }
             } catch (_: Exception) {
                 null

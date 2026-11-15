@@ -276,8 +276,9 @@ object LxResolver {
         engine: LxEngine?,
         budgetMs: Long = 90000L,
         banUrls: Set<String> = emptySet(),
+        ignoreCooling: Boolean = false,
         log: (String) -> Unit
-    ): String? = resolveProv(song, sources, wantQ, autoDown, engine, budgetMs, banUrls, log)?.url
+    ): String? = resolveProv(song, sources, wantQ, autoDown, engine, budgetMs, banUrls, ignoreCooling, log)?.url
 
     fun resolveProv(
         song: JSONObject,
@@ -287,6 +288,7 @@ object LxResolver {
         engine: LxEngine?,
         budgetMs: Long = 90000L,
         banUrls: Set<String> = emptySet(),
+        ignoreCooling: Boolean = false,
         log: (String) -> Unit
     ): Prov? {
         // 3.12.0：解析分段记录（脚本日志搬进脑子）——一进一出包一段，
@@ -294,7 +296,7 @@ object LxResolver {
         ScriptSeg.begin(song)
         var out: Prov? = null
         try {
-            out = resolveBody(song, sources, wantQ, autoDown, engine, budgetMs, banUrls, log)
+            out = resolveBody(song, sources, wantQ, autoDown, engine, budgetMs, banUrls, ignoreCooling, log)
         } finally {
             ScriptSeg.end(out?.url, out?.srcName ?: "", out?.tier ?: "", out?.viaQq ?: false)
         }
@@ -309,6 +311,7 @@ object LxResolver {
         engine: LxEngine?,
         budgetMs: Long = 90000L,
         banUrls: Set<String> = emptySet(),
+        ignoreCooling: Boolean = false,
         log: (String) -> Unit
     ): Prov? {
         // 3.3.1：单曲解析总时限（默认 90 秒，脚本源慢调用由引擎 30 秒/次封顶，
@@ -331,7 +334,7 @@ object LxResolver {
                 ScriptSeg.note("引擎：单曲解析超时跳过 " + song.optString("name"))
                 return null
             }
-            val hit = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls)
+            val hit = resolveAtQuality(song, q, sources, engine, log, deadline, banUrls, ignoreCooling)
             if (hit != null) return Prov(hit.url, false, hit.srcName, canonTier(q))
         }
         if (songPlat != "qq" && System.currentTimeMillis() <= deadline) {
@@ -341,7 +344,7 @@ object LxResolver {
                 ScriptSeg.note("引擎：本平台各档已尽，启用 QQ 兜底 " + song.optString("name"))
                 for (q in tiers) {
                     if (System.currentTimeMillis() > deadline) break
-                    val hit2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls)
+                    val hit2 = resolveAtQuality(alt, q, sources, engine, log, deadline, banUrls, ignoreCooling)
                     if (hit2 != null) {
                         log("引擎：QQ 兜底命中 " + song.optString("name") + "（" + q + "）")
                         return Prov(hit2.url, true, hit2.srcName, canonTier(q))
@@ -359,7 +362,8 @@ object LxResolver {
         engine: LxEngine?,
         log: (String) -> Unit,
         deadline: Long = Long.MAX_VALUE,
-        banUrls: Set<String> = emptySet()
+        banUrls: Set<String> = emptySet(),
+        ignoreCooling: Boolean = false
     ): Hit? {
         val mid = cleanPlayMid(song)
         if (mid.isEmpty()) return null
@@ -369,7 +373,11 @@ object LxResolver {
         }
         for (src in chain) {
             if (System.currentTimeMillis() > deadline) return null
-            if (isCooling(src, songPlat)) continue
+            // 3.54.0：停车场探针绕过冻（cheng 定）——探针一分钟才问一
+            // 次，本就是去测腿好了没，直接问；冻只管高频那几路
+            // （预取、点播），不管探针。绕过时冻住的源照问，问活
+            // 了下面解冻；问死了照样重新冻上。
+            if (!ignoreCooling && isCooling(src, songPlat)) continue
             val t0 = System.currentTimeMillis()
             var threw = false
             val r = try {
@@ -380,7 +388,8 @@ object LxResolver {
             }
             if (r == null) {
                 // 3.15.0 源×平台冷却：硬失败（抛异常、或耗满 8 秒超时级
-                // 时长仍无果）才凉这个源在这个平台 3 分钟；快速答
+                // 时长仍无果）才凉这个源在这个平台 1 分钟（3.54.0
+                // 由 3 分钟缩到 1 分钟，cheng 定）；快速答
                 // 「没有」不凉——那是歌的问题不是源死了
                 // 3.43.0：脚本源亲口报的错经引擎回传为异常、同样算抛
                 // 异常（此前被引擎吞成普通空结果，只有耗满 8 秒才凉，
@@ -438,10 +447,14 @@ object LxResolver {
                         okLxUrls.add(r.url)
                     }
                 }
+                unbenchSource(src, songPlat, log)
                 return Hit(r.url, src.name)
             }
             val det = detectQualityFromUrl(r.url)
-            if (det == null || qualityMeets(det, q)) return Hit(r.url, src.name)
+            if (det == null || qualityMeets(det, q)) {
+                unbenchSource(src, songPlat, log)
+                return Hit(r.url, src.name)
+            }
             // 3.15.0 对齐网页：音质不达标只毙这个源、继续问下一个源；
             // 旧行为整档判败，会让排第一的源一个低音质址带死整档
         }
@@ -466,9 +479,21 @@ object LxResolver {
     private fun benchSource(src: SrcCfg, plat: String, log: (String) -> Unit) {
         synchronized(srcCooldownUntil) {
             srcCooldownUntil[src.key() + "|" + plat] =
-                System.currentTimeMillis() + 180_000L
+                System.currentTimeMillis() + 60_000L
         }
-        log("引擎：源冷却 " + src.name + " 平台 " + plat + "（3 分钟）")
+        log("引擎：源冷却 " + src.name + " 平台 " + plat + "（1 分钟）")
+    }
+
+    // 3.54.0：探针探活解冻——绕过冻问活了的源，把它的冻摘掉
+    // （腿自己证明活着了，没必要再关着）；没冻住就是空操作。
+    // 只有探针绕过时才可能命中（平时冻住的源根本问不到）。
+    private fun unbenchSource(src: SrcCfg, plat: String, log: (String) -> Unit) {
+        val removed = synchronized(srcCooldownUntil) {
+            srcCooldownUntil.remove(src.key() + "|" + plat) != null
+        }
+        if (removed) {
+            log("引擎：源解冻 " + src.name + " 平台 " + plat + "（探针探活）")
+        }
     }
 
     // 3.35.0 构造源预验：构造型源（念心/淡月疏星）拼址永不失败，链在
