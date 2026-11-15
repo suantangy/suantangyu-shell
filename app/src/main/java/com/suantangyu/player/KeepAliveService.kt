@@ -940,7 +940,7 @@ class KeepAliveService : Service() {
     // 20s 只管彻底断线），网页迟到的切歌前摇（pause / 清 src 的 stop）又可能
     // 在接播后落到新曲上把它按停/卸载，而网页自己的切歌流程卡在解析上，
     // 后续的 PLAY_URL 永远不来。两条卡法共同的缺口是：装载后没人确认"真的
-    // 出声了"。看门狗每 10s 采样一次：有播放意图却不在播、位置也没推进，
+    // 出声了"。看门狗每 5s 采样一次：有播放意图却不在播、位置也没推进，
     // 先整条重拉一次（换新连接），仍卡就停掉播放器并给网页发 error 同步，
     // 交垫片重试 / 页面换源降级链接管，不再无限期静默。
     private val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -957,7 +957,7 @@ class KeepAliveService : Service() {
                 watchdogTick()
             } catch (_: Exception) {
             }
-            if (watchdogRunning) watchdogHandler.postDelayed(this, 10_000)
+            if (watchdogRunning) watchdogHandler.postDelayed(this, 5_000)
         }
     }
 
@@ -967,7 +967,7 @@ class KeepAliveService : Service() {
         watchdogEndedStall = 0
         if (watchdogRunning) return
         watchdogRunning = true
-        watchdogHandler.postDelayed(watchdogRunnable, 10_000)
+        watchdogHandler.postDelayed(watchdogRunnable, 5_000)
     }
 
     private fun stopWatchdog() {
@@ -1784,7 +1784,7 @@ class KeepAliveService : Service() {
         pipeParkRefUsedKey = ""
         pipeParkRefCount = 0
         pipeParkSinceMs = now
-        // 双轨各自回拨计时（看门狗一律按 10 秒间隔判定）：A 线
+        // 双轨各自回拨计时（看门狗一律按 5 秒间隔判定）：A 线
         // lastTry 回拨 5 秒 → 首探落在 +5 秒，其后以探针起点
         // 计每 10 秒一轮、不限轮；B 线不回拨 → 首探（上一首）
         // 落在 +10 秒，第二轮（下一首）在首探起点 +10 秒，即
@@ -3636,7 +3636,7 @@ class KeepAliveService : Service() {
         }
     }
 
-    /** 睡眠分钟定时到点检查（看门狗 10 秒粒度）：到点暂停并通知页面清显示；
+    /** 睡眠分钟定时到点检查（看门狗 5 秒粒度）：到点暂停并通知页面清显示；
      * 没在播也照常收账，免得页面留着过期的定时显示 */
     private fun checkBrainSleepDeadline() {
         if (brainSleepUntilMs <= 0L) return
