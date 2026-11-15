@@ -1102,7 +1102,7 @@ object LxResolver {
 }
 
 /** 脚本日志分段（3.12.0 建，3.12.1 改暂存落盘）：resolve 一进一出记
- * 一段——段头（歌名-歌手）、段尾（✓ 解析成功 → host（脚本 档）/ ✗ 解析失败）；段
+ * 一段——段头（歌名-歌手）、段尾（✓ 解析成功 → host［脚本（接口）档］/ ✗ 解析失败）；段
  * 进行中的脚本行由服务侧引擎回调转入。段先在内存暂存，歌真正起播
  * （或点播终点失败）才落盘进 lx_script.log——预置/补仓解析没被播到
  * 的段永不出现，与旧网页脚本日志「播到才并入」的规矩一致。fileSink
@@ -1177,7 +1177,34 @@ object ScriptSeg {
     }
 
     // 3.48.0：尾行改 ✓/✗（段头 ▶ 播放留着，头尾一眼分开）；成功时括号里写
-    // 赢的脚本和档（链上第几档，与验档作废行的档同义；QQ 兜底赢的标 QQ兜底）
+    // 赢的脚本和档（链上第几档，与验档作废行的档同义；QQ 兜底赢的标 QQ兜底）。
+    // 3.57.0：外层括号改 ［］（与内层接口名（）区分）；多接口源在接口名处写
+    // 赢的接口（取段内最后一条「使用接口」行），单接口源没有这行、不写接口名。
+    // 段尾加接口名（多接口源取段内最后一条「使用接口」行，赢家最后落笔；
+    // 单接口源没有这行，返回空、不显示。行形如
+    // "[酸汤鱼音源] '[酷我] 使用接口:', '枫叶'"，接口名在最后一段单引号里；
+    // 无引号形如「使用接口: 枫叶」时走兜底分支）
+    private fun extractIface(lines: List<String>): String {
+        var found: String? = null
+        for (ln in lines) {
+            if (ln.contains("使用接口")) found = ln
+        }
+        if (found == null) return ""
+        val idx = found.indexOf("使用接口") + "使用接口".length
+        val tail = found.substring(idx)
+        val lastQ = tail.lastIndexOf('\'')
+        if (lastQ >= 0) {
+            val firstQ = tail.lastIndexOf('\'', lastQ - 1)
+            if (firstQ >= 0 && lastQ > firstQ) {
+                val name = tail.substring(firstQ + 1, lastQ).trim()
+                if (name.isNotEmpty()) return name
+            }
+        }
+        val t2 = tail.trimStart(':', '：', ' ', '\'', '"', ',', '，')
+        val end = t2.indexOfFirst { it == '\'' || it == '"' || it == ',' || it == ' ' || it == '，' }
+        return (if (end >= 0) t2.substring(0, end) else t2).trim()
+    }
+
     fun end(url: String?, srcName: String = "", tier: String = "", viaQq: Boolean = false) {
         synchronized(lock) {
             val seg = openSegs.remove(Thread.currentThread().id) ?: return
@@ -1188,7 +1215,10 @@ object ScriptSeg {
                 } catch (_: Exception) {
                 }
                 val who = if (srcName.isNotEmpty() && tier.isNotEmpty()) {
-                    "（" + srcName + (if (viaQq) " QQ兜底" else "") + " " + tier + " 档）"
+                    val iface = extractIface(seg.lines)
+                    val ifacePart = if (iface.isNotEmpty()) "（" + iface + "）" else ""
+                    val qqPart = if (viaQq) " QQ兜底 " else ""
+                    "［" + srcName + ifacePart + qqPart + tier + "档］"
                 } else ""
                 seg.lines.add(
                     stamp(if (host.isNotEmpty()) "✓ 解析成功 → " + host + who else "✓ 解析成功" + who)

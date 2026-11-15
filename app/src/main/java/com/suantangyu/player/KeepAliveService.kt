@@ -383,15 +383,15 @@ class KeepAliveService : Service() {
         }
         try {
             val f = java.io.File(filesDir, "lx_engine.log")
-            // 3.5.1：上限提到 1MB；写满时滚动保留——只丢最老的一段
-            // （删到剩约 768KB），不再整文件删光（旧实现 256KB 写满即
+            // 3.57.0：上限提到 5MB；写满时滚动保留——只丢最老的一段
+            // （删到剩约 4MB），不再整文件删光（旧实现 256KB 写满即
             // 整表删除，前半夜的记录会整段消失，查案时日志像断了一截）
-            if (f.length() > 1024 * 1024) {
+            if (f.length() > 5 * 1024 * 1024) {
                 try {
                     val lines = f.readLines(Charsets.UTF_8)
                     var bytes = lines.sumOf { it.toByteArray(Charsets.UTF_8).size + 1 }
                     var drop = 0
-                    while (drop < lines.size && bytes > 768 * 1024) {
+                    while (drop < lines.size && bytes > 4 * 1024 * 1024) {
                         bytes -= lines[drop].toByteArray(Charsets.UTF_8).size + 1
                         drop++
                     }
