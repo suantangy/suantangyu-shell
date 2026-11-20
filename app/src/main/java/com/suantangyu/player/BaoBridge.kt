@@ -473,23 +473,23 @@ class BaoBridge(private val activity: MainActivity) {
             out.put("perm", perm)
             val arr = org.json.JSONArray()
             if (perm) {
-                val ms = android.provider.MediaStore.Audio.Media
+                // 列名用字面量：MediaStore 的列常量散在接口里，Kotlin 经
+                // Audio.Media 类名取不到（Media 是 class 不是 object）
                 val proj = arrayOf(
-                    ms._ID, ms.TITLE, ms.ARTIST, ms.ALBUM, ms.DURATION,
-                    ms.RELATIVE_PATH, ms.DATA
+                    "_id", "title", "artist", "album", "duration",
+                    "relative_path", "_data"
                 )
                 activity.contentResolver.query(
-                    ms.EXTERNAL_CONTENT_URI, proj,
-                    ms.IS_MUSIC + " != 0", null,
-                    ms.DATE_ADDED + " DESC"
+                    android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    proj, "is_music != 0", null, "date_added DESC"
                 )?.use { cur ->
-                    val idC = cur.getColumnIndex(ms._ID)
-                    val tC = cur.getColumnIndex(ms.TITLE)
-                    val aC = cur.getColumnIndex(ms.ARTIST)
-                    val alC = cur.getColumnIndex(ms.ALBUM)
-                    val dC = cur.getColumnIndex(ms.DURATION)
-                    val rpC = cur.getColumnIndex(ms.RELATIVE_PATH)
-                    val dataC = cur.getColumnIndex(ms.DATA)
+                    val idC = cur.getColumnIndex("_id")
+                    val tC = cur.getColumnIndex("title")
+                    val aC = cur.getColumnIndex("artist")
+                    val alC = cur.getColumnIndex("album")
+                    val dC = cur.getColumnIndex("duration")
+                    val rpC = cur.getColumnIndex("relative_path")
+                    val dataC = cur.getColumnIndex("_data")
                     var n = 0
                     while (cur.moveToNext() && n < 2000) {
                         val rp = if (rpC >= 0) cur.getString(rpC) ?: "" else ""
