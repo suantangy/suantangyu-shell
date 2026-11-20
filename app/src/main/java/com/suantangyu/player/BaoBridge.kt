@@ -669,39 +669,45 @@ class BaoBridge(private val activity: MainActivity) {
                     if (cacheFile.exists() && cacheFile.length() > 0) {
                         bytes = cacheFile.readBytes()
                     } else {
+                        var rawPic: ByteArray? = null
                         val mmr = android.media.MediaMetadataRetriever()
                         try {
                             mmr.setDataSource(activity, Uri.parse(uriStr))
-                            val pic = mmr.embeddedPicture
-                            if (pic != null) {
-                                val bmp = android.graphics.BitmapFactory
-                                    .decodeByteArray(pic, 0, pic.size)
-                                if (bmp != null) {
-                                    val maxDim = maxOf(bmp.width, bmp.height)
-                                    val scaled = if (maxDim > 256) {
-                                        val r = 256f / maxDim
-                                        android.graphics.Bitmap.createScaledBitmap(
-                                            bmp,
-                                            (bmp.width * r).toInt().coerceAtLeast(1),
-                                            (bmp.height * r).toInt().coerceAtLeast(1),
-                                            true
-                                        )
-                                    } else bmp
-                                    val bos = java.io.ByteArrayOutputStream()
-                                    scaled.compress(
-                                        android.graphics.Bitmap.CompressFormat.JPEG,
-                                        80, bos
-                                    )
-                                    bytes = bos.toByteArray()
-                                    try {
-                                        cacheFile.writeBytes(bytes)
-                                    } catch (_: Exception) {
-                                    }
-                                }
-                            }
+                            rawPic = mmr.embeddedPicture
                         } catch (_: Exception) {
                         } finally {
                             try { mmr.release() } catch (_: Exception) {
+                            }
+                        }
+                        if (rawPic == null) {
+                            // 3.62：MMR 对 FLAC 图片块支持不全（真机实测
+                            // 取不到），改按文件格式从文件头直接抠图
+                            rawPic = extractArtBytes(Uri.parse(uriStr))
+                        }
+                        if (rawPic != null) {
+                            val bmp = android.graphics.BitmapFactory
+                                .decodeByteArray(rawPic, 0, rawPic.size)
+                            if (bmp != null) {
+                                val maxDim = maxOf(bmp.width, bmp.height)
+                                val scaled = if (maxDim > 256) {
+                                    val r = 256f / maxDim
+                                    android.graphics.Bitmap.createScaledBitmap(
+                                        bmp,
+                                        (bmp.width * r).toInt().coerceAtLeast(1),
+                                        (bmp.height * r).toInt().coerceAtLeast(1),
+                                        true
+                                    )
+                                } else bmp
+                                val bos = java.io.ByteArrayOutputStream()
+                                scaled.compress(
+                                    android.graphics.Bitmap.CompressFormat.JPEG,
+                                    80, bos
+                                )
+                                bytes = bos.toByteArray()
+                                try {
+                                    cacheFile.writeBytes(bytes)
+                                } catch (_: Exception) {
+                                }
                             }
                         }
                     }
@@ -718,6 +724,191 @@ class BaoBridge(private val activity: MainActivity) {
                     org.json.JSONObject.quote(dataUri) + ")"
             )
         }.start()
+    }
+
+    // —— 封面抠图（3.62.0）：FLAC 图片块 / ID3v2 APIC 直接解析 ——
+    // 与离线验证过的镜像实现（fixtures/ArtParser.java）逻辑逐行对应。
+    private fun artReadFully(
+        ins: java.io.InputStream, buf: ByteArray, off: Int, len: Int
+    ): Boolean {
+        var got = 0
+        while (got < len) {
+            val r = try {
+                ins.read(buf, off + got, len - got)
+            } catch (_: Exception) {
+                return false
+            }
+            if (r < 0) return false
+            got += r
+        }
+        return true
+    }
+
+    private fun artSkipFully(ins: java.io.InputStream, n: Long): Boolean {
+        var left = n
+        while (left > 0) {
+            val s = try {
+                ins.skip(left)
+            } catch (_: Exception) {
+                return false
+            }
+            if (s <= 0) {
+                val b = try {
+                    ins.read()
+                } catch (_: Exception) {
+                    return false
+                }
+                if (b < 0) return false
+                left -= 1
+            } else {
+                left -= s
+            }
+        }
+        return true
+    }
+
+    private fun artBe32(b: ByteArray, off: Int): Int {
+        return ((b[off].toInt() and 0xFF) shl 24) or
+            ((b[off + 1].toInt() and 0xFF) shl 16) or
+            ((b[off + 2].toInt() and 0xFF) shl 8) or
+            (b[off + 3].toInt() and 0xFF)
+    }
+
+    private fun extractArtBytes(uri: Uri): ByteArray? {
+        return try {
+            val raw = activity.contentResolver.openInputStream(uri)
+                ?: return null
+            raw.use {
+                val ins = java.io.BufferedInputStream(it, 65536)
+                ins.mark(32)
+                val head = ByteArray(10)
+                var got = 0
+                while (got < 10) {
+                    val r = ins.read(head, got, 10 - got)
+                    if (r < 0) break
+                    got += r
+                }
+                ins.reset()
+                when {
+                    got >= 4 && head[0] == 'f'.code.toByte() &&
+                        head[1] == 'L'.code.toByte() &&
+                        head[2] == 'a'.code.toByte() &&
+                        head[3] == 'C'.code.toByte() ->
+                        parseFlacPicture(ins)
+                    got >= 3 && head[0] == 'I'.code.toByte() &&
+                        head[1] == 'D'.code.toByte() &&
+                        head[2] == '3'.code.toByte() ->
+                        parseId3Apic(ins)
+                    else -> null
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun parseFlacPicture(
+        ins: java.io.InputStream
+    ): ByteArray? {
+        val magic = ByteArray(4)
+        if (!artReadFully(ins, magic, 0, 4)) return null
+        var skipped = 0L
+        for (blk in 0 until 16) {
+            val h = ByteArray(4)
+            if (!artReadFully(ins, h, 0, 4)) return null
+            val last = (h[0].toInt() and 0x80) != 0
+            val type = h[0].toInt() and 0x7F
+            val len = ((h[1].toInt() and 0xFF) shl 16) or
+                ((h[2].toInt() and 0xFF) shl 8) or
+                (h[3].toInt() and 0xFF)
+            if (type == 6) {
+                if (len <= 0 || len > 16 * 1024 * 1024) return null
+                val body = ByteArray(len)
+                if (!artReadFully(ins, body, 0, len)) return null
+                return parseFlacPictureBlock(body)
+            }
+            if (last) return null
+            skipped += len
+            if (skipped > 16L * 1024 * 1024) return null
+            if (!artSkipFully(ins, len.toLong())) return null
+        }
+        return null
+    }
+
+    private fun parseFlacPictureBlock(b: ByteArray): ByteArray? {
+        var off = 0
+        if (b.size < 4) return null
+        val mimeLen = artBe32(b, off)
+        off += 4
+        if (mimeLen < 0 || off + mimeLen + 4 > b.size) return null
+        off += mimeLen
+        val descLen = artBe32(b, off)
+        off += 4
+        if (descLen < 0 || off + descLen + 16 + 4 > b.size) return null
+        off += descLen + 16
+        val dataLen = artBe32(b, off)
+        off += 4
+        if (dataLen <= 0 || off + dataLen > b.size) return null
+        return b.copyOfRange(off, off + dataLen)
+    }
+
+    private fun parseId3Apic(
+        ins: java.io.InputStream
+    ): ByteArray? {
+        val hdr = ByteArray(10)
+        if (!artReadFully(ins, hdr, 0, 10)) return null
+        val ver = hdr[3].toInt() and 0xFF
+        val tagSize = ((hdr[6].toInt() and 0x7F) shl 21) or
+            ((hdr[7].toInt() and 0x7F) shl 14) or
+            ((hdr[8].toInt() and 0x7F) shl 7) or
+            (hdr[9].toInt() and 0x7F)
+        if (tagSize <= 0 || tagSize > 20 * 1024 * 1024) return null
+        val body = ByteArray(tagSize)
+        if (!artReadFully(ins, body, 0, tagSize)) return null
+        var off = 0
+        while (off + 10 <= body.size) {
+            val id = String(body, off, 4, Charsets.ISO_8859_1)
+            if (!id.all { it in 'A'..'Z' || it in '0'..'9' }) break
+            val size = if (ver >= 4) {
+                ((body[off + 4].toInt() and 0x7F) shl 21) or
+                    ((body[off + 5].toInt() and 0x7F) shl 14) or
+                    ((body[off + 6].toInt() and 0x7F) shl 7) or
+                    (body[off + 7].toInt() and 0x7F)
+            } else {
+                artBe32(body, off + 4)
+            }
+            if (size <= 0 || off + 10 + size > body.size) break
+            if (id == "APIC") {
+                return parseApicBody(body, off + 10, size)
+            }
+            off += 10 + size
+        }
+        return null
+    }
+
+    private fun parseApicBody(
+        b: ByteArray, start: Int, len: Int
+    ): ByteArray? {
+        val end = start + len
+        if (len < 4) return null
+        val enc = b[start].toInt() and 0xFF
+        var off = start + 1
+        while (off < end && b[off].toInt() != 0) off++
+        if (off >= end) return null
+        off++
+        if (off >= end) return null
+        off++
+        if (enc == 1 || enc == 2) {
+            while (off + 1 < end &&
+                !(b[off].toInt() == 0 && b[off + 1].toInt() == 0)
+            ) off += 2
+            off += 2
+        } else {
+            while (off < end && b[off].toInt() != 0) off++
+            off++
+        }
+        if (off >= end) return null
+        return b.copyOfRange(off, end)
     }
 
     private fun scanFilesAsync() {
