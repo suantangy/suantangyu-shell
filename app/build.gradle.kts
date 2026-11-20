@@ -11,8 +11,8 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 100
-        versionName = "3.58.0"
+        versionCode = 101
+        versionName = "3.59.0"
     }
 
     // 固定签名：工作流把 Secrets 里的固定 keystore 还原成 app/debug.keystore 时，debug 构建就用它签，
@@ -51,6 +51,8 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // 3.59.0 本地音乐授权文件夹：DocumentFile 走 SAF 树
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.media:media:1.7.0")
     implementation("androidx.webkit:webkit:1.10.0")
     // phase-2 原生播放：ExoPlayer 在前台服务里解码，音频脱离 WebView

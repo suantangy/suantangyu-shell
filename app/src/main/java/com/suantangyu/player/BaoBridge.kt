@@ -454,82 +454,283 @@ class BaoBridge(private val activity: MainActivity) {
         }
     }
 
-    /** 本地音乐（3.58.0）：扫系统音频库（MediaStore），返回
-     * {"perm":bool,"songs":[...]}——只收 IS_MUSIC=1、按加入时间倒序；
+    /** 音频权限（33+ READ_MEDIA_AUDIO，以下 READ_EXTERNAL_STORAGE） */
+    private fun audioPermGranted(): Boolean {
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_AUDIO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        return ContextCompat.checkSelfPermission(activity, perm) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    /** 扫系统音频库（MediaStore）：只收 IS_MUSIC、按加入时间倒序；
      * 排除「下载/酸汤鱼音乐」目录（壳下载导出的副本，已在「已下载」里，
-     * 再扫进来会一歌两现）。无音频权限时 perm=false、songs 空，
-     * 页面据此显示提示并调 requestLocalPerm 申请 */
+     * 再扫进来会一歌两现） */
+    private fun scanMediaStoreSongs(): org.json.JSONArray {
+        val arr = org.json.JSONArray()
+        try {
+            // 列名用字面量：MediaStore 的列常量散在接口里，Kotlin 经
+            // Audio.Media 类名取不到（Media 是 class 不是 object）
+            val proj = arrayOf(
+                "_id", "title", "artist", "album", "duration",
+                "relative_path", "_data"
+            )
+            activity.contentResolver.query(
+                android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                proj, "is_music != 0", null, "date_added DESC"
+            )?.use { cur ->
+                val idC = cur.getColumnIndex("_id")
+                val tC = cur.getColumnIndex("title")
+                val aC = cur.getColumnIndex("artist")
+                val alC = cur.getColumnIndex("album")
+                val dC = cur.getColumnIndex("duration")
+                val rpC = cur.getColumnIndex("relative_path")
+                val dataC = cur.getColumnIndex("_data")
+                var n = 0
+                while (cur.moveToNext() && n < 2000) {
+                    val rp = if (rpC >= 0) cur.getString(rpC) ?: "" else ""
+                    val data = if (dataC >= 0) cur.getString(dataC) ?: "" else ""
+                    if (rp.startsWith("Download/酸汤鱼音乐") ||
+                        data.contains("/Download/酸汤鱼音乐/")
+                    ) continue
+                    val id = cur.getLong(idC)
+                    val title = (if (tC >= 0) cur.getString(tC) else null)
+                        ?.trim().orEmpty()
+                    var artist = (if (aC >= 0) cur.getString(aC) else null)
+                        ?.trim().orEmpty()
+                    if (artist == "<unknown>") artist = ""
+                    val album = (if (alC >= 0) cur.getString(alC) else null)
+                        ?.trim().orEmpty()
+                    val durMs = if (dC >= 0) cur.getLong(dC) else 0L
+                    val o = org.json.JSONObject()
+                    o.put("id", "local:$id")
+                    o.put("songmid", "local:$id")
+                    o.put("name", title.ifEmpty { "未知歌曲" })
+                    o.put("artist", artist)
+                    o.put("singer", artist)
+                    o.put("album", album)
+                    o.put("source", "local")
+                    o.put("luri", "content://media/external/audio/media/$id")
+                    o.put("interval", (durMs / 1000).toInt())
+                    arr.put(o)
+                    n++
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return arr
+    }
+
+    /** 本地音乐（3.58.0，保留兼容 1_98 网页）：{"perm":bool,"songs":[...]} */
     @JavascriptInterface
     fun getLocalSongs(): String {
         val out = org.json.JSONObject()
+        val perm = audioPermGranted()
+        out.put("perm", perm)
+        out.put("songs", if (perm) scanMediaStoreSongs() else org.json.JSONArray())
+        return out.toString()
+    }
+
+    // —— 本地音乐导入制（3.59.0）——
+    // 状态存 SharedPreferences(aq_local)：mode(none/global/folder)、
+    // folderUri、folderName、cache（最近一次扫描列表，folder 模式开机
+    // 计数与首屏渲染先用缓存，打开段时 rescanLocal 后台重扫再回推）。
+    // 导入二选一作为当前来源，列表统一经 __aqLocalList 回推页面。
+    private fun localPrefs() =
+        activity.getSharedPreferences("aq_local", android.content.Context.MODE_PRIVATE)
+
+    private fun localStateJson(songs: org.json.JSONArray?): String {
+        val p = localPrefs()
+        val out = org.json.JSONObject()
+        out.put("mode", p.getString("mode", "none") ?: "none")
+        out.put("folderName", p.getString("folderName", "") ?: "")
+        out.put("perm", audioPermGranted())
+        if (songs != null) {
+            out.put("songs", songs)
+        } else {
+            val cache = try {
+                org.json.JSONArray(p.getString("cache", "[]") ?: "[]")
+            } catch (_: Exception) {
+                org.json.JSONArray()
+            }
+            out.put("songs", cache)
+        }
+        return out.toString()
+    }
+
+    private fun pushLocalState(songs: org.json.JSONArray) {
         try {
-            val perm = if (Build.VERSION.SDK_INT >= 33) {
-                ContextCompat.checkSelfPermission(activity, Manifest.permission.READ_MEDIA_AUDIO) ==
-                    PackageManager.PERMISSION_GRANTED
-            } else {
-                ContextCompat.checkSelfPermission(activity, Manifest.permission.READ_EXTERNAL_STORAGE) ==
-                    PackageManager.PERMISSION_GRANTED
-            }
-            out.put("perm", perm)
-            val arr = org.json.JSONArray()
-            if (perm) {
-                // 列名用字面量：MediaStore 的列常量散在接口里，Kotlin 经
-                // Audio.Media 类名取不到（Media 是 class 不是 object）
-                val proj = arrayOf(
-                    "_id", "title", "artist", "album", "duration",
-                    "relative_path", "_data"
-                )
-                activity.contentResolver.query(
-                    android.provider.MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                    proj, "is_music != 0", null, "date_added DESC"
-                )?.use { cur ->
-                    val idC = cur.getColumnIndex("_id")
-                    val tC = cur.getColumnIndex("title")
-                    val aC = cur.getColumnIndex("artist")
-                    val alC = cur.getColumnIndex("album")
-                    val dC = cur.getColumnIndex("duration")
-                    val rpC = cur.getColumnIndex("relative_path")
-                    val dataC = cur.getColumnIndex("_data")
-                    var n = 0
-                    while (cur.moveToNext() && n < 2000) {
-                        val rp = if (rpC >= 0) cur.getString(rpC) ?: "" else ""
-                        val data = if (dataC >= 0) cur.getString(dataC) ?: "" else ""
-                        if (rp.startsWith("Download/酸汤鱼音乐") ||
-                            data.contains("/Download/酸汤鱼音乐/")
-                        ) continue
-                        val id = cur.getLong(idC)
-                        val title = (if (tC >= 0) cur.getString(tC) else null)
-                            ?.trim().orEmpty()
-                        var artist = (if (aC >= 0) cur.getString(aC) else null)
-                            ?.trim().orEmpty()
-                        if (artist == "<unknown>") artist = ""
-                        val album = (if (alC >= 0) cur.getString(alC) else null)
-                            ?.trim().orEmpty()
-                        val durMs = if (dC >= 0) cur.getLong(dC) else 0L
-                        val o = org.json.JSONObject()
-                        o.put("id", "local:$id")
-                        o.put("songmid", "local:$id")
-                        o.put("name", title.ifEmpty { "未知歌曲" })
-                        o.put("artist", artist)
-                        o.put("singer", artist)
-                        o.put("album", album)
-                        o.put("source", "local")
-                        o.put("luri", "content://media/external/audio/media/$id")
-                        o.put("interval", (durMs / 1000).toInt())
-                        arr.put(o)
-                        n++
-                    }
-                }
-            }
-            out.put("songs", arr)
+            localPrefs().edit().putString("cache", songs.toString()).apply()
         } catch (_: Exception) {
+        }
+        activity.runJsOnPage(
+            "window.__aqLocalList && window.__aqLocalList(" +
+                org.json.JSONObject.quote(localStateJson(songs)) + ")"
+        )
+    }
+
+    /** 页面拉当前状态（同步、快）：global 现扫系统库；folder/none 回缓存 */
+    @JavascriptInterface
+    fun getLocalState(): String {
+        val mode = localPrefs().getString("mode", "none")
+        return if (mode == "global" && audioPermGranted()) {
+            localStateJson(scanMediaStoreSongs())
+        } else {
+            localStateJson(null)
+        }
+    }
+
+    /** 全局导入：设 mode=global 并现扫回推（页面保证有权限才调；
+     * 没权限时兜底只回当前状态，页面据 perm=false 显示提示） */
+    @JavascriptInterface
+    fun importGlobal() {
+        if (!audioPermGranted()) {
+            activity.runJsOnPage(
+                "window.__aqLocalList && window.__aqLocalList(" +
+                    org.json.JSONObject.quote(localStateJson(null)) + ")"
+            )
+            return
+        }
+        localPrefs().edit().putString("mode", "global").apply()
+        pushLocalState(scanMediaStoreSongs())
+    }
+
+    /** 授权文件夹导入：拉起系统文件夹选择器，选定后 MainActivity
+     * 经 localFolderLauncher 取持久授权并调 onLocalFolderPicked */
+    @JavascriptInterface
+    fun importFolder() {
+        activity.runOnUiThread {
             try {
-                out.put("perm", false)
-                out.put("songs", org.json.JSONArray())
+                activity.pickLocalFolder()
             } catch (_: Exception) {
             }
         }
-        return out.toString()
+    }
+
+    /** 重新扫描当前来源：global 现扫；folder 后台走树扫描，完成回推 */
+    @JavascriptInterface
+    fun rescanLocal() {
+        when (localPrefs().getString("mode", "none")) {
+            "global" -> if (audioPermGranted()) pushLocalState(scanMediaStoreSongs())
+            "folder" -> {
+                val uriStr = localPrefs().getString("folderUri", "") ?: ""
+                if (uriStr.isNotEmpty()) scanFolderAsync(Uri.parse(uriStr))
+            }
+        }
+    }
+
+    /** 文件夹选定后（MainActivity 回调）：存授权信息、设 mode=folder、后台扫描 */
+    fun onLocalFolderPicked(treeUri: Uri, folderName: String) {
+        localPrefs().edit()
+            .putString("mode", "folder")
+            .putString("folderUri", treeUri.toString())
+            .putString("folderName", folderName)
+            .apply()
+        scanFolderAsync(treeUri)
+    }
+
+    private fun scanFolderAsync(treeUri: Uri) {
+        Thread {
+            val arr = org.json.JSONArray()
+            try {
+                val root = androidx.documentfile.provider.DocumentFile
+                    .fromTreeUri(activity, treeUri)
+                if (root != null) {
+                    val files = mutableListOf<androidx.documentfile.provider.DocumentFile>()
+                    collectAudioFiles(root, files, 0)
+                    // 新文件在前：按最后修改时间倒序
+                    files.sortByDescending {
+                        try { it.lastModified() } catch (_: Exception) { 0L }
+                    }
+                    for (f in files) {
+                        if (arr.length() >= 2000) break
+                        arr.put(folderSongJson(f))
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            pushLocalState(arr)
+        }.start()
+    }
+
+    private fun collectAudioFiles(
+        dir: androidx.documentfile.provider.DocumentFile,
+        out: MutableList<androidx.documentfile.provider.DocumentFile>,
+        depth: Int
+    ) {
+        if (depth > 12) return
+        val kids = try { dir.listFiles() } catch (_: Exception) { return }
+        for (k in kids) {
+            try {
+                if (k.isDirectory) collectAudioFiles(k, out, depth + 1)
+                else if (k.isFile && isAudioDoc(k)) out.add(k)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun isAudioDoc(f: androidx.documentfile.provider.DocumentFile): Boolean {
+        val t = try { f.type } catch (_: Exception) { null }
+        if (t != null && t.startsWith("audio/")) return true
+        val n = (try { f.name } catch (_: Exception) { null } ?: "").lowercase()
+        return n.endsWith(".mp3") || n.endsWith(".flac") || n.endsWith(".m4a") ||
+            n.endsWith(".aac") || n.endsWith(".ogg") || n.endsWith(".opus") ||
+            n.endsWith(".wav") || n.endsWith(".ape") || n.endsWith(".wma") ||
+            n.endsWith(".alac") || n.endsWith(".aiff")
+    }
+
+    private fun folderSongJson(
+        f: androidx.documentfile.provider.DocumentFile
+    ): org.json.JSONObject {
+        val uri = f.uri
+        var title = ""
+        var artist = ""
+        var album = ""
+        var durMs = 0L
+        val mmr = android.media.MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(activity, uri)
+            title = mmr.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_TITLE
+            )?.trim().orEmpty()
+            artist = mmr.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_ARTIST
+            )?.trim().orEmpty()
+            album = mmr.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_ALBUM
+            )?.trim().orEmpty()
+            durMs = mmr.extractMetadata(
+                android.media.MediaMetadataRetriever.METADATA_KEY_DURATION
+            )?.toLongOrNull() ?: 0L
+        } catch (_: Exception) {
+        } finally {
+            try { mmr.release() } catch (_: Exception) {
+            }
+        }
+        if (title.isEmpty()) {
+            val raw = (try { f.name } catch (_: Exception) { null } ?: "").trim()
+            title = raw.replace(Regex("\\.[A-Za-z0-9]{2,5}$"), "")
+                .ifEmpty { "未知歌曲" }
+        }
+        if (artist == "<unknown>") artist = ""
+        val docId = try {
+            android.provider.DocumentsContract.getDocumentId(uri)
+        } catch (_: Exception) {
+            uri.toString()
+        }
+        val o = org.json.JSONObject()
+        o.put("id", "local:$docId")
+        o.put("songmid", "local:$docId")
+        o.put("name", title)
+        o.put("artist", artist)
+        o.put("singer", artist)
+        o.put("album", album)
+        o.put("source", "local")
+        o.put("luri", uri.toString())
+        o.put("interval", (durMs / 1000).toInt())
+        return o
     }
 
     /** 本地音乐权限申请（3.58.0）：页面在无权限打开本地音乐段时调用，

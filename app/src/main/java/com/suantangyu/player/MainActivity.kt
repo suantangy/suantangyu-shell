@@ -60,6 +60,9 @@ class MainActivity : AppCompatActivity() {
     private var pageReady = false
     private var revealed = false
     private var earlyInjected = false
+    /** 网页桥（本地音乐授权文件夹回调要回调用） */
+    private var baoBridge: BaoBridge? = null
+
     /** 文件选择器回调（音源管理"本地文件"按钮用） */
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private val fileChooserLauncher = registerForActivityResult(
@@ -197,7 +200,9 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
         }
         // 网页 → 原生：上报曲名/播放状态，驱动通知栏
-        webView.addJavascriptInterface(BaoBridge(this), "BaoBus")
+        val bridge = BaoBridge(this)
+        baoBridge = bridge
+        webView.addJavascriptInterface(bridge, "BaoBus")
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
@@ -319,6 +324,42 @@ class MainActivity : AppCompatActivity() {
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             runJsOnPage("window.__aqLocalPerm && window.__aqLocalPerm($granted)")
         }
+    }
+
+    /** 本地音乐授权文件夹（3.59.0）：系统文件夹选择器回调——取持久读授权，
+     * 把树 URI 与文件夹名交桥存档并后台扫描 */
+    private val localFolderLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != android.app.Activity.RESULT_OK) return@registerForActivityResult
+        val uri = result.data?.data ?: return@registerForActivityResult
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {
+        }
+        val name = try {
+            androidx.documentfile.provider.DocumentFile
+                .fromTreeUri(this, uri)?.name ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+        try {
+            baoBridge?.onLocalFolderPicked(uri, name)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 拉起系统文件夹选择器（SAF）：用户选哪个文件夹就只扫哪个 */
+    fun pickLocalFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
+        localFolderLauncher.launch(intent)
     }
 
     override fun onDestroy() {
