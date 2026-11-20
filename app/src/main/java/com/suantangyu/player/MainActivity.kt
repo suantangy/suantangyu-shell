@@ -291,6 +291,36 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    /** 本地音乐（3.58.0）：网页经桥请求音频权限（33+ READ_MEDIA_AUDIO，
+     * 以下 READ_EXTERNAL_STORAGE），结果经 __aqLocalPerm 回推页面 */
+    fun requestAudioPermission() {
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_AUDIO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (ContextCompat.checkSelfPermission(this, perm) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            runJsOnPage("window.__aqLocalPerm && window.__aqLocalPerm(true)")
+            return
+        }
+        ActivityCompat.requestPermissions(this, arrayOf(perm), 1002)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1002) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            runJsOnPage("window.__aqLocalPerm && window.__aqLocalPerm($granted)")
+        }
+    }
+
     override fun onDestroy() {
         try {
             unregisterReceiver(controlReceiver)

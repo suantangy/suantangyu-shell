@@ -1557,6 +1557,14 @@ class KeepAliveService : Service() {
                 }, 300)
                 return
             }
+            // 本地音乐（3.58.0）：本地文件播出错（文件被删/权限被撤）——
+            // 不进网络阶梯（探网/回链都治不了本地文件），记一行直接跳下一首
+            if (nativeUrl.startsWith("content://")) {
+                engineLog("引擎：本地文件播放失败，跳过 " + title)
+                val p = player
+                if (p != null) doSkipAfterError(p)
+                return
+            }
             // 3.3.5：错误留痕进引擎日志 + 壳内自救。解析成功不等于流能播，
             // 某首直链拉流时死了（403/过期），不能停等冻着的页面来救
             if (!rescueInFlight && !netProbeInFlight) {

@@ -1,11 +1,14 @@
 package com.suantangyu.player
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.webkit.JavascriptInterface
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileOutputStream
@@ -448,6 +451,96 @@ class BaoBridge(private val activity: MainActivity) {
             }
         } catch (_: Exception) {
             "[]"
+        }
+    }
+
+    /** 本地音乐（3.58.0）：扫系统音频库（MediaStore），返回
+     * {"perm":bool,"songs":[...]}——只收 IS_MUSIC=1、按加入时间倒序；
+     * 排除「下载/酸汤鱼音乐」目录（壳下载导出的副本，已在「已下载」里，
+     * 再扫进来会一歌两现）。无音频权限时 perm=false、songs 空，
+     * 页面据此显示提示并调 requestLocalPerm 申请 */
+    @JavascriptInterface
+    fun getLocalSongs(): String {
+        val out = org.json.JSONObject()
+        try {
+            val perm = if (Build.VERSION.SDK_INT >= 33) {
+                ContextCompat.checkSelfPermission(activity, Manifest.permission.READ_MEDIA_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+            } else {
+                ContextCompat.checkSelfPermission(activity, Manifest.permission.READ_EXTERNAL_STORAGE) ==
+                    PackageManager.PERMISSION_GRANTED
+            }
+            out.put("perm", perm)
+            val arr = org.json.JSONArray()
+            if (perm) {
+                val ms = android.provider.MediaStore.Audio.Media
+                val proj = arrayOf(
+                    ms._ID, ms.TITLE, ms.ARTIST, ms.ALBUM, ms.DURATION,
+                    ms.RELATIVE_PATH, ms.DATA
+                )
+                activity.contentResolver.query(
+                    ms.EXTERNAL_CONTENT_URI, proj,
+                    ms.IS_MUSIC + " != 0", null,
+                    ms.DATE_ADDED + " DESC"
+                )?.use { cur ->
+                    val idC = cur.getColumnIndex(ms._ID)
+                    val tC = cur.getColumnIndex(ms.TITLE)
+                    val aC = cur.getColumnIndex(ms.ARTIST)
+                    val alC = cur.getColumnIndex(ms.ALBUM)
+                    val dC = cur.getColumnIndex(ms.DURATION)
+                    val rpC = cur.getColumnIndex(ms.RELATIVE_PATH)
+                    val dataC = cur.getColumnIndex(ms.DATA)
+                    var n = 0
+                    while (cur.moveToNext() && n < 2000) {
+                        val rp = if (rpC >= 0) cur.getString(rpC) ?: "" else ""
+                        val data = if (dataC >= 0) cur.getString(dataC) ?: "" else ""
+                        if (rp.startsWith("Download/酸汤鱼音乐") ||
+                            data.contains("/Download/酸汤鱼音乐/")
+                        ) continue
+                        val id = cur.getLong(idC)
+                        val title = (if (tC >= 0) cur.getString(tC) else null)
+                            ?.trim().orEmpty()
+                        var artist = (if (aC >= 0) cur.getString(aC) else null)
+                            ?.trim().orEmpty()
+                        if (artist == "<unknown>") artist = ""
+                        val album = (if (alC >= 0) cur.getString(alC) else null)
+                            ?.trim().orEmpty()
+                        val durMs = if (dC >= 0) cur.getLong(dC) else 0L
+                        val o = org.json.JSONObject()
+                        o.put("id", "local:$id")
+                        o.put("songmid", "local:$id")
+                        o.put("name", title.ifEmpty { "未知歌曲" })
+                        o.put("artist", artist)
+                        o.put("singer", artist)
+                        o.put("album", album)
+                        o.put("source", "local")
+                        o.put("luri", "content://media/external/audio/media/$id")
+                        o.put("interval", (durMs / 1000).toInt())
+                        arr.put(o)
+                        n++
+                    }
+                }
+            }
+            out.put("songs", arr)
+        } catch (_: Exception) {
+            try {
+                out.put("perm", false)
+                out.put("songs", org.json.JSONArray())
+            } catch (_: Exception) {
+            }
+        }
+        return out.toString()
+    }
+
+    /** 本地音乐权限申请（3.58.0）：页面在无权限打开本地音乐段时调用，
+     * 结果由 MainActivity 经 __aqLocalPerm 回推页面 */
+    @JavascriptInterface
+    fun requestLocalPerm() {
+        activity.runOnUiThread {
+            try {
+                activity.requestAudioPermission()
+            } catch (_: Exception) {
+            }
         }
     }
 

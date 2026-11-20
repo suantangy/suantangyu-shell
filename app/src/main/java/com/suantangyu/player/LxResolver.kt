@@ -291,6 +291,10 @@ object LxResolver {
         ignoreCooling: Boolean = false,
         log: (String) -> Unit
     ): Prov? {
+        // 3.58.0：本地音乐——歌自带本地地址（luri）时不走解析链，
+        // 直接交回本地地址由脑子播；不写脚本日志段（本地歌没走脚本）
+        val luri = song.optString("luri")
+        if (luri.isNotEmpty()) return Prov(luri, false, "本地音乐", "")
         // 3.12.0：解析分段记录（脚本日志搬进脑子）——一进一出包一段，
         // 段头/段尾写进独立脚本日志，解析本体一字不改
         ScriptSeg.begin(song)
