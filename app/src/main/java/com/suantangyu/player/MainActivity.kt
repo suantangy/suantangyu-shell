@@ -296,36 +296,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** 本地音乐（3.58.0）：网页经桥请求音频权限（33+ READ_MEDIA_AUDIO，
-     * 以下 READ_EXTERNAL_STORAGE），结果经 __aqLocalPerm 回推页面 */
-    fun requestAudioPermission() {
-        val perm = if (Build.VERSION.SDK_INT >= 33) {
-            Manifest.permission.READ_MEDIA_AUDIO
-        } else {
-            Manifest.permission.READ_EXTERNAL_STORAGE
-        }
-        if (ContextCompat.checkSelfPermission(this, perm) ==
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            runJsOnPage("window.__aqLocalPerm && window.__aqLocalPerm(true)")
-            return
-        }
-        ActivityCompat.requestPermissions(this, arrayOf(perm), 1002)
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1002) {
-            val granted = grantResults.isNotEmpty() &&
-                grantResults[0] == PackageManager.PERMISSION_GRANTED
-            runJsOnPage("window.__aqLocalPerm && window.__aqLocalPerm($granted)")
-        }
-    }
-
     /** 本地音乐授权文件夹（3.59.0）：系统文件夹选择器回调——取持久读授权，
      * 把树 URI 与文件夹名交桥存档并后台扫描 */
     private val localFolderLauncher = registerForActivityResult(

@@ -5,9 +5,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 本地音乐（3.58.0）：扫系统音频库；33+ 用 READ_MEDIA_AUDIO，以下用旧存储权限 -->
-    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- 本地音乐（3.60.0）：只走 SAF 授权文件夹，不申请任何存储/音频权限 -->
     <!-- ExoPlayer WAKE_MODE_NETWORK：播放网络流时持 WakeLock + WifiLock -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
