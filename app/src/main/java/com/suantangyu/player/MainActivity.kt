@@ -296,40 +296,53 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** 本地音乐授权文件夹（3.59.0）：系统文件夹选择器回调——取持久读授权，
-     * 把树 URI 与文件夹名交桥存档并后台扫描 */
-    private val localFolderLauncher = registerForActivityResult(
+    /** 本地音乐多选文件导入（3.61.0）：系统文件选择器回调——逐个文件
+     * 取持久读授权，把 URI 名单交桥存档并扫描 */
+    private val localFilesLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode != android.app.Activity.RESULT_OK) return@registerForActivityResult
-        val uri = result.data?.data ?: return@registerForActivityResult
-        try {
-            contentResolver.takePersistableUriPermission(
-                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
-        } catch (_: Exception) {
+        if (result.resultCode != android.app.Activity.RESULT_OK) {
+            return@registerForActivityResult
         }
-        val name = try {
-            androidx.documentfile.provider.DocumentFile
-                .fromTreeUri(this, uri)?.name ?: ""
-        } catch (_: Exception) {
-            ""
+        val data = result.data ?: return@registerForActivityResult
+        val uris = mutableListOf<Uri>()
+        data.data?.let { uris.add(it) }
+        val clip = data.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) {
+                try {
+                    clip.getItemAt(i)?.uri?.let { uris.add(it) }
+                } catch (_: Exception) {
+                }
+            }
+        }
+        if (uris.isEmpty()) return@registerForActivityResult
+        for (u in uris) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    u, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
         }
         try {
-            baoBridge?.onLocalFolderPicked(uri, name)
+            baoBridge?.onLocalFilesPicked(uris)
         } catch (_: Exception) {
         }
     }
 
-    /** 拉起系统文件夹选择器（SAF）：用户选哪个文件夹就只扫哪个 */
-    fun pickLocalFolder() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+    /** 拉起系统文件选择器（多选）：用户一首首选，只有选中的进列表 */
+    fun pickLocalFiles() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "audio/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
             addFlags(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
                     Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
             )
         }
-        localFolderLauncher.launch(intent)
+        localFilesLauncher.launch(intent)
     }
 
     override fun onDestroy() {

@@ -454,16 +454,49 @@ class BaoBridge(private val activity: MainActivity) {
         }
     }
 
-    // —— 本地音乐（3.60.0 定稿）：只走授权文件夹 ——
-    // 取消全局扫描、不申请音频权限。可陆续授权多个文件夹，列表合并。
-    // 状态存 SharedPreferences(aq_local)：folders（JSON 数组
-    // [{uri,name}]）、cache（最近一次扫描列表；开机计数与首屏先用
-    // 缓存，打开段时 rescanLocal 后台重扫再经 __aqLocalList 回推）。
+    // —— 本地音乐（3.61.0）：系统多选文件导入 + 自带封面 + 移除 ——
+    // 导入走 ACTION_OPEN_DOCUMENT 多选：逐个文件取持久读授权，只有
+    // 选中的文件进列表。状态存 SharedPreferences(aq_local)：files
+    // （文件 URI 的 JSON 数组）、cache（最近一次扫描列表）。
+    // 3.60 的授权文件夹（folders 键）首启迁移：走一遍文件夹扫描，把
+    // 在册歌曲的文件 URI 播种进 files，列表不丢，此后不再扫文件夹。
     private fun localPrefs() =
         activity.getSharedPreferences("aq_local", android.content.Context.MODE_PRIVATE)
 
-    /** 已授权文件夹列表；兼容 3.59 单文件夹存档（mode=folder+folderUri） */
-    private fun localFolders(): MutableList<Pair<String, String>> {
+    /** 已选文件 URI 名单（纯读取，不触发迁移） */
+    private fun storedFileUris(): List<String> {
+        val raw = localPrefs().getString("files", null) ?: return emptyList()
+        val out = mutableListOf<String>()
+        try {
+            val a = org.json.JSONArray(raw)
+            for (i in 0 until a.length()) {
+                val u = a.optString(i)
+                if (u.isNotEmpty()) out.add(u)
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    private fun saveFileUris(list: List<String>) {
+        try {
+            val a = org.json.JSONArray()
+            for (u in list) a.put(u)
+            localPrefs().edit().putString("files", a.toString()).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun docIdOf(uriStr: String): String {
+        return try {
+            android.provider.DocumentsContract.getDocumentId(Uri.parse(uriStr))
+        } catch (_: Exception) {
+            uriStr
+        }
+    }
+
+    /** 3.60 授权文件夹名单（仅迁移用） */
+    private fun localFolders(): List<Pair<String, String>> {
         val p = localPrefs()
         val out = mutableListOf<Pair<String, String>>()
         val raw = p.getString("folders", null)
@@ -479,34 +512,47 @@ class BaoBridge(private val activity: MainActivity) {
             }
             return out
         }
-        // 旧存档迁移：3.59 单文件夹进列表；mode=global 不迁（全局已取消）
         if (p.getString("mode", "") == "folder") {
             val u = p.getString("folderUri", "") ?: ""
             if (u.isNotEmpty()) out.add(u to (p.getString("folderName", "") ?: ""))
         }
-        saveLocalFolders(out)
         return out
     }
 
-    private fun saveLocalFolders(list: List<Pair<String, String>>) {
-        try {
-            val a = org.json.JSONArray()
-            for ((u, n) in list) {
-                val o = org.json.JSONObject()
-                o.put("uri", u)
-                o.put("name", n)
-                a.put(o)
+    /** 首启迁移：files 键不存在时，若有 3.60 文件夹存档，后台走一遍
+     * 文件夹把在册歌曲 URI 播种进 files，随后正常扫描回推 */
+    private fun ensureFilesReady() {
+        val p = localPrefs()
+        if (p.contains("files")) return
+        saveFileUris(emptyList())
+        val folders = localFolders()
+        if (folders.isEmpty()) return
+        Thread {
+            try {
+                val seed = mutableListOf<String>()
+                for ((uriStr, _) in folders) {
+                    try {
+                        val root = androidx.documentfile.provider.DocumentFile
+                            .fromTreeUri(activity, Uri.parse(uriStr)) ?: continue
+                        val files = mutableListOf<
+                            androidx.documentfile.provider.DocumentFile>()
+                        collectAudioFiles(root, files, 0)
+                        for (f in files) seed.add(f.uri.toString())
+                    } catch (_: Exception) {
+                    }
+                }
+                if (seed.isNotEmpty()) {
+                    saveFileUris(seed.distinct())
+                    scanFilesAsync()
+                }
+            } catch (_: Exception) {
             }
-            localPrefs().edit().putString("folders", a.toString()).apply()
-        } catch (_: Exception) {
-        }
+        }.start()
     }
 
     private fun localStateJson(songs: org.json.JSONArray?): String {
         val out = org.json.JSONObject()
-        val names = org.json.JSONArray()
-        for ((_, n) in localFolders()) names.put(n)
-        out.put("folders", names)
+        out.put("picked", storedFileUris().size)
         if (songs != null) {
             out.put("songs", songs)
         } else {
@@ -531,70 +577,177 @@ class BaoBridge(private val activity: MainActivity) {
         )
     }
 
-    /** 页面拉当前状态（同步、快）：回已授权文件夹名与缓存列表 */
+    /** 页面拉当前状态（同步、快）：回已选文件数与缓存列表 */
     @JavascriptInterface
     fun getLocalState(): String {
+        ensureFilesReady()
         return localStateJson(null)
     }
 
-    /** 导入音乐：拉起系统文件夹选择器，选定后 MainActivity 经
-     * localFolderLauncher 取持久授权并调 onLocalFolderPicked */
+    /** 导入音乐：拉起系统多选文件选择器，选定后 MainActivity 取
+     * 持久授权并调 onLocalFilesPicked */
     @JavascriptInterface
-    fun importFolder() {
+    fun importFiles() {
         activity.runOnUiThread {
             try {
-                activity.pickLocalFolder()
+                activity.pickLocalFiles()
             } catch (_: Exception) {
             }
         }
     }
 
-    /** 重新扫描全部已授权文件夹（后台），完成回推 */
+    /** 重新扫描已选文件（后台）：文件已删的自动剔除，完成回推 */
     @JavascriptInterface
     fun rescanLocal() {
-        if (localFolders().isNotEmpty()) scanFoldersAsync()
+        ensureFilesReady()
+        if (storedFileUris().isNotEmpty()) scanFilesAsync()
     }
 
-    /** 文件夹选定后（MainActivity 回调）：新文件夹追加进列表
-     * （同 URI 不重复），然后全量重扫 */
-    fun onLocalFolderPicked(treeUri: Uri, folderName: String) {
-        val list = localFolders()
-        if (list.none { it.first == treeUri.toString() }) {
-            list.add(treeUri.toString() to folderName)
-            saveLocalFolders(list)
+    /** 文件选定后（MainActivity 回调）：新文件追加进名单（同 URI 不重复），全量重扫 */
+    fun onLocalFilesPicked(uris: List<Uri>) {
+        val cur = storedFileUris().toMutableList()
+        var changed = false
+        for (u in uris) {
+            val s = u.toString()
+            if (s !in cur) {
+                cur.add(s)
+                changed = true
+            }
         }
-        scanFoldersAsync()
+        if (changed) saveFileUris(cur)
+        if (cur.isNotEmpty()) scanFilesAsync()
     }
 
-    private fun scanFoldersAsync() {
-        val folders = localFolders()
+    /** 移除一首（页面长按移除状态点「移除」）：名单删该文件、释放
+     * 其持久授权、缓存同步剔除并回推。文件本身不动。 */
+    @JavascriptInterface
+    fun removeLocalSong(songmid: String) {
+        val docId = songmid.removePrefix("local:")
+        val cur = storedFileUris()
+        val target = cur.firstOrNull { docIdOf(it) == docId } ?: return
+        saveFileUris(cur - target)
+        try {
+            activity.contentResolver.releasePersistableUriPermission(
+                Uri.parse(target), Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {
+        }
+        try {
+            val cache = org.json.JSONArray(
+                localPrefs().getString("cache", "[]") ?: "[]"
+            )
+            val kept = org.json.JSONArray()
+            for (i in 0 until cache.length()) {
+                val o = cache.optJSONObject(i) ?: continue
+                if (o.optString("id") != songmid) kept.put(o)
+            }
+            pushLocalState(kept)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 自带封面（页面渲染本地行时按 songmid 来要）：磁盘缓存优先，
+     * 未命中用 MMR 取内嵌图、缩到 256px 内转 JPEG，经 __aqLocalCover
+     * 回推 data URI；无内嵌图回空串，页面保留占位 */
+    @JavascriptInterface
+    fun requestLocalCover(songmid: String) {
+        Thread {
+            var dataUri = ""
+            try {
+                val docId = songmid.removePrefix("local:")
+                val uriStr = storedFileUris()
+                    .firstOrNull { docIdOf(it) == docId }
+                if (uriStr != null) {
+                    val dir = java.io.File(activity.cacheDir, "local_covers")
+                    if (!dir.exists()) dir.mkdirs()
+                    val key = java.security.MessageDigest
+                        .getInstance("MD5")
+                        .digest(docId.toByteArray(Charsets.UTF_8))
+                        .joinToString("") { "%02x".format(it) }
+                    val cacheFile = java.io.File(dir, "$key.jpg")
+                    var bytes: ByteArray? = null
+                    if (cacheFile.exists() && cacheFile.length() > 0) {
+                        bytes = cacheFile.readBytes()
+                    } else {
+                        val mmr = android.media.MediaMetadataRetriever()
+                        try {
+                            mmr.setDataSource(activity, Uri.parse(uriStr))
+                            val pic = mmr.embeddedPicture
+                            if (pic != null) {
+                                val bmp = android.graphics.BitmapFactory
+                                    .decodeByteArray(pic, 0, pic.size)
+                                if (bmp != null) {
+                                    val maxDim = maxOf(bmp.width, bmp.height)
+                                    val scaled = if (maxDim > 256) {
+                                        val r = 256f / maxDim
+                                        android.graphics.Bitmap.createScaledBitmap(
+                                            bmp,
+                                            (bmp.width * r).toInt().coerceAtLeast(1),
+                                            (bmp.height * r).toInt().coerceAtLeast(1),
+                                            true
+                                        )
+                                    } else bmp
+                                    val bos = java.io.ByteArrayOutputStream()
+                                    scaled.compress(
+                                        android.graphics.Bitmap.CompressFormat.JPEG,
+                                        80, bos
+                                    )
+                                    bytes = bos.toByteArray()
+                                    try {
+                                        cacheFile.writeBytes(bytes)
+                                    } catch (_: Exception) {
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {
+                        } finally {
+                            try { mmr.release() } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        dataUri = "data:image/jpeg;base64," + android.util.Base64
+                            .encodeToString(bytes, android.util.Base64.NO_WRAP)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            activity.runJsOnPage(
+                "window.__aqLocalCover && window.__aqLocalCover(" +
+                    org.json.JSONObject.quote(songmid) + "," +
+                    org.json.JSONObject.quote(dataUri) + ")"
+            )
+        }.start()
+    }
+
+    private fun scanFilesAsync() {
         Thread {
             val arr = org.json.JSONArray()
             try {
-                val all = mutableListOf<
+                val uris = storedFileUris()
+                val items = mutableListOf<
                     Pair<androidx.documentfile.provider.DocumentFile, Long>>()
-                for ((uriStr, _) in folders) {
+                val alive = mutableListOf<String>()
+                for (uriStr in uris) {
                     try {
-                        val root = androidx.documentfile.provider.DocumentFile
-                            .fromTreeUri(activity, Uri.parse(uriStr)) ?: continue
-                        val files = mutableListOf<
-                            androidx.documentfile.provider.DocumentFile>()
-                        collectAudioFiles(root, files, 0)
-                        for (f in files) {
-                            val lm = try {
-                                f.lastModified()
-                            } catch (_: Exception) {
-                                0L
-                            }
-                            all.add(f to lm)
+                        val f = androidx.documentfile.provider.DocumentFile
+                            .fromSingleUri(activity, Uri.parse(uriStr))
+                        if (f == null || !f.exists()) continue
+                        alive.add(uriStr)
+                        val lm = try {
+                            f.lastModified()
+                        } catch (_: Exception) {
+                            0L
                         }
+                        items.add(f to lm)
                     } catch (_: Exception) {
                     }
                 }
-                // 新文件在前：跨文件夹按最后修改时间倒序；同文件只收一次
-                all.sortByDescending { it.second }
+                if (alive.size != uris.size) saveFileUris(alive)
+                // 新文件在前：按最后修改时间倒序；同文件只收一次
+                items.sortByDescending { it.second }
                 val seen = HashSet<String>()
-                for ((f, _) in all) {
+                for ((f, _) in items) {
                     if (arr.length() >= 2000) break
                     val docId = try {
                         android.provider.DocumentsContract.getDocumentId(f.uri)
