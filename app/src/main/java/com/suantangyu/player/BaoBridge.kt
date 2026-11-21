@@ -912,6 +912,53 @@ class BaoBridge(private val activity: MainActivity) {
         return b.copyOfRange(off, end)
     }
 
+    /** 脚本导入（3.64.0）：拉起系统文件选择器选 .js，选定后
+     * MainActivity 回调 onScriptFilePicked 读文本回推页面 */
+    @JavascriptInterface
+    fun importScriptFile() {
+        activity.runOnUiThread {
+            try {
+                activity.pickScriptFile()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 脚本文件选定后（MainActivity 回调）：后台读文本（上限 2MB），
+     * 经 __aqScriptFile 回推页面导入处理线 */
+    fun onScriptFilePicked(uri: Uri) {
+        Thread {
+            try {
+                val name = try {
+                    androidx.documentfile.provider.DocumentFile
+                        .fromSingleUri(activity, uri)?.name
+                } catch (_: Exception) {
+                    null
+                } ?: "本地音源.js"
+                val bytes = activity.contentResolver
+                    .openInputStream(uri)?.use { ins ->
+                        val bos = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(65536)
+                        var total = 0
+                        while (total < 2 * 1024 * 1024) {
+                            val r = ins.read(buf)
+                            if (r < 0) break
+                            bos.write(buf, 0, r)
+                            total += r
+                        }
+                        bos.toByteArray()
+                    } ?: return@Thread
+                val text = String(bytes, Charsets.UTF_8)
+                activity.runJsOnPage(
+                    "window.__aqScriptFile && window.__aqScriptFile(" +
+                        org.json.JSONObject.quote(name) + "," +
+                        org.json.JSONObject.quote(text) + ")"
+                )
+            } catch (_: Exception) {
+            }
+        }.start()
+    }
+
     private fun scanFilesAsync() {
         Thread {
             val arr = org.json.JSONArray()

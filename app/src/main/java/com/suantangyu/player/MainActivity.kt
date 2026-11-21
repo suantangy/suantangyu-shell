@@ -345,6 +345,31 @@ class MainActivity : AppCompatActivity() {
         localFilesLauncher.launch(intent)
     }
 
+    /** 脚本导入（3.64.0）：系统文件选择器（单选）回调——把选定的
+     * 文件 URI 交桥读文本回推页面，不需要持久授权 */
+    private val scriptFileLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != android.app.Activity.RESULT_OK) {
+            return@registerForActivityResult
+        }
+        val uri = result.data?.data ?: return@registerForActivityResult
+        try {
+            baoBridge?.onScriptFilePicked(uri)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 拉起系统文件选择器选脚本文件（单选） */
+    fun pickScriptFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        scriptFileLauncher.launch(intent)
+    }
+
     override fun onDestroy() {
         try {
             unregisterReceiver(controlReceiver)
