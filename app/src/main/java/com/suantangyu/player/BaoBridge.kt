@@ -837,7 +837,8 @@ class BaoBridge(private val activity: MainActivity) {
 
     private fun parseFlacPictureBlock(b: ByteArray): ByteArray? {
         var off = 0
-        if (b.size < 4) return null
+        if (b.size < 8) return null
+        off += 4 // 图片类型（封面=3）：真实文件必有此字段，3.62 漏了
         val mimeLen = artBe32(b, off)
         off += 4
         if (mimeLen < 0 || off + mimeLen + 4 > b.size) return null
