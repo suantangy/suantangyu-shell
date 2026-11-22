@@ -17,7 +17,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
-import android.widget.TextView
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
@@ -179,18 +178,7 @@ class MainActivity : AppCompatActivity() {
         insetsController.isAppearanceLightStatusBars = true
         insetsController.isAppearanceLightNavigationBars = true
 
-        // 老电视可能缺可用的 WebView 组件：建不出来别闪退，给一行字说明白（3.66.0）
-        webView = try {
-            WebView(this)
-        } catch (t: Throwable) {
-            val tip = TextView(this)
-            tip.text = "此设备缺少可用的 WebView 组件，酸汤鱼音乐无法运行。\n\n" + t
-            tip.setTextColor(Color.WHITE)
-            tip.textSize = 16f
-            tip.setPadding(48, 96, 48, 48)
-            setContentView(tip)
-            return
-        }
+        webView = WebView(this)
         // 先隐身：等安全区注入画好再显示，标题不会先顶上去再跳下来
         webView.visibility = View.INVISIBLE
         setContentView(webView)
@@ -208,12 +196,7 @@ class MainActivity : AppCompatActivity() {
         // 网页渲染进程——切歌决策、下一首解析、给服务重新预置续播都靠它的 JS 活着；
         // 被冻住时页面收不到 ended、发不出新地址，原生播放器只能干等（phase-2.6）。
         try {
-            // setRendererPriorityPolicy 是 API 26 才有的方法：老系统上调用抛
-            // NoSuchMethodError（属 Error，catch Exception 拦不住、启动当场闪退），
-            // 必须先判版本（3.66.0 修老电视点开闪退）
-            if (Build.VERSION.SDK_INT >= 26) {
-                webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-            }
+            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
         } catch (_: Exception) {
         }
         // 网页 → 原生：上报曲名/播放状态，驱动通知栏

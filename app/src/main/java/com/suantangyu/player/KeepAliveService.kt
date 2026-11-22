@@ -917,7 +917,7 @@ class KeepAliveService : Service() {
     private fun acquireGraceWakeLock() {
         try {
             if (graceWakeLock?.isHeld == true) return
-            val pm = getSystemService(POWER_SERVICE) as? PowerManager ?: return
+            val pm = getSystemService(PowerManager::class.java) ?: return
             val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Suantangyu:GraceAdvance")
             wl.setReferenceCounted(false)
             wl.acquire(60_000L)
@@ -2521,7 +2521,7 @@ class KeepAliveService : Service() {
                         }
                 )
                 e
-            } catch (ex: Throwable) {
+            } catch (ex: Exception) {
                 cronetEngineFailed = true
                 engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + ex.javaClass.simpleName + "）")
                 null
@@ -2839,7 +2839,7 @@ class KeepAliveService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
 
     private val notificationManager by lazy {
-        getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        getSystemService(NotificationManager::class.java)
     }
 
     override fun onCreate() {
