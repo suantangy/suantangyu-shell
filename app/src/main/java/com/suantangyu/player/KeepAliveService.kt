@@ -917,7 +917,7 @@ class KeepAliveService : Service() {
     private fun acquireGraceWakeLock() {
         try {
             if (graceWakeLock?.isHeld == true) return
-            val pm = getSystemService(PowerManager::class.java) ?: return
+            val pm = getSystemService(POWER_SERVICE) as? PowerManager ?: return
             val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Suantangyu:GraceAdvance")
             wl.setReferenceCounted(false)
             wl.acquire(60_000L)
@@ -2839,7 +2839,7 @@ class KeepAliveService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
 
     private val notificationManager by lazy {
-        getSystemService(NotificationManager::class.java)
+        getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     }
 
     override fun onCreate() {
