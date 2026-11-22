@@ -2521,7 +2521,7 @@ class KeepAliveService : Service() {
                         }
                 )
                 e
-            } catch (ex: Exception) {
+            } catch (ex: Throwable) {
                 cronetEngineFailed = true
                 engineLog("引擎：Cronet 初始化失败，回落 HttpURLConnection 通道（" + ex.javaClass.simpleName + "）")
                 null
