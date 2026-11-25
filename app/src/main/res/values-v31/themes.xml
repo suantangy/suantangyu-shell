@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 3.69.0：Android 12+ 系统启动屏——白底＋应用图标。页面露脸前的空窗由系统
+         撑住，底色与窗口底/页面底一致（#ffffff，cheng 2026-10-20 定的白窗口底），
+         过渡不跳色。低版本系统走基础主题的 windowBackground，不受影响。 -->
+    <style name="Theme.SuantangyuShell" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#ffffff</item>
+        <item name="android:statusBarColor">#0c0c0e</item>
+        <item name="android:windowSplashScreenBackground">#ffffff</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+    </style>
+</resources>

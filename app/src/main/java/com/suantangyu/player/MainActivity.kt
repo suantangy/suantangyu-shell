@@ -21,7 +21,14 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebViewClient
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import androidx.activity.addCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -46,6 +53,10 @@ class MainActivity : AppCompatActivity() {
         /** 你的 Cloudflare Pages 地址，换了部署地址就改这里 */
         const val START_URL = "https://m.858600.xyz/"
         const val ACTION_CONTROL = "com.suantangyu.player.CONTROL"
+        /** 3.69.0：APK 内置页面版本（assets/web/index.html），与页面 aq-ver 标记对应 */
+        const val BUNDLED_PAGE_VER = 157
+        /** 离线包查更新每进程只跑一次 */
+        var pageUpdateChecked = false
         var instance: MainActivity? = null
             private set
     }
@@ -135,6 +146,78 @@ class MainActivity : AppCompatActivity() {
         webView.post { check() }
     }
 
+    // —— 3.69.0 离线包：页面主文档从本地供（同源不变，localStorage/设置全保留） ——
+    // 优先用已下载的新版（filesDir/webpkg），没有或比内置旧就用 APK 内置页。
+    private fun openLocalPage(): InputStream? {
+        try {
+            val dir = File(filesDir, "webpkg")
+            val f = File(dir, "index.html")
+            val v = try { File(dir, "ver.txt").readText().trim().toIntOrNull() ?: 0 } catch (_: Exception) { 0 }
+            if (f.isFile && f.length() > 500_000L && v >= BUNDLED_PAGE_VER) {
+                return FileInputStream(f)
+            }
+        } catch (_: Exception) {
+        }
+        return try { assets.open("web/index.html") } catch (_: Exception) { null }
+    }
+
+    private fun parsePageVer(text: String): Int? {
+        val m = Regex("aq-ver:1_(\\d+)").find(text) ?: return null
+        return m.groupValues[1].toIntOrNull()
+    }
+
+    /** 后台查一次线上页面版本：比本地新才整页下载存好，下次启动生效；全程静默失败、不挡启动 */
+    private fun checkPageUpdate() {
+        if (pageUpdateChecked) return
+        pageUpdateChecked = true
+        Thread {
+            try {
+                val dir = File(filesDir, "webpkg"); dir.mkdirs()
+                val savedVer = try { File(dir, "ver.txt").readText().trim().toIntOrNull() ?: 0 } catch (_: Exception) { 0 }
+                val localVer = maxOf(BUNDLED_PAGE_VER, savedVer)
+                // 只读头部 8KB 找版本标记（不管服务器认不认 Range 都不会整页白下）
+                var remoteVer: Int? = null
+                val conn = URL(START_URL).openConnection() as HttpURLConnection
+                conn.connectTimeout = 8000; conn.readTimeout = 8000
+                conn.setRequestProperty("Range", "bytes=0-8191")
+                conn.setRequestProperty("User-Agent", "SuantangyuShell")
+                conn.inputStream.use { ins ->
+                    val buf = ByteArray(8192)
+                    var n = 0
+                    while (n < buf.size) {
+                        val r = ins.read(buf, n, buf.size - n)
+                        if (r < 0) break
+                        n += r
+                    }
+                    remoteVer = parsePageVer(String(buf, 0, n, Charsets.UTF_8))
+                }
+                conn.disconnect()
+                val rv = remoteVer ?: return@Thread
+                if (rv <= localVer) return@Thread
+                val tmp = File(dir, "index.html.tmp")
+                val c2 = URL(START_URL).openConnection() as HttpURLConnection
+                c2.connectTimeout = 15000; c2.readTimeout = 30000
+                c2.setRequestProperty("User-Agent", "SuantangyuShell")
+                var ok = false
+                if (c2.responseCode == 200) {
+                    c2.inputStream.use { ins ->
+                        tmp.outputStream().use { out -> ins.copyTo(out) }
+                    }
+                    ok = tmp.length() > 500_000L && parsePageVer(tmp.readText(Charsets.UTF_8)) == rv
+                }
+                c2.disconnect()
+                if (ok) {
+                    val target = File(dir, "index.html")
+                    if (target.exists()) target.delete()
+                    if (tmp.renameTo(target)) {
+                        File(dir, "ver.txt").writeText(rv.toString())
+                    } else tmp.delete()
+                } else tmp.delete()
+            } catch (_: Exception) {
+            }
+        }.start()
+    }
+
     /** 把系统栏高度注入网页，页面 CSS 的 var(--fm-safe-top/bottom) 自动生效 */
     private fun injectSafeArea() {        if (!::webView.isInitialized) return
         webView.post {
@@ -208,6 +291,26 @@ class MainActivity : AppCompatActivity() {
         baoBridge = bridge
         webView.addJavascriptInterface(bridge, "BaoBus")
         webView.webViewClient = object : WebViewClient() {
+            // 3.69.0 离线包：主文档走本地副本（同源不变），其余请求一律不碰
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                try {
+                    val u = request.url
+                    if (request.isForMainFrame && request.method == "GET" &&
+                        u.scheme == "https" && u.host == "m.858600.xyz" &&
+                        (u.path == "/" || u.path == "" || u.path == "/index.html")
+                    ) {
+                        val stream = openLocalPage()
+                        if (stream != null) {
+                            val resp = WebResourceResponse("text/html", "utf-8", stream)
+                            resp.setStatusCodeAndReasonPhrase(200, "OK")
+                            return resp
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+                return null
+            }
+
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 // 页面加载完补一次注入（防止 insets 先到、页面后到的情况）
@@ -300,6 +403,9 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(
             this, Intent(this, KeepAliveService::class.java)
         )
+
+        // 3.69.0：离线包后台查更新（不挡启动，新版下次启动生效）
+        checkPageUpdate()
     }
 
     /** 本地音乐多选文件导入（3.61.0）：系统文件选择器回调——逐个文件
