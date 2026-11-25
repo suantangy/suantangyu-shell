@@ -99,9 +99,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 条件满足后：补一次注入，轮询确认计算样式已生效再显示，彻底杜绝时序竞态 */
+    /** 条件满足后：补一次注入，轮询确认计算样式已生效再显示，彻底杜绝时序竞态。
+     *  3.68.0：触发点从 onPageFinished 提前到进度 20% 的提前注入点——校验本身
+     *  （类已挂＋--safe-t 计算值正确）就是安全保证，不必等整页（含全部子资源）
+     *  加载完才开始校验；首帧样式一就位即可露脸，冷启动不再全程黑屏等待。
+     *  onPageFinished 仍会置 pageReady 再调一次本函数作兜底。 */
     private fun maybeReveal() {
-        if (revealed || !insetsReady || !pageReady || !::webView.isInitialized) return
+        if (revealed || !insetsReady || !(pageReady || earlyInjected) || !::webView.isInitialized) return
         revealed = true
         injectSafeArea()
         var tries = 0
@@ -219,6 +223,8 @@ class MainActivity : AppCompatActivity() {
                 if (!earlyInjected && newProgress >= 20 && insetsReady && ::webView.isInitialized) {
                     earlyInjected = true
                     injectSafeArea()
+                    // 3.68.0：注入点一到就启动露脸校验，不再等 onPageFinished
+                    maybeReveal()
                 }
             }
             // 网页 <input type="file">（如音源管理"本地文件"）调起系统文件选择器
