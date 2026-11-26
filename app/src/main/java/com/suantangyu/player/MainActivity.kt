@@ -274,8 +274,9 @@ class MainActivity : AppCompatActivity() {
 
         webView = WebView(this)
         // 3.75.0：向 WebToApp 壳看齐——不设显现门，WebView 从头可见、边下边画。
-        // 底色先刷成页面浅色底，首帧画出前不露白闪。
-        webView.setBackgroundColor(Color.rgb(243, 243, 246))
+        // 3.78.0：删掉 3.75 的 #F3F3F6 底色预刷——它让空屏阶段多出一段实灰，
+        // 与系统启动窗的白一帧硬换成一闪（cheng 2026-11-26 定：砍掉第二段）。
+        // 不预刷时 WebView 默认白底，与系统白连成一段，页面带着内容一次到位。
         setContentView(webView)
 
         with(webView.settings) {
