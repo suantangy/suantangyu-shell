@@ -71,6 +71,8 @@ class MainActivity : AppCompatActivity() {
     private var pageReady = false
     private var revealed = false
     private var earlyInjected = false
+    /** 3.72.0：页面第一帧已提交（onPageCommitVisible），可提前启动露脸校验 */
+    private var firstFrameSeen = false
     /** 网页桥（本地音乐授权文件夹回调要回调用） */
     private var baoBridge: BaoBridge? = null
 
@@ -114,9 +116,13 @@ class MainActivity : AppCompatActivity() {
      *  3.68.0：触发点从 onPageFinished 提前到进度 20% 的提前注入点——校验本身
      *  （类已挂＋--safe-t 计算值正确）就是安全保证，不必等整页（含全部子资源）
      *  加载完才开始校验；首帧样式一就位即可露脸，冷启动不再全程黑屏等待。
-     *  onPageFinished 仍会置 pageReady 再调一次本函数作兜底。 */
+     *  onPageFinished 仍会置 pageReady 再调一次本函数作兜底。
+     *  3.72.0：再加一条触发——onPageCommitVisible（页面第一帧真正提交）一到就
+     *  启动校验。此时页面已经画出真实帧，注入的计算样式检查通常首轮即过，
+     *  露脸不再等进度节拍＋多轮 100ms 轮询，系统等首帧的压灰时间随之缩短。
+     *  校验与 250ms 淡入、5 秒兜底都不变。 */
     private fun maybeReveal() {
-        if (revealed || !insetsReady || !(pageReady || earlyInjected) || !::webView.isInitialized) return
+        if (revealed || !insetsReady || !(pageReady || earlyInjected || firstFrameSeen) || !::webView.isInitialized) return
         revealed = true
         injectSafeArea()
         var tries = 0
@@ -317,6 +323,17 @@ class MainActivity : AppCompatActivity() {
                 pageReady = true
                 injectSafeArea()
                 maybeReveal()
+            }
+
+            // 3.72.0：页面第一帧真正提交到 WebView 时先补注入并启动露脸校验，
+            // 不再干等进度 20% 的节拍；校验不过仍走 maybeReveal 内的轮询兜底。
+            override fun onPageCommitVisible(view: WebView, url: String) {
+                super.onPageCommitVisible(view, url)
+                if (!firstFrameSeen) {
+                    firstFrameSeen = true
+                    injectSafeArea()
+                    maybeReveal()
+                }
             }
         }
         // 进度起来后 DOM 基本可用，提前注入一次，缩短隐身等待（最终显示仍以校验为准）
