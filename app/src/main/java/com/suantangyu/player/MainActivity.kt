@@ -276,7 +276,10 @@ class MainActivity : AppCompatActivity() {
         // 3.75.0：向 WebToApp 壳看齐——不设显现门，WebView 从头可见、边下边画。
         // 3.78.0：删掉 3.75 的 #F3F3F6 底色预刷——它让空屏阶段多出一段实灰，
         // 与系统启动窗的白一帧硬换成一闪（cheng 2026-11-26 定：砍掉第二段）。
-        // 不预刷时 WebView 默认白底，与系统白连成一段，页面带着内容一次到位。
+        // 3.79.0：但完全不预刷会露黑——WebView 未绘制的硬件表面是纯黑（cheng
+        // 录屏实锤：黑段约 1.7 秒、长度随页面到达时间变）。故预刷改白色：与
+        // 系统白连成一段，灰段、黑段都没有，页面带着内容一次到位。
+        webView.setBackgroundColor(Color.WHITE)
         setContentView(webView)
 
         with(webView.settings) {
