@@ -38,6 +38,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 
 /**
  * 酸汤鱼音乐混合壳：WebView 承载现有网页播放器（音频仍由网页 <audio> 播放，
@@ -68,6 +70,8 @@ class MainActivity : AppCompatActivity() {
     private var lastKbCss: Int = 0
     /** 启动闪跳修复：insets 和页面都就绪、注入已画出来后，才显示 WebView */
     private var insetsReady = false
+    private var wantInitialLoad = false
+    private var pageLoadStarted = false
     private var pageReady = false
     private var revealed = false
     private var earlyInjected = false
@@ -194,6 +198,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 把系统栏高度注入网页，页面 CSS 的 var(--fm-safe-top/bottom) 自动生效 */
+    /** 3.77.0：安全区文档起始注入——赶在页面任何绘制之前把 --fm-safe-top/bottom
+     *  和 fm-chrome-full 写进文档。旧路（加载 20% 时 evaluateJavascript 注入）与
+     *  第一帧赛跑：页面走缓存来得快时先按 --safe-t=0 画出错位一帧、注入落地再
+     *  整页滑回（cheng 2026-11-26 录屏实锤：高约 40dp、停约 0.45 秒后滑回）。
+     *  本函数只在首次加载前登记一次（脚本对后续每次导航同样生效），值取登记
+     *  时刻的真实 insets；其后 insets 变化仍由 injectSafeArea 实时修正。 */
+    private fun safeAreaScript(): String =
+        "document.documentElement.classList.add('fm-chrome-full');" +
+            "document.documentElement.style.setProperty('--fm-safe-top','" + lastTopCss + "px');" +
+            "document.documentElement.style.setProperty('--fm-safe-bottom','" + lastBottomCss + "px')"
+
+    /** 首次加载：等 insets 到手才登记文档起始脚本并 loadUrl——insets 在窗口
+     *  首次布局时就到（远早于页面下载），等待不拖慢启动；800ms 兜底防异常
+     *  环境下 insets 不来时页面永远打不开（force 用当时的值先加载，后续注入
+     *  再修正）。 */
+    private fun maybeLoadPage(force: Boolean = false) {
+        if (!wantInitialLoad || pageLoadStarted || !(insetsReady || force)) return
+        if (!::webView.isInitialized) return
+        pageLoadStarted = true
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(webView, safeAreaScript(), setOf("*"))
+            }
+        } catch (_: Exception) {
+        }
+        webView.loadUrl(START_URL)
+    }
+
     private fun injectSafeArea() {        if (!::webView.isInitialized) return
         webView.post {
             webView.evaluateJavascript(
@@ -269,9 +301,9 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             // 3.69.0 离线包：主文档走本地副本（同源不变），其余请求一律不碰
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                // 3.76.0 测试版：离线包拦截关闭，主文档走真网络——验证「空架子闪帧」
-                // 是否由本地直供造成（cheng 2026-11-26 疑离线包）。其余与 3.75 一字不动；
-                // checkPageUpdate 照常后台下载、只是没人供它，对渲染无影响。
+                // 3.77.0 定版：离线包已拆——主文档走真网络（3.76 测试版验证：
+                // 本地直供让页面各构建阶段挤成一帧闪，走网络后阶段拉开如
+                // WebToApp 壳）。拦截函数保留空壳，防后续误接回本地供页。
                 return null
             }
 
@@ -324,6 +356,7 @@ class MainActivity : AppCompatActivity() {
             lastTopCss = (bars.top / density).toInt()
             lastBottomCss = (bars.bottom / density).toInt()
             insetsReady = true
+            maybeLoadPage()
             // 页面已就绪：值变了（旋转/分屏）就补注入
             if (pageReady) injectSafeArea()
             maybeReveal()
@@ -360,7 +393,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (savedInstanceState == null) {
-            webView.loadUrl(START_URL)
+            // 3.77.0：不等这里直接加载——等 insets 到手、文档起始脚本登记后再
+            // 加载（见 maybeLoadPage）；800ms 兜底防 insets 迟到卡住首屏。
+            wantInitialLoad = true
+            maybeLoadPage()
+            uiHandler.postDelayed({ maybeLoadPage(force = true) }, 800)
         }
 
         // 启动前台保活服务（通知栏常驻就靠它）
@@ -368,8 +405,8 @@ class MainActivity : AppCompatActivity() {
             this, Intent(this, KeepAliveService::class.java)
         )
 
-        // 3.69.0：离线包后台查更新（不挡启动，新版下次启动生效）
-        checkPageUpdate()
+        // 3.77.0：离线包已正式拆除（3.76 测试验证：本地直供把空架子压成一帧闪，
+        // 走真网络后各阶段拉开、读作正常加载）——不再后台下载页面副本。
     }
 
     /** 本地音乐多选文件导入（3.61.0）：系统文件选择器回调——逐个文件
