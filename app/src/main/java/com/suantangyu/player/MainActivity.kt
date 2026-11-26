@@ -110,40 +110,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 条件满足后：补一次注入，轮询确认计算样式已生效再显示，彻底杜绝时序竞态。
-     *  3.68.0：触发点从 onPageFinished 提前到进度 20% 的提前注入点——校验本身
-     *  （类已挂＋--safe-t 计算值正确）就是安全保证，不必等整页（含全部子资源）
-     *  加载完才开始校验；首帧样式一就位即可露脸，冷启动不再全程黑屏等待。
-     *  onPageFinished 仍会置 pageReady 再调一次本函数作兜底。 */
+    /** 3.75.0：显现门已拆（WebView 全程可见、边下边画，同 WebToApp 壳），
+     *  本函数只负责在条件齐时补一次安全区注入。触发点不变：进度 20% 提前
+     *  注入点／onPageFinished／insets 就位，三处任一先到都调，revealed 保证
+     *  只注一次；其后 insets 变化由监听器里 pageReady 分支补注。注入落地前
+     *  页面 --safe-t 另有 env(safe-area-inset-top) 兜底，顶部不会跳。 */
     private fun maybeReveal() {
         if (revealed || !insetsReady || !(pageReady || earlyInjected) || !::webView.isInitialized) return
         revealed = true
         injectSafeArea()
-        var tries = 0
-        fun check() {
-            if (webView.visibility == View.VISIBLE) return
-            if (tries++ >= 50) { webView.visibility = View.VISIBLE; return } // 5s 兜底，绝不白屏
-            webView.evaluateJavascript(
-                "(function(){try{var e=document.documentElement;" +
-                    "var c=e.classList.contains('fm-chrome-full')?'1':'0';" +
-                    "var v=getComputedStyle(e).getPropertyValue('--safe-t').trim();" +
-                    "return c+'|'+v;}catch(x){return '0|';}})()"
-            ) { r ->
-                val s = r ?: ""
-                val clsOk = s.startsWith("\"1|")
-                // 有状态栏时期望 --safe-t 非 0；无状态栏时只看类
-                val valOk = lastTopCss == 0 || !(s.startsWith("\"1|0px\"") || s == "\"1|\"")
-                if (clsOk && valOk) {
-                    // 淡入显示，避免内容"啪"一下弹出的两层感
-                    webView.alpha = 0f
-                    webView.visibility = View.VISIBLE
-                    webView.animate().alpha(1f).setDuration(250).start()
-                } else {
-                    webView.postDelayed({ check() }, 100)
-                }
-            }
-        }
-        webView.post { check() }
     }
 
     // —— 3.69.0 离线包：页面主文档从本地供（同源不变，localStorage/设置全保留） ——
@@ -266,8 +241,9 @@ class MainActivity : AppCompatActivity() {
         insetsController.isAppearanceLightNavigationBars = true
 
         webView = WebView(this)
-        // 先隐身：等安全区注入画好再显示，标题不会先顶上去再跳下来
-        webView.visibility = View.INVISIBLE
+        // 3.75.0：向 WebToApp 壳看齐——不设显现门，WebView 从头可见、边下边画。
+        // 底色先刷成页面浅色底，首帧画出前不露白闪。
+        webView.setBackgroundColor(Color.rgb(243, 243, 246))
         setContentView(webView)
 
         with(webView.settings) {
