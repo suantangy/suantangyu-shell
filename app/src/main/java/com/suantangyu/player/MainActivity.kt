@@ -269,21 +269,9 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             // 3.69.0 离线包：主文档走本地副本（同源不变），其余请求一律不碰
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                try {
-                    val u = request.url
-                    if (request.isForMainFrame && request.method == "GET" &&
-                        u.scheme == "https" && u.host == "m.858600.xyz" &&
-                        (u.path == "/" || u.path == "" || u.path == "/index.html")
-                    ) {
-                        val stream = openLocalPage()
-                        if (stream != null) {
-                            val resp = WebResourceResponse("text/html", "utf-8", stream)
-                            resp.setStatusCodeAndReasonPhrase(200, "OK")
-                            return resp
-                        }
-                    }
-                } catch (_: Exception) {
-                }
+                // 3.76.0 测试版：离线包拦截关闭，主文档走真网络——验证「空架子闪帧」
+                // 是否由本地直供造成（cheng 2026-11-26 疑离线包）。其余与 3.75 一字不动；
+                // checkPageUpdate 照常后台下载、只是没人供它，对渲染无影响。
                 return null
             }
 
