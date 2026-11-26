@@ -120,7 +120,9 @@ class MainActivity : AppCompatActivity() {
      *  3.72.0：再加一条触发——onPageCommitVisible（页面第一帧真正提交）一到就
      *  启动校验。此时页面已经画出真实帧，注入的计算样式检查通常首轮即过，
      *  露脸不再等进度节拍＋多轮 100ms 轮询，系统等首帧的压灰时间随之缩短。
-     *  校验与 250ms 淡入、5 秒兜底都不变。 */
+     *  校验与 250ms 淡入、5 秒兜底都不变。
+     *  3.73.0：隐身门已拆、WebView 全程可见，本函数只剩注入协调作用——check()
+     *  见 VISIBLE 即返回，轮询与淡入不再实际执行（代码留作保险）。 */
     private fun maybeReveal() {
         if (revealed || !insetsReady || !(pageReady || earlyInjected || firstFrameSeen) || !::webView.isInitialized) return
         revealed = true
@@ -272,8 +274,11 @@ class MainActivity : AppCompatActivity() {
         insetsController.isAppearanceLightNavigationBars = true
 
         webView = WebView(this)
-        // 先隐身：等安全区注入画好再显示，标题不会先顶上去再跳下来
-        webView.visibility = View.INVISIBLE
+        // 3.73.0：拆掉隐身门——WebView 从第一帧就可见、边下边画（学上游薄壳），
+        // 窗口任何时刻都有内容，系统交接淡入不再漏出暗底压灰。安全区由页面
+        // env(safe-area-inset-top) 兜底＋壳注入取 max，标题跳变风险已核可控。
+        // 底色先刷成页面底色，第一帧画出前也是这一色，不露 WebView 默认白。
+        webView.setBackgroundColor(Color.rgb(243, 243, 246))
         setContentView(webView)
 
         with(webView.settings) {
