@@ -71,8 +71,6 @@ class MainActivity : AppCompatActivity() {
     private var pageReady = false
     private var revealed = false
     private var earlyInjected = false
-    /** 3.72.0：页面第一帧已提交（onPageCommitVisible），可提前启动露脸校验 */
-    private var firstFrameSeen = false
     /** 网页桥（本地音乐授权文件夹回调要回调用） */
     private var baoBridge: BaoBridge? = null
 
@@ -116,15 +114,9 @@ class MainActivity : AppCompatActivity() {
      *  3.68.0：触发点从 onPageFinished 提前到进度 20% 的提前注入点——校验本身
      *  （类已挂＋--safe-t 计算值正确）就是安全保证，不必等整页（含全部子资源）
      *  加载完才开始校验；首帧样式一就位即可露脸，冷启动不再全程黑屏等待。
-     *  onPageFinished 仍会置 pageReady 再调一次本函数作兜底。
-     *  3.72.0：再加一条触发——onPageCommitVisible（页面第一帧真正提交）一到就
-     *  启动校验。此时页面已经画出真实帧，注入的计算样式检查通常首轮即过，
-     *  露脸不再等进度节拍＋多轮 100ms 轮询，系统等首帧的压灰时间随之缩短。
-     *  校验与 250ms 淡入、5 秒兜底都不变。
-     *  3.73.0：隐身门已拆、WebView 全程可见，本函数只剩注入协调作用——check()
-     *  见 VISIBLE 即返回，轮询与淡入不再实际执行（代码留作保险）。 */
+     *  onPageFinished 仍会置 pageReady 再调一次本函数作兜底。 */
     private fun maybeReveal() {
-        if (revealed || !insetsReady || !(pageReady || earlyInjected || firstFrameSeen) || !::webView.isInitialized) return
+        if (revealed || !insetsReady || !(pageReady || earlyInjected) || !::webView.isInitialized) return
         revealed = true
         injectSafeArea()
         var tries = 0
@@ -274,11 +266,8 @@ class MainActivity : AppCompatActivity() {
         insetsController.isAppearanceLightNavigationBars = true
 
         webView = WebView(this)
-        // 3.73.0：拆掉隐身门——WebView 从第一帧就可见、边下边画（学上游薄壳），
-        // 窗口任何时刻都有内容，系统交接淡入不再漏出暗底压灰。安全区由页面
-        // env(safe-area-inset-top) 兜底＋壳注入取 max，标题跳变风险已核可控。
-        // 底色先刷成页面底色，第一帧画出前也是这一色，不露 WebView 默认白。
-        webView.setBackgroundColor(Color.rgb(243, 243, 246))
+        // 先隐身：等安全区注入画好再显示，标题不会先顶上去再跳下来
+        webView.visibility = View.INVISIBLE
         setContentView(webView)
 
         with(webView.settings) {
@@ -328,17 +317,6 @@ class MainActivity : AppCompatActivity() {
                 pageReady = true
                 injectSafeArea()
                 maybeReveal()
-            }
-
-            // 3.72.0：页面第一帧真正提交到 WebView 时先补注入并启动露脸校验，
-            // 不再干等进度 20% 的节拍；校验不过仍走 maybeReveal 内的轮询兜底。
-            override fun onPageCommitVisible(view: WebView, url: String) {
-                super.onPageCommitVisible(view, url)
-                if (!firstFrameSeen) {
-                    firstFrameSeen = true
-                    injectSafeArea()
-                    maybeReveal()
-                }
             }
         }
         // 进度起来后 DOM 基本可用，提前注入一次，缩短隐身等待（最终显示仍以校验为准）
