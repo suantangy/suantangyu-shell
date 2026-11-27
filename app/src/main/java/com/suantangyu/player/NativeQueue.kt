@@ -123,30 +123,37 @@ object CoverCache {
         return tiny
     }
 
-    /** 强模糊版:原图先缩到宽 12px、再放大回原尺寸。糊度按 cheng
-     *  网页版截图实测拟合:显示域特征约 250px → 中间图宽 = 2970/250
-     *  ≈ 12(72px 时字形透出、20px 仍偏利);键加 |blur 后缀独立缓存 */
+    /** 强模糊版(3.84.9 按网页 .np-bg 几何重做):网页背景图是封面
+     *  以 145% 尺寸居中、object-fit:cover 铺放,屏幕实际只看到封面
+     *  的中央窗(x 34.5%–65.5%、y 15.5%–84.5%),位置对位置对应。
+     *  这里取含模糊外溢的窗口(x 28.5%–71.5%、y 9.5%–90.5%)逐块
+     *  面积平均到 9x8(面积平均而非采样缩放,防亮笔画成白斑——
+     *  3.84.4 教训),再裁出可见窗约 7x6 直接返回,绘制时拉满全屏。
+     *  糊度由 21 首网页版截图离线全栈模拟拟合(条带均差 8.2);
+     *  键加 |blur 后缀独立缓存 */
     suspend fun loadBlurred(url: String): Bitmap? {
         if (url.isEmpty() || !url.startsWith("http")) return null
         val key = "$url|blur"
         cache.get(key)?.let { return it }
         val full = load(url) ?: return null
         val blurred = try {
-            val tw = 7
-            val th = maxOf(1, full.height * tw / full.width)
-            // 逐块面积平均缩到 7px:不能用 createScaledBitmap 一步缩——
-            // 它是采样不是面积平均,亮笔画会被采样保留、放大后成一团
-            // 团白光斑(3.84.4 真机实锤:顶部书法字白斑;离线 PIL 面积
-            // 平均版同参数与网页版只差约 5)。放大回去可以走系统缩放
+            val wx0 = (full.width * 0.285f).toInt()
+            val wx1 = (full.width * 0.715f).toInt()
+            val wy0 = (full.height * 0.095f).toInt()
+            val wy1 = (full.height * 0.905f).toInt()
+            val ww = wx1 - wx0
+            val wh = wy1 - wy0
+            val tw = 9
+            val th = 8
             val px = IntArray(full.width * full.height)
             full.getPixels(px, 0, full.width, 0, 0, full.width, full.height)
             val small = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
             for (oy in 0 until th) {
-                val y0 = oy * full.height / th
-                val y1 = maxOf(y0 + 1, (oy + 1) * full.height / th)
+                val y0 = wy0 + oy * wh / th
+                val y1 = maxOf(y0 + 1, wy0 + (oy + 1) * wh / th)
                 for (ox in 0 until tw) {
-                    val x0 = ox * full.width / tw
-                    val x1 = maxOf(x0 + 1, (ox + 1) * full.width / tw)
+                    val x0 = wx0 + ox * ww / tw
+                    val x1 = maxOf(x0 + 1, wx0 + (ox + 1) * ww / tw)
                     var r = 0L; var g = 0L; var b = 0L; var n = 0L
                     for (yy in y0 until y1) {
                         var idx = yy * full.width + x0
@@ -166,7 +173,10 @@ object CoverCache {
                     )
                 }
             }
-            Bitmap.createScaledBitmap(small, full.width, full.height, true)
+            // 裁可见窗:外溢占窗口宽 0.06/0.43、高 0.06/0.81
+            val sx = Math.round(tw * 0.06f / 0.43f)
+            val sy = Math.round(th * 0.06f / 0.81f)
+            Bitmap.createBitmap(small, sx, sy, tw - 2 * sx, th - 2 * sy)
         } catch (_: Exception) {
             full
         }

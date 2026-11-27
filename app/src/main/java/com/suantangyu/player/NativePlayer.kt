@@ -428,7 +428,8 @@ private fun fmtTime(ms: Long): String {
 // 明暗判定(网页 syncNpUiContrast):lum = 0.65*lum(c1) + 0.35*lum(c2),
 // c1/c2 是提亮后的氛围色对(未过 sat14),lum>88 → 深字浅底
 private class CoverPalette(
-    val darkUi: Boolean, val lyOn: Color, val c1: Color, val c2: Color
+    val darkUi: Boolean, val lyOn: Color, val c1: Color, val c2: Color,
+    val c1Raw: Color, val c2Raw: Color
 )
 
 private class PalBucket { var n = 0; var r = 0L; var g = 0L; var b = 0L; var sat = 0.0 }
@@ -520,16 +521,73 @@ private fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
                 bb.toInt().coerceIn(0, 255)
             )
         }
-        val c1 = sat14(punch(fr, 70.0), punch(fg2, 40.0), punch(fb, 50.0))
-        val c2 = sat14(
-            minOf(255.0, fr * 0.5 + 120).toInt(),
-            minOf(255.0, fg2 * 0.5 + 110).toInt(),
-            minOf(255.0, fb * 0.5 + 120).toInt()
-        )
-        return CoverPalette(darkUi, lyOn, c1, c2)
+        val c1ri = punch(fr, 70.0); val c1gi = punch(fg2, 40.0); val c1bi = punch(fb, 50.0)
+        val c2ri = minOf(255.0, fr * 0.5 + 120).toInt()
+        val c2gi = minOf(255.0, fg2 * 0.5 + 110).toInt()
+        val c2bi = minOf(255.0, fb * 0.5 + 120).toInt()
+        val c1 = sat14(c1ri, c1gi, c1bi)
+        val c2 = sat14(c2ri, c2gi, c2bi)
+        // 原始 c1/c2(未过 sat14):浅底新栈的染色层用原色,饱和由
+        // 整叠合成后的统一 saturate(1.4) 施加(网页 backdrop 同序)
+        val c1Raw = Color(c1ri, c1gi, c1bi)
+        val c2Raw = Color(c2ri, c2gi, c2bi)
+        return CoverPalette(darkUi, lyOn, c1, c2, c1Raw, c2Raw)
     } catch (e: Exception) {
         return null
     }
+}
+
+
+// 浅底背景绘制用饱和画笔:整叠(底+染色+图)合成后统一 saturate
+// (1.4),对应网页 ::after 的 backdrop-filter;白罩在其外、不参与
+private val npBgSatPaint = android.graphics.Paint().apply {
+    colorFilter = android.graphics.ColorMatrixColorFilter(
+        android.graphics.ColorMatrix().apply { setSaturation(1.4f) }
+    )
+    isFilterBitmap = true
+}
+
+/** 浅底氛围底离线合成(半分辨率,网页 .np-bg 层序):底 #FAFAFC →
+ *  c1 径向染色(中心 (50%,-10%)、有效半径 (0.66W, 0.44H)、alpha
+ *  .28、原始色)→ c2 径向(中心 (100%,40%)、有效半径 (0.45W,
+ *  0.275H)、alpha .22)→ 中央窗强模糊图(alpha .80、sat 1.25、
+ *  亮 1.12)。整叠的 saturate(1.4) 在绘制本位图时由 npBgSatPaint
+ *  施加。参数出自 21 首网页版截图离线全栈拟合(条带均差 8.2) */
+private fun composeLightBg(blur: Bitmap, pa: CoverPalette, w: Int, h: Int): Bitmap {
+    val W = maxOf(2, w / 2); val H = maxOf(2, h / 2)
+    val out = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+    val cv = android.graphics.Canvas(out)
+    cv.drawColor(android.graphics.Color.rgb(250, 250, 252))
+    fun radial(cx: Float, cy: Float, rx: Float, ry: Float, col: Color, a: Float) {
+        val argb = android.graphics.Color.argb(
+            (a * 255).toInt().coerceIn(0, 255),
+            (col.red * 255).toInt().coerceIn(0, 255),
+            (col.green * 255).toInt().coerceIn(0, 255),
+            (col.blue * 255).toInt().coerceIn(0, 255)
+        )
+        val sh = android.graphics.RadialGradient(
+            cx, cy, rx, intArrayOf(argb, 0), floatArrayOf(0f, 1f),
+            android.graphics.Shader.TileMode.CLAMP
+        )
+        val m = android.graphics.Matrix()
+        m.setScale(1f, ry / rx, cx, cy)
+        sh.setLocalMatrix(m)
+        val p = android.graphics.Paint().apply { shader = sh; isAntiAlias = true }
+        cv.drawRect(0f, 0f, W.toFloat(), H.toFloat(), p)
+    }
+    radial(W * 0.5f, -H * 0.10f, W * 0.66f, H * 0.44f, pa.c1Raw, 0.28f)
+    radial(W.toFloat(), H * 0.40f, W * 0.45f, H * 0.275f, pa.c2Raw, 0.22f)
+    val cm = android.graphics.ColorMatrix()
+    cm.setSaturation(1.25f)
+    val arr = cm.array
+    for (r in 0..2) for (c in 0..2) arr[r * 5 + c] = arr[r * 5 + c] * 1.12f
+    val ip = android.graphics.Paint().apply {
+        alpha = 204
+        colorFilter = android.graphics.ColorMatrixColorFilter(cm)
+        isFilterBitmap = true
+    }
+    cv.drawBitmap(blur, null, android.graphics.Rect(0, 0, W, H), ip)
+    return out
 }
 
 @Composable
@@ -653,81 +711,93 @@ fun NativePlayerRoot(
             .offset { IntOffset(0, offsetY.value.roundToInt()) }
             .background(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
     ) {
-        // 氛围底(网页全栈复刻):底色 + c1/c2 两团径向染色 + 原图 145%
-        // 强模糊(参数按明暗两套),整层再 saturate 1.4(模拟 ::after 的
-        // backdrop saturate),最后罩色——浅底:白 .45(页面深主题 .32);
-        // 深底:黑 .35。3.84.1/3.84.2 只搬了图和罩、漏了染色与整层
-        // 饱和,所以底子发灰发白、跟网页对不上
+        // 氛围底(3.84.9 按网页 .np-bg 的几何与层序重做):网页背景
+        // 是封面 145% 居中 cover 铺放,屏幕只见封面中央窗,位置对
+        // 位置;层序=底 #FAFAFC → c1/c2 径向染色(原始色 .28/.22)
+        // → 图(中央窗强模糊、sat 1.25、亮 1.12、alpha .80)→
+        // 整叠 saturate(1.4)(::after 的 backdrop)→ 白罩 .35
+        // (页面深主题 .32)。参数由 21 首网页版截图离线全栈模拟
+        // 拟合(条带均差 8.2,旧栈真机约 14)。浅底走 composeLightBg
+        // 离线合成 + npBgSatPaint 绘制;深底仍走旧路径
         val blurBmp = CoverBitmap(st.cover, blurred = true)
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val bw = constraints.maxWidth.toFloat()
-            val bh = constraints.maxHeight.toFloat()
-            Box(Modifier.fillMaxSize()) {
-                Canvas(Modifier.fillMaxSize()) {
-                    drawRect(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
-                    val pa = palette
-                    if (pa != null) {
-                        drawRect(
-                            brush = Brush.radialGradient(
-                                colors = listOf(
-                                    pa.c1.copy(alpha = if (darkUi) 0.28f else 0.36f),
-                                    Color.Transparent
-                                ),
-                                center = Offset(bw * 0.5f, -bh * 0.10f),
-                                radius = bw * 0.66f
-                            )
-                        )
-                        drawRect(
-                            brush = Brush.radialGradient(
-                                colors = listOf(
-                                    pa.c2.copy(alpha = if (darkUi) 0.22f else 0.23f),
-                                    Color.Transparent
-                                ),
-                                center = Offset(bw, bh * 0.40f),
-                                radius = bw * 0.45f
-                            )
-                        )
-                    }
+            val bw = constraints.maxWidth
+            val bh = constraints.maxHeight
+            val pa = palette
+            if (!darkUi && pa != null && blurBmp != null) {
+                val comp = remember(blurBmp, pa, bw, bh) {
+                    composeLightBg(blurBmp, pa, bw, bh)
                 }
-                if (blurBmp != null) {
-                    val imgMatrix = remember(darkUi) {
-                        ColorMatrix().apply {
-                            // 饱和取实测拟合值(见下方罩色注释):名义
-                            // 1.25×1.4=1.75 渲染出来到不了他截图的浓
-                            // 度,拟合总饱和约 1.4
-                            setToSaturation(if (darkUi) 1.4f else 1.45f)
-                            val b = if (darkUi) 1.16f else 0.7f
-                            for (r in 0..2) {
-                                for (c in 0..2) {
-                                    this[r, c] = this[r, c] * b
+                Canvas(Modifier.fillMaxSize()) {
+                    drawContext.canvas.nativeCanvas.drawBitmap(
+                        comp, null,
+                        android.graphics.RectF(0f, 0f, size.width, size.height),
+                        npBgSatPaint
+                    )
+                }
+                Box(
+                    Modifier.fillMaxSize().background(
+                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.35f)
+                    )
+                )
+            } else {
+                Box(Modifier.fillMaxSize()) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        drawRect(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
+                        if (pa != null) {
+                            drawRect(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(
+                                        pa.c1.copy(alpha = if (darkUi) 0.28f else 0.36f),
+                                        Color.Transparent
+                                    ),
+                                    center = Offset(bw * 0.5f, -bh * 0.10f),
+                                    radius = bw * 0.66f
+                                )
+                            )
+                            drawRect(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(
+                                        pa.c2.copy(alpha = if (darkUi) 0.22f else 0.23f),
+                                        Color.Transparent
+                                    ),
+                                    center = Offset(bw.toFloat(), bh * 0.40f),
+                                    radius = bw * 0.45f
+                                )
+                            )
+                        }
+                    }
+                    if (blurBmp != null) {
+                        val imgMatrix = remember(darkUi) {
+                            ColorMatrix().apply {
+                                setToSaturation(if (darkUi) 1.4f else 1.45f)
+                                val b = if (darkUi) 1.16f else 0.7f
+                                for (r in 0..2) {
+                                    for (c in 0..2) {
+                                        this[r, c] = this[r, c] * b
+                                    }
                                 }
                             }
                         }
-                    }
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Image(
                             blurBmp.asImageBitmap(), null,
-                            Modifier.fillMaxSize(1.45f),
-                            contentScale = ContentScale.Crop,
+                            Modifier.fillMaxSize(),
+                            contentScale = ContentScale.FillBounds,
                             alpha = if (darkUi) 0.9f else 0.85f,
                             colorFilter = ColorFilter.colorMatrix(imgMatrix)
                         )
                     }
                 }
-            }
-            Box(
-                Modifier.fillMaxSize().background(
-                    if (darkUi) {
-                        // 罩 .48:离线拟合(图 .9/罩 .35)落到真机后
-                        // 边缘纯背景条实测整体偏暗约 (20,11,10)——
-                        // 拟合与真机渲染有系统差,按真机条带数据把
-                        // 罩提回 .48、图亮度 1.12→1.16 补齐
-                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.48f)
-                    } else {
-                        Color.Black.copy(alpha = 0.35f)
-                    }
+                Box(
+                    Modifier.fillMaxSize().background(
+                        if (darkUi) {
+                            Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.48f)
+                        } else {
+                            Color.Black.copy(alpha = 0.35f)
+                        }
+                    )
                 )
-            )
+            }
         }
 
         val safeTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
