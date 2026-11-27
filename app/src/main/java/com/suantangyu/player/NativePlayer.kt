@@ -497,10 +497,23 @@ private fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
         val lum = lumBase * 0.65 + lumVivid * 0.35
         val darkUi = lum > 88
         val lyOn = if (darkUi) mixColor(base, Color.Black, 0.42f) else mixColor(base, Color.White, 0.12f)
-        // 网页 rgbToAmbientPair 经典分支:punch 提亮得 c1、半量提亮得 c2
+        // 网页 rgbToAmbientPair 经典分支:punch 提亮得 c1、半量提亮得 c2;
+        // 再过一遍 backdrop 的 saturate(1.4)(与网页 ::after 同步作用于
+        // 染色层;饱和矩阵系数同 Android ColorMatrix:0.213/0.715/0.072)
         fun punch(v: Double, lift: Double) = minOf(255.0, v * 0.85 + lift).toInt()
-        val c1 = Color(punch(fr, 70.0), punch(fg2, 40.0), punch(fb, 50.0))
-        val c2 = Color(
+        fun sat14(r: Int, g: Int, b: Int): Color {
+            val s = 1.4; val i = 1 - s
+            val rr = (0.213 * i + s) * r + 0.715 * i * g + 0.072 * i * b
+            val gg = 0.213 * i * r + (0.715 * i + s) * g + 0.072 * i * b
+            val bb = 0.213 * i * r + 0.715 * i * g + (0.072 * i + s) * b
+            return Color(
+                rr.toInt().coerceIn(0, 255),
+                gg.toInt().coerceIn(0, 255),
+                bb.toInt().coerceIn(0, 255)
+            )
+        }
+        val c1 = sat14(punch(fr, 70.0), punch(fg2, 40.0), punch(fb, 50.0))
+        val c2 = sat14(
             minOf(255.0, fr * 0.5 + 120).toInt(),
             minOf(255.0, fg2 * 0.5 + 110).toInt(),
             minOf(255.0, fb * 0.5 + 120).toInt()
@@ -641,14 +654,7 @@ fun NativePlayerRoot(
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val bw = constraints.maxWidth.toFloat()
             val bh = constraints.maxHeight.toFloat()
-            val satLayer = remember {
-                ColorMatrix().apply { setToSaturation(1.4f) }
-            }
-            Box(
-                Modifier.fillMaxSize().graphicsLayer {
-                    colorFilter = ColorFilter.colorMatrix(satLayer)
-                }
-            ) {
+            Box(Modifier.fillMaxSize()) {
                 Canvas(Modifier.fillMaxSize()) {
                     drawRect(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
                     val pa = palette
@@ -678,7 +684,9 @@ fun NativePlayerRoot(
                 if (blurBmp != null) {
                     val imgMatrix = remember(darkUi) {
                         ColorMatrix().apply {
-                            setToSaturation(if (darkUi) 1.25f else 1.3f)
+                            // 图自身饱和 × backdrop 的 1.4(饱和是线性
+                            // 运算、与 alpha 混合可交换,直接乘进来)
+                            setToSaturation(if (darkUi) 1.75f else 1.82f)
                             val b = if (darkUi) 1.12f else 0.7f
                             for (r in 0..2) {
                                 for (c in 0..2) {
