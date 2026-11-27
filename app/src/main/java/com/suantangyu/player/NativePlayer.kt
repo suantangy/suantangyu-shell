@@ -58,6 +58,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
@@ -97,6 +98,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -714,11 +717,6 @@ fun NativePlayerRoot(
     // 「第一次能弹、后面弹不出」的真凶)
     val openSignal = remember { st.hideSignal }
     LaunchedEffect(st.hideSignal) { if (st.hideSignal > openSignal) close() }
-    LaunchedEffect(Unit) {
-        st.composeBeat++
-        onComposed()
-        offsetY.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 260f))
-    }
     val dragMod = Modifier.pointerInput(Unit) {
         val tracker = VelocityTracker()
         var dragPos = 0f
@@ -806,6 +804,23 @@ fun NativePlayerRoot(
     val w70 = wht.copy(alpha = if (darkUi) 0.62f else 0.72f)
     val w55 = wht.copy(alpha = if (darkUi) 0.48f else 0.55f)
     val w50 = wht.copy(alpha = 0.5f)
+
+    // 封面取色就绪标记:fullBmp 到手的那次合成里 palette 已同步算出
+    var artReady by remember { mutableStateOf(false) }
+    LaunchedEffect(fullBmp) { if (fullBmp != null) artReady = true }
+    LaunchedEffect(Unit) {
+        st.composeBeat++
+        onComposed()
+        // 等取色就绪再滑入(250ms 超时兜底,封面拉不到照常开):取色
+        // 未出时 darkUi 默认 false、页底纯黑,弹簧慢起步会让黑色页头
+        // 先在屏底露一截(cheng 实录:第一次点迷你条,底部先出黑色
+        // 条块,然后才弹出播放页)。切歌时 postTrack 已预加载封面,
+        // 常态下这里零等待
+        if (st.cover.isNotEmpty() && !artReady) {
+            withTimeoutOrNull(250) { snapshotFlow { artReady }.first { it } }
+        }
+        offsetY.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 260f))
+    }
 
     Box(
         Modifier

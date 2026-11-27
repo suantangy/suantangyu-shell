@@ -149,6 +149,20 @@ class BaoBridge(private val activity: MainActivity) {
             putExtra("cover", cover)
         }
         activity.startService(intent)
+        // 顺带预加载封面(原图+强模糊版)进 CoverCache:切歌时就备好,
+        // 播放页打开时取色/氛围底首帧即就绪(3.84.15;取色未就绪时
+        // 播放页默认黑底,会先在屏底露黑色页头)
+        if (cover.isNotEmpty()) {
+            Thread {
+                try {
+                    kotlinx.coroutines.runBlocking {
+                        CoverCache.load(cover)
+                        CoverCache.loadBlurred(cover)
+                    }
+                } catch (_: Exception) {
+                }
+            }.start()
+        }
     }
 
     @JavascriptInterface
