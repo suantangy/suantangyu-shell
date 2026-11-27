@@ -939,25 +939,8 @@ fun NativePlayerRoot(
         offsetY.animateTo(0f, tween(durationMillis = 450, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)))
     }
 
-    // 染色垫(3.84.29,cheng 点选):上滑时顶边闪线的根子是分界
-    // 两边色差(主页近白 243 vs 页面底约 165)。羽化(3.84.27)
-    // 把页面侧化开被否(更丑);改从主页侧下手——页面升起的过
-    // 程中,给露出来的主页盖一层当前歌氛围色的半透明垫,进度
-    // 越高垫越实(上限 .7),分界两侧同色系、对比塌下来,线就
-    // 抓不住。垫与页面同级、垫先画(在页面底下),页面到位后
-    // 垫被完全盖住;收回/下拉时随进度反向退掉
-    val tintPa = palette
-    if (tintPa != null) {
-        val tintProg = 1f - (offsetY.value / screenHPx).coerceIn(0f, 1f)
-        if (tintProg > 0.001f) {
-            val tintCol = if (tintPa.darkUi) tintPa.c1Raw
-                else mixColor(tintPa.c1Raw, Color.Black, 0.5f)
-            Box(
-                Modifier.fillMaxSize()
-                    .background(tintCol.copy(alpha = 0.7f * tintProg))
-            )
-        }
-    }
+    // 染色垫已撤(3.84.30,cheng 判「感觉也没用」):3.84.29 曾在此
+    // 给主页盖氛围色垫压顶边闪线,真机无感,整段删除回到 3.84.28 形态
     Box(
         Modifier
             .fillMaxSize()
