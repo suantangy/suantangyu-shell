@@ -18,7 +18,6 @@ import android.graphics.Bitmap
 import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -721,10 +720,14 @@ fun NativePlayerRoot(
         val tracker = VelocityTracker()
         var dragPos = 0f
         fun rebound(v: Float) {
+            // 回位也走补间(3.84.16:播放页与队列开/关/回位全改滑、
+            // 两面统一):时长按当前位移等比,上甩够快时缩短
             scope.launch {
+                val frac = (offsetY.value / screenHPx).coerceIn(0f, 1f)
+                var dur = (350 * frac).toInt().coerceIn(120, 350)
+                if (v < -1500f) dur = minOf(dur, 200)
                 offsetY.animateTo(
-                    0f, spring(dampingRatio = 0.88f, stiffness = 300f),
-                    initialVelocity = v.coerceIn(-6000f, 6000f)
+                    0f, tween(durationMillis = dur, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
                 )
             }
         }
@@ -812,14 +815,14 @@ fun NativePlayerRoot(
         st.composeBeat++
         onComposed()
         // 等取色就绪再滑入(250ms 超时兜底,封面拉不到照常开):取色
-        // 未出时 darkUi 默认 false、页底纯黑,弹簧慢起步会让黑色页头
+        // 未出时 darkUi 默认 false、页底纯黑,滑入时黑色页头会
         // 先在屏底露一截(cheng 实录:第一次点迷你条,底部先出黑色
         // 条块,然后才弹出播放页)。切歌时 postTrack 已预加载封面,
         // 常态下这里零等待
         if (st.cover.isNotEmpty() && !artReady) {
             withTimeoutOrNull(250) { snapshotFlow { artReady }.first { it } }
         }
-        offsetY.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 260f))
+        offsetY.animateTo(0f, tween(durationMillis = 350, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f)))
     }
 
     Box(

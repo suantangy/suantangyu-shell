@@ -3,22 +3,30 @@ package com.suantangyu.player
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.LruCache
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -28,11 +36,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -43,16 +47,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -251,7 +262,11 @@ private fun PlayingWave(accent: Color, playing: Boolean) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+/** 3.84.16 自绘队列弹层(代 ModalBottomSheet):开/关/回位全走定长
+ * 补间,与播放页同规格(cheng 定:两个面、打开关闭都滑、都一样)。
+ * M3 sheet 的弹簧在本工程无法换规格,故自绘:遮罩淡入 + 面板平移,
+ * 拖动关闭两路——标题行拖拽 + 列表到顶后继续下拉(嵌套滚动接管),
+ * 与 M3 时的行为保持一致。 */
 @Composable
 fun NativeQueueRoot(
     onPlay: (String) -> Unit,
@@ -270,33 +285,167 @@ fun NativeQueueRoot(
     val titleColor = if (dark) Color(0xADEBEBF5) else Color(0xB83C3C43)
     val curBg = accent.copy(alpha = if (dark) 0.18f else 0.10f)
 
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    val sheetHState = remember { mutableStateOf(0) }
+    val offsetY = remember { Animatable(10000f) }
+    var closing by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+
+    fun rebound() {
+        scope.launch {
+            val h = sheetHState.value
+            val frac = if (h > 0) (offsetY.value / h).coerceIn(0f, 1f) else 0f
+            val dur = (350 * frac).toInt().coerceIn(120, 350)
+            try {
+                offsetY.animateTo(
+                    0f, tween(durationMillis = dur, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     fun dismiss() {
+        if (closing) return
+        closing = true
         scope.launch {
-            try { sheetState.hide() } catch (e: Exception) {}
+            val h = sheetHState.value
+            try {
+                val remaining = if (h > 0) ((h - offsetY.value) / h).coerceIn(0f, 1f) else 1f
+                val dur = (300 * remaining).toInt().coerceIn(120, 300)
+                offsetY.animateTo(
+                    if (h > 0) h.toFloat() else 10000f,
+                    tween(durationMillis = dur, easing = CubicBezierEasing(0.3f, 0f, 0.8f, 0.15f))
+                )
+            } catch (_: Exception) {
+            }
             store.visible = false
             onHidden()
         }
     }
 
-    LaunchedEffect(Unit) { try { sheetState.show() } catch (e: Exception) {} }
-    LaunchedEffect(store.hideSignal) {
-        if (store.hideSignal > 0 && sheetState.currentValue != SheetValue.Hidden) dismiss()
+    // 打开:面板量到高度后先瞬移贴底,再补间滑入(与播放页同规格)
+    LaunchedEffect(sheetHState.value) {
+        val h = sheetHState.value
+        if (h > 0 && offsetY.value > h) {
+            offsetY.snapTo(h.toFloat())
+            offsetY.animateTo(
+                0f, tween(durationMillis = 350, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+            )
+        }
+    }
+    // hideSignal 跨开关累加:以本次合成值为基线(同播放页 3.82.2 教训)
+    val openSignal = remember { store.hideSignal }
+    LaunchedEffect(store.hideSignal) { if (store.hideSignal > openSignal) dismiss() }
+
+    // 列表嵌套滚动接管:面板被拖下一截时,上拖先把面板推回去;列表
+    // 到顶还继续下拉,未消费的量转成面板下移;松手按速度/位移定去留
+    val sheetNested = object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            if (available.y < 0f && offsetY.value > 0f) {
+                val newOff = (offsetY.value + available.y).coerceAtLeast(0f)
+                val consumedY = newOff - offsetY.value
+                scope.launch { offsetY.snapTo(newOff) }
+                return Offset(0f, consumedY)
+            }
+            return Offset.Zero
+        }
+
+        override fun onPostScroll(
+            consumed: Offset, available: Offset, source: NestedScrollSource
+        ): Offset {
+            val atTop = listState.firstVisibleItemIndex == 0 &&
+                listState.firstVisibleItemScrollOffset == 0
+            if (available.y > 0f && atTop) {
+                val h = sheetHState.value
+                val newOff = (offsetY.value + available.y)
+                    .coerceIn(0f, if (h > 0) h.toFloat() else Float.MAX_VALUE)
+                val consumedY = newOff - offsetY.value
+                scope.launch { offsetY.snapTo(newOff) }
+                return Offset(0f, consumedY)
+            }
+            return Offset.Zero
+        }
+
+        override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+            if (offsetY.value > 0f) {
+                val h = sheetHState.value
+                when {
+                    available.y < -900f -> rebound()
+                    available.y > 900f || offsetY.value > h * 0.35f -> dismiss()
+                    else -> rebound()
+                }
+                return available
+            }
+            return Velocity.Zero
+        }
     }
 
-    ModalBottomSheet(
-        onDismissRequest = { store.visible = false; onHidden() },
-        sheetState = sheetState,
-        containerColor = surface,
-        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
-        dragHandle = null
-    ) {
+    val sheetH = sheetHState.value
+    val progress = if (sheetH > 0) {
+        (1f - (offsetY.value / sheetH).coerceIn(0f, 1f))
+    } else 0f
+
+    Box(Modifier.fillMaxSize()) {
+        // 遮罩:随滑入淡入(满 0.32 黑,与 M3 同值),点击关闭
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.32f * progress))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    enabled = sheetH > 0
+                ) { dismiss() }
+        )
         val items = store.items
-        Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-            // 标题行：播放列表 · N 首（居中）＋编辑/完成（右）
-            Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+        Column(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .offset { IntOffset(0, offsetY.value.roundToInt()) }
+                .onSizeChanged { sheetHState.value = it.height }
+                .shadow(12.dp, RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                .background(surface)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(bottom = 8.dp)
+        ) {
+            // 标题行：播放列表 · N 首（居中）＋编辑/完成（右）；整行可拖关
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .pointerInput(Unit) {
+                        val tracker = VelocityTracker()
+                        var dragPos = 0f
+                        detectVerticalDragGestures(
+                            onDragStart = {
+                                tracker.resetTracking()
+                                dragPos = offsetY.value
+                                scope.launch { offsetY.stop() }
+                            },
+                            onVerticalDrag = { change, dy ->
+                                change.consume()
+                                dragPos = (dragPos + dy)
+                                    .coerceIn(0f, if (sheetHState.value > 0) sheetHState.value.toFloat() else Float.MAX_VALUE)
+                                tracker.addPosition(change.uptimeMillis, Offset(0f, dragPos))
+                                scope.launch { offsetY.snapTo(dragPos) }
+                            },
+                            onDragEnd = {
+                                val v = tracker.calculateVelocity().y
+                                val h = sheetHState.value
+                                when {
+                                    v < -1200f -> rebound()
+                                    offsetY.value > with(density) { 110.dp.toPx() } || v > 1200f -> dismiss()
+                                    else -> rebound()
+                                }
+                            },
+                            onDragCancel = { rebound() }
+                        )
+                    }
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+            ) {
                 Text(
                     text = "播放列表 · ${items.size} 首",
                     fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
@@ -322,7 +471,6 @@ fun NativeQueueRoot(
                 )
             } else {
                 val screenH = LocalConfiguration.current.screenHeightDp
-                val listState = rememberLazyListState()
                 var lastMoreAt by remember { mutableStateOf(0L) }
                 LaunchedEffect(listState, items.size) {
                     snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
@@ -338,7 +486,6 @@ fun NativeQueueRoot(
                     val ci = items.indexOfFirst { it.key == store.curKey }
                     if (ci > 2) listState.scrollToItem(ci - 1)
                 }
-                val density = LocalDensity.current
                 val stridePx = with(density) { 68.dp.toPx() }
                 var dragIdx by remember { mutableStateOf<Int?>(null) }
                 var dragFrom by remember { mutableStateOf(0) }
@@ -350,6 +497,7 @@ fun NativeQueueRoot(
                         .fillMaxWidth()
                         .heightIn(max = (screenH * 0.54f).dp)
                         .padding(horizontal = 10.dp)
+                        .nestedScroll(sheetNested)
                 ) {
                     itemsIndexed(items, key = { idx, it -> "$idx|${it.key}" }) { i, item ->
                         val on = item.key == store.curKey
