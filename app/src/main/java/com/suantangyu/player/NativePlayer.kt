@@ -565,7 +565,10 @@ private val npBgSatPaint = android.graphics.Paint().apply {
  *  亮 1.12)。整叠的 saturate(1.4) 在绘制本位图时由 npBgSatPaint
  *  施加。参数出自 21 首网页版截图离线全栈拟合(条带均差 8.2) */
 fun composeLightBg(blur: Bitmap, pa: CoverPalette, w: Int, h: Int): Bitmap {
-    val W = maxOf(2, w / 2); val H = maxOf(2, h / 2)
+    // 3.84.22:1/6 分辨率——产物是 σ≈50 的扩散糊图,细节早被糊
+    // 掉,拉伸回全屏与半分辨率版看不出差别;像素量降到约 1/9,
+    // 合成只要几十毫秒,播放页得以同步算完、首帧即定版背景
+    val W = maxOf(2, w / 6); val H = maxOf(2, h / 6)
     val out = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
     val cv = android.graphics.Canvas(out)
     cv.drawColor(android.graphics.Color.rgb(250, 250, 252))
@@ -890,13 +893,17 @@ fun NativePlayerRoot(
                 // 合成背景优先读切歌时预合成的缓存;未命中才后台现算
                 // (3.84.18:此前在 remember 里同步现算,stackBlur 在主
                 //  线程阻塞滑动帧——真机表现为迟滞+闪屏)
-                val compCached = CoverCache.composedOf(st.cover)
-                val compAsync by produceState<Bitmap?>(null, blurBmp, pa, bw, bh) {
-                    value = withContext(Dispatchers.Default) {
+                // 3.84.22:合成改同步——composeLightBg 已降到 1/6 分辨
+                // 率(内容是 σ≈50 的扩散糊图,拉伸回全屏看不出差别),
+                // 一次几十毫秒,remember 里当场算完,首帧就是定版背景。
+                // 此前 produceState 异步现算:约 0.2s 才换上,封面上下
+                // 两条背景带一步跳变(cheng 两段录屏逐帧实锤);异步到
+                // 达这件事本身就是闪的来源,不再依赖缓存命中与否
+                val comp = remember(blurBmp, pa, bw, bh, st.cover) {
+                    CoverCache.composedOf(st.cover) ?: runCatching {
                         composeLightBg(blurBmp, pa, bw, bh)
-                    }.also { CoverCache.putComposed(st.cover, it) }
+                    }.getOrNull()?.also { CoverCache.putComposed(st.cover, it) }
                 }
-                val comp = compCached ?: compAsync
                 if (comp != null) {
                     Canvas(Modifier.fillMaxSize()) {
                         drawContext.canvas.nativeCanvas.drawBitmap(
