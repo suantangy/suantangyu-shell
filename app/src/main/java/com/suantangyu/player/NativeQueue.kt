@@ -107,7 +107,6 @@ object CoverCache {
         if (bmp != null) cache.put(url, bmp)
         return bmp
     }
-}
 
     /** 低清版(24px):给播放页氛围底当模糊源,键加 |tiny 后缀独立缓存 */
     suspend fun loadTiny(url: String): Bitmap? {

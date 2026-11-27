@@ -341,7 +341,7 @@ fun NativePlayerRoot(
                             onDragEnd = { onSeek(seekPos); seeking = false },
                             onDragCancel = { seeking = false }
                         )
-                    }
+                    },
                 contentAlignment = Alignment.CenterStart
             ) {
                 val frac = (shownPos.toFloat() / dur).coerceIn(0f, 1f)
