@@ -939,6 +939,25 @@ fun NativePlayerRoot(
         offsetY.animateTo(0f, tween(durationMillis = 450, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)))
     }
 
+    // 染色垫(3.84.29,cheng 点选):上滑时顶边闪线的根子是分界
+    // 两边色差(主页近白 243 vs 页面底约 165)。羽化(3.84.27)
+    // 把页面侧化开被否(更丑);改从主页侧下手——页面升起的过
+    // 程中,给露出来的主页盖一层当前歌氛围色的半透明垫,进度
+    // 越高垫越实(上限 .7),分界两侧同色系、对比塌下来,线就
+    // 抓不住。垫与页面同级、垫先画(在页面底下),页面到位后
+    // 垫被完全盖住;收回/下拉时随进度反向退掉
+    val tintPa = palette
+    if (tintPa != null) {
+        val tintProg = 1f - (offsetY.value / screenHPx).coerceIn(0f, 1f)
+        if (tintProg > 0.001f) {
+            val tintCol = if (tintPa.darkUi) tintPa.c1Raw
+                else mixColor(tintPa.c1Raw, Color.Black, 0.5f)
+            Box(
+                Modifier.fillMaxSize()
+                    .background(tintCol.copy(alpha = 0.7f * tintProg))
+            )
+        }
+    }
     Box(
         Modifier
             .fillMaxSize()
@@ -1344,9 +1363,13 @@ fun NativePlayerRoot(
                     contentAlignment = Alignment.Center
                 ) { SvgIcon(P_PREV, 36.dp, wht) }
                 Box(
-                    Modifier.size(56.dp).clip(CircleShape).clickable { onToggle() },
+                    // 播放键 64/44(3.84.29):网页 .np-play 实读
+                    // 64px !important、svg 44px——3.84.1 审计读漏了
+                    // 这条覆盖规则、误记 56/34,控制行因此矮 8dp,
+                    // 上面进度/时间整串低 8dp(cheng 两图实测对账)
+                    Modifier.size(64.dp).clip(CircleShape).clickable { onToggle() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 34.dp, wht) }
+                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 44.dp, wht) }
                 Box(
                     Modifier.size(56.dp).clip(CircleShape).clickable { onNext() },
                     contentAlignment = Alignment.Center
