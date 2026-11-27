@@ -158,6 +158,10 @@ class BaoBridge(private val activity: MainActivity) {
                     kotlinx.coroutines.runBlocking {
                         CoverCache.load(cover)
                         CoverCache.loadBlurred(cover)
+                        // 3.84.18:取色与浅底合成背景也一并预合成,
+                        // 播放页打开首帧即完整(治迟滞与闪屏)
+                        val dm = activity.resources.displayMetrics
+                        CoverCache.precompute(cover, dm.widthPixels, dm.heightPixels)
                     }
                 } catch (_: Exception) {
                 }

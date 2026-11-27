@@ -512,13 +512,6 @@ class MainActivity : AppCompatActivity() {
         val cv = ComposeView(this)
         cv.visibility = View.GONE
         cv.setContent {
-            NativeQueueRoot(
-                onPlay = { key -> nativeQueuePlay(key) },
-                onRemove = { key -> nativeQueueRemove(key) },
-                onMove = { key, to -> nativeQueueMove(key, to) },
-                onLoadMore = { nativeQueueEdit("loadmore", "", 0) },
-                onHidden = { syncNativeComposeVisibility() }
-            )
             NativePlayerRoot(
                 onClose = { onNativePlayerHidden() },
                 onToggle = { nativePlayerToggle() },
@@ -533,7 +526,14 @@ class MainActivity : AppCompatActivity() {
                 onOpenWeb = {
                     NativePlayerStore.hideSignal++
                     runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
-                },
+                    NativeQueueRoot(
+                onPlay = { key -> nativeQueuePlay(key) },
+                onRemove = { key -> nativeQueueRemove(key) },
+                onMove = { key, to -> nativeQueueMove(key, to) },
+                onLoadMore = { nativeQueueEdit("loadmore", "", 0) },
+                onHidden = { syncNativeComposeVisibility() }
+            )
+        },
                 onTool = { tool ->
                     NativePlayerStore.hideSignal++
                     runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")

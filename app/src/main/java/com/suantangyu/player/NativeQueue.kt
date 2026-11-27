@@ -196,6 +196,34 @@ object CoverCache {
         cache.put(key, blurred)
         return blurred
     }
+
+    // ===== 3.84.18 切歌预合成:取色与浅底合成背景 =====
+    private val paletteCache = LruCache<String, CoverPalette>(48)
+    private val composedCache = LruCache<String, Bitmap>(24)
+
+    fun paletteOf(url: String): CoverPalette? = paletteCache.get(url)
+    fun composedOf(url: String): Bitmap? = composedCache.get(url)
+
+    /** 取色+浅底合成背景一次备好(后台线程调用):播放页打开首帧
+     *  即完整,不再等取色门、滑动中途也不必现算 stackBlur */
+    suspend fun precompute(url: String, w: Int, h: Int) {
+        if (url.isEmpty() || !url.startsWith("http")) return
+        if (paletteCache.get(url) != null) return
+        val full = load(url) ?: return
+        val pal = try {
+            sampleCoverPalette(full)
+        } catch (_: Exception) {
+            null
+        } ?: return
+        paletteCache.put(url, pal)
+        if (pal.darkUi && w > 0 && h > 0) {
+            val blur = loadBlurred(url) ?: return
+            try {
+                composedCache.put(url, composeLightBg(blur, pal, w, h))
+            } catch (_: Exception) {
+            }
+        }
+    }
 }
 
 /** 封面 Bitmap 助手(队列/播放页共用;tiny=低清版,blurred=强模糊版) */

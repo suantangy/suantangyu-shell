@@ -52,6 +52,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +99,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.delay
@@ -435,7 +438,7 @@ private fun fmtTime(ms: Long): String {
 // 48x48 采样:滤太黑/太白/近灰,16 级量化桶取众数色,再按鲜艳色加权混合;
 // 明暗判定(网页 syncNpUiContrast):lum = 0.65*lum(c1) + 0.35*lum(c2),
 // c1/c2 是提亮后的氛围色对(未过 sat14),lum>88 → 深字浅底
-private class CoverPalette(
+class CoverPalette(
     val darkUi: Boolean, val lyOn: Color, val c1: Color, val c2: Color,
     val c1Raw: Color, val c2Raw: Color
 )
@@ -448,7 +451,7 @@ private fun mixColor(c1: Color, c2: Color, t: Float): Color = Color(
     blue = c1.blue + (c2.blue - c1.blue) * t
 )
 
-private fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
+fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
     try {
         val w = 48; val h = 48
         val scaled = Bitmap.createScaledBitmap(bmp, w, h, true)
@@ -561,7 +564,7 @@ private val npBgSatPaint = android.graphics.Paint().apply {
  *  0.275H)、alpha .22)→ 中央窗强模糊图(alpha .80、sat 1.25、
  *  亮 1.12)。整叠的 saturate(1.4) 在绘制本位图时由 npBgSatPaint
  *  施加。参数出自 21 首网页版截图离线全栈拟合(条带均差 8.2) */
-private fun composeLightBg(blur: Bitmap, pa: CoverPalette, w: Int, h: Int): Bitmap {
+fun composeLightBg(blur: Bitmap, pa: CoverPalette, w: Int, h: Int): Bitmap {
     val W = maxOf(2, w / 2); val H = maxOf(2, h / 2)
     val out = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
     val cv = android.graphics.Canvas(out)
@@ -824,7 +827,10 @@ fun NativePlayerRoot(
     val accent = st.accent
     // 明暗自适应(网页版同规则):封面取色 lum>88 → 深字浅底,否则白字深底
     val fullBmp = CoverBitmap(st.cover)
-    val palette = remember(fullBmp) { fullBmp?.let { sampleCoverPalette(it) } }
+    val asyncPalette = remember(fullBmp) { fullBmp?.let { sampleCoverPalette(it) } }
+    // 切歌时已预合成取色(postTrack → CoverCache.precompute):命中
+    // 缓存时首帧即有取色,不必等封面异步加载(3.84.18)
+    val palette = CoverCache.paletteOf(st.cover) ?: asyncPalette
     val darkUi = palette?.darkUi ?: false
     val lyOn = if (darkUi) mixColor(st.npAccent, Color.Black, 0.28f) else st.npAccent
     val wht = if (darkUi) Color(0xFF1C1C1E) else Color.White
@@ -833,7 +839,7 @@ fun NativePlayerRoot(
     val w50 = wht.copy(alpha = 0.5f)
 
     // 封面取色就绪标记:fullBmp 到手的那次合成里 palette 已同步算出
-    var artReady by remember { mutableStateOf(false) }
+    var artReady by remember { mutableStateOf(CoverCache.paletteOf(st.cover) != null) }
     LaunchedEffect(fullBmp) { if (fullBmp != null) artReady = true }
     LaunchedEffect(Unit) {
         st.composeBeat++
@@ -881,21 +887,33 @@ fun NativePlayerRoot(
             // 跑过——3.84.10/3.84.11 调的扩散对浅底页全程没生效,真机
             // 剖面逐点不变就是这个原因。3.84.12 改回 darkUi。
             if (darkUi && pa != null && blurBmp != null) {
-                val comp = remember(blurBmp, pa, bw, bh) {
-                    composeLightBg(blurBmp, pa, bw, bh)
+                // 合成背景优先读切歌时预合成的缓存;未命中才后台现算
+                // (3.84.18:此前在 remember 里同步现算,stackBlur 在主
+                //  线程阻塞滑动帧——真机表现为迟滞+闪屏)
+                val compCached = CoverCache.composedOf(st.cover)
+                val compAsync by produceState<Bitmap?>(null, blurBmp, pa, bw, bh) {
+                    value = withContext(Dispatchers.Default) {
+                        composeLightBg(blurBmp, pa, bw, bh)
+                    }
                 }
-                Canvas(Modifier.fillMaxSize()) {
-                    drawContext.canvas.nativeCanvas.drawBitmap(
-                        comp, null,
-                        android.graphics.RectF(0f, 0f, size.width, size.height),
-                        npBgSatPaint
+                val comp = compCached ?: compAsync
+                if (comp != null) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        drawContext.canvas.nativeCanvas.drawBitmap(
+                            comp, null,
+                            android.graphics.RectF(0f, 0f, size.width, size.height),
+                            npBgSatPaint
+                        )
+                    }
+                    Box(
+                        Modifier.fillMaxSize().background(
+                            Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.35f)
+                        )
                     )
+                } else {
+                    // 预合成未就绪:先铺浅底(与定版底色一致,不闪黑)
+                    Box(Modifier.fillMaxSize().background(Color(0xFFFAFAFC)))
                 }
-                Box(
-                    Modifier.fillMaxSize().background(
-                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.35f)
-                    )
-                )
             } else {
                 Box(Modifier.fillMaxSize()) {
                     Canvas(Modifier.fillMaxSize()) {
