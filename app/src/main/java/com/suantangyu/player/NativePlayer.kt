@@ -63,7 +63,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.BlendMode
@@ -687,18 +686,20 @@ fun NativePlayerRoot(
     val conf = LocalConfiguration.current
     val screenHPx = with(density) { conf.screenHeightDp.dp.toPx() }
     val offsetY = remember { Animatable(screenHPx) }
-    // 页面淡入淡出(3.84.17 对齐网页版 .np:opacity .36s ease):
-    // 打开 0→1、关闭 1→0、拖动跟手溶解,与位移补间并行
-    val pageAlpha = remember { Animatable(0f) }
+    // 3.84.19:页面淡入淡出已摘除——3.84.17 为对齐网页版 .np 的
+    // opacity .36s 加的整页淡,真机上页面半透明地糊在主页上滑
+    // (cheng 报「闪屏」,录屏逐帧实锤);网页版那层淡在浏览器里由
+    // 合成器跑满帧,原生整页走离屏层渲染、掉帧时鬼影滞留。摘淡
+    // 留纯滑(450ms 网页曲线),回到 3.84.14–16 从没闪过的形态
     var closing by remember { mutableStateOf(false) }
     // 关闭:定长补间,到点即结束——和网页版收回同一个机制(网页版
     // 实测 3 帧加速出画、无尾巴)。旧版弹簧(ζ0.92、目标=屏高)在最
     // 后一段渐近爬行:原始帧率录屏实测主滑行后还有约 0.25s 低速
     // 蠕动(帧间差 22→9.7→4.3→2.0→1.2 缓降),页面顶条在屏底慢慢
     // 蹭完最后一程(cheng:「快回到底部了还停一下才彻底收回」)。
-    // 3.84.17 起参数与网页版 .np 逐项对齐:位移 .45s
-    // cubic-bezier(0.32,0.72,0,1)、淡入淡出 .36s ease,均按剩余
-    // 距离等比时长(iv 仅保留签名,时长不再按速度缩短)
+    // 参数对齐网页版 .np 的位移:.45s cubic-bezier(0.32,0.72,0,1),
+    // 按剩余距离等比时长(iv 仅保留签名,时长不再按速度缩短);
+    // 网页版的 opacity 淡入淡出不搬(3.84.19,见上方摘除注)
     fun close(iv: Float = 0f) {
         if (closing) return
         closing = true
@@ -706,15 +707,6 @@ fun NativePlayerRoot(
             try {
                 val frac = ((screenHPx - offsetY.value) / screenHPx).coerceIn(0f, 1f)
                 val dur = (450 * frac).toInt().coerceIn(140, 450)
-                launch {
-                    pageAlpha.animateTo(
-                        0f,
-                        tween(
-                            durationMillis = (360 * frac).toInt().coerceIn(120, 360),
-                            easing = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f)
-                        )
-                    )
-                }
                 offsetY.animateTo(
                     screenHPx,
                     tween(durationMillis = dur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
@@ -741,15 +733,6 @@ fun NativePlayerRoot(
             scope.launch {
                 val frac = (offsetY.value / screenHPx).coerceIn(0f, 1f)
                 val dur = (450 * frac).toInt().coerceIn(120, 450)
-                launch {
-                    pageAlpha.animateTo(
-                        1f,
-                        tween(
-                            durationMillis = (360 * frac).toInt().coerceIn(100, 360),
-                            easing = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f)
-                        )
-                    )
-                }
                 offsetY.animateTo(
                     0f, tween(durationMillis = dur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
                 )
@@ -764,10 +747,7 @@ fun NativePlayerRoot(
             onVerticalDrag = { change, dy ->
                 dragPos = (dragPos + dy).coerceAtLeast(0f)
                 tracker.addPosition(change.uptimeMillis, Offset(0f, dragPos))
-                scope.launch {
-                    offsetY.snapTo(dragPos)
-                    pageAlpha.snapTo(1f - (dragPos / screenHPx).coerceIn(0f, 1f))
-                }
+                scope.launch { offsetY.snapTo(dragPos) }
             },
             onDragEnd = {
                 val v = tracker.calculateVelocity().y
@@ -852,12 +832,6 @@ fun NativePlayerRoot(
         if (st.cover.isNotEmpty() && !artReady) {
             withTimeoutOrNull(250) { snapshotFlow { artReady }.first { it } }
         }
-        launch {
-            pageAlpha.animateTo(
-                1f,
-                tween(durationMillis = 360, easing = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f))
-            )
-        }
         offsetY.animateTo(0f, tween(durationMillis = 450, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)))
     }
 
@@ -865,7 +839,6 @@ fun NativePlayerRoot(
         Modifier
             .fillMaxSize()
             .offset { IntOffset(0, offsetY.value.roundToInt()) }
-            .alpha(pageAlpha.value)
             .background(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
     ) {
         // 氛围底(3.84.9 按网页 .np-bg 的几何与层序重做):网页背景
