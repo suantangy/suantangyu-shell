@@ -7,6 +7,7 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.animateIntOffsetAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -256,16 +257,31 @@ fun NativeQueueRoot(
                     itemsIndexed(items, key = { idx, it -> "$idx|${it.key}" }) { i, item ->
                         val on = item.key == store.curKey
                         val isDragged = dragIdx == i
-                        var shiftPx = 0f
-                        if (dragIdx != null && !isDragged) {
+                        // 拖动预览位置(与网页版 preview() 同算法):序号实时按落点重排
+                        var dispPos = i
+                        var shiftTarget = 0
+                        if (dragIdx != null) {
                             val steps = (dragDy / stridePx).roundToInt()
                             val to = (dragFrom + steps).coerceIn(0, items.size - 1)
-                            shiftPx = when {
-                                steps > 0 && i in (dragFrom + 1)..to -> -stridePx
-                                steps < 0 && i in to until dragFrom -> stridePx
-                                else -> 0f
+                            dispPos = when {
+                                isDragged -> to
+                                steps > 0 && i in (dragFrom + 1)..to -> i - 1
+                                steps < 0 && i in to until dragFrom -> i + 1
+                                else -> i
+                            }
+                            if (!isDragged) {
+                                shiftTarget = when {
+                                    steps > 0 && i in (dragFrom + 1)..to -> -stridePx.roundToInt()
+                                    steps < 0 && i in to until dragFrom -> stridePx.roundToInt()
+                                    else -> 0
+                                }
                             }
                         }
+                        val shiftAnim by animateIntOffsetAsState(
+                            targetValue = IntOffset(0, shiftTarget),
+                            animationSpec = tween(180),
+                            label = "qshift$i"
+                        )
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
@@ -273,14 +289,14 @@ fun NativeQueueRoot(
                                 .padding(vertical = 2.dp)
                                 .zIndex(if (isDragged) 6f else 0f)
                                 .offset {
-                                    IntOffset(
-                                        0,
-                                        (if (isDragged) dragDy else shiftPx).roundToInt()
-                                    )
+                                    if (isDragged) IntOffset(0, dragDy.roundToInt()) else shiftAnim
                                 }
                                 .then(if (isDragged) Modifier.shadow(12.dp, RoundedCornerShape(12.dp)) else Modifier)
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(if (on) curBg else if (isDragged) surface else Color.Transparent)
+                                // 被拖行必须实底(网页版同款白卡):先铺 surface 实色,
+                                // 当前曲再叠主题色淡染——3.80.0 只铺 10% 淡染,拖起来透出底下行、糊成一片
+                                .background(if (isDragged) surface else Color.Transparent)
+                                .background(if (on) curBg else Color.Transparent)
                                 .clickable(enabled = !store.editMode) {
                                     if (item.key == store.curKey) dismiss() else onPlay(item.key)
                                 }
@@ -290,7 +306,7 @@ fun NativeQueueRoot(
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    text = "${i + 1}. ${item.name}",
+                                    text = "${dispPos + 1}. ${item.name}",
                                     fontSize = 15.sp,
                                     fontWeight = if (on) FontWeight.Bold else FontWeight.SemiBold,
                                     color = if (on) accent else nameColor,
