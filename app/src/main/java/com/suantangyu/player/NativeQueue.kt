@@ -204,6 +204,10 @@ object CoverCache {
     fun paletteOf(url: String): CoverPalette? = paletteCache.get(url)
     fun composedOf(url: String): Bitmap? = composedCache.get(url)
 
+    fun putComposed(url: String, bmp: Bitmap) {
+        composedCache.put(url, bmp)
+    }
+
     /** 取色+浅底合成背景一次备好(后台线程调用):播放页打开首帧
      *  即完整,不再等取色门、滑动中途也不必现算 stackBlur */
     suspend fun precompute(url: String, w: Int, h: Int) {

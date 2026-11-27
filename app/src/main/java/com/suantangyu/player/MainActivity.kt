@@ -644,6 +644,9 @@ class MainActivity : AppCompatActivity() {
         syncNativeComposeVisibility()
     }
 
+    private val precomputeInFlight =
+        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
     private fun refreshNativePlayer() {
         val svc = KeepAliveService.instance ?: return
         try {
@@ -658,6 +661,27 @@ class MainActivity : AppCompatActivity() {
             NativePlayerStore.anchorAtMs = SystemClock.elapsedRealtime()
             NativePlayerStore.durMs = o.optLong("dur")
         } catch (_: Exception) {
+        }
+        // 3.84.21:当前歌的取色/合成背景没备好就后台补预合成——
+        // postTrack 只在切歌时触发,装新版后正在播的歌(或会话恢复
+        // 的歌)永远等不到,开页时背景只能中途现算、一步跳变
+        // (cheng 录屏:封面上下两条背景带闪动)。脑同步一到就补,
+        // 点开时早已备好
+        val cover = NativePlayerStore.cover
+        if (cover.isNotEmpty() && CoverCache.paletteOf(cover) == null &&
+            precomputeInFlight.add(cover)
+        ) {
+            Thread {
+                try {
+                    val dm = resources.displayMetrics
+                    kotlinx.coroutines.runBlocking {
+                        CoverCache.precompute(cover, dm.widthPixels, dm.heightPixels)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    precomputeInFlight.remove(cover)
+                }
+            }.start()
         }
     }
 

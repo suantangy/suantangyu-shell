@@ -894,7 +894,7 @@ fun NativePlayerRoot(
                 val compAsync by produceState<Bitmap?>(null, blurBmp, pa, bw, bh) {
                     value = withContext(Dispatchers.Default) {
                         composeLightBg(blurBmp, pa, bw, bh)
-                    }
+                    }.also { CoverCache.putComposed(st.cover, it) }
                 }
                 val comp = compCached ?: compAsync
                 if (comp != null) {
@@ -911,8 +911,23 @@ fun NativePlayerRoot(
                         )
                     )
                 } else {
-                    // 预合成未就绪:先铺浅底(与定版底色一致,不闪黑)
-                    Box(Modifier.fillMaxSize().background(Color(0xFFFAFAFC)))
+                    // 预合成未就绪:先用强模糊图本体顶上(经同款饱和漆
+                    // 绘制+同罩),与合成背景只差染色与扩散,合成图到达
+                    // 时是小步切换而非整片闪变(3.84.21:录屏实锤开页
+                    // 约 0.2s 时背景一步跳变,封面上下两条背景带最扎眼
+                    // ——此前拿纯平浅底垫场,那一步跳变最大)
+                    Canvas(Modifier.fillMaxSize()) {
+                        drawContext.canvas.nativeCanvas.drawBitmap(
+                            blurBmp, null,
+                            android.graphics.RectF(0f, 0f, size.width, size.height),
+                            npBgSatPaint
+                        )
+                    }
+                    Box(
+                        Modifier.fillMaxSize().background(
+                            Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.35f)
+                        )
+                    )
                 }
             } else {
                 Box(Modifier.fillMaxSize()) {
