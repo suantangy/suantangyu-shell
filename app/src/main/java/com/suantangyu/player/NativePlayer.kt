@@ -1297,7 +1297,14 @@ fun NativePlayerRoot(
                     darkUi, st.npAccent, wht
                 )
             }
-            Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
+            // 时间行留白对齐网页 .np-time(padding 4/24/8,3.84.25):
+            // 此前原生是光秃一行字、比网页少 12dp——这才是进度条
+            // 位置偏低的主因;3.84.24 把星轨盒高 48 改 36 只动了
+            // 波形大小,盒底锚定下中心反而降了 6dp,方向算反了
+            Row(
+                Modifier.fillMaxWidth()
+                    .padding(start = 24.dp, end = 24.dp, top = 4.dp, bottom = 8.dp)
+            ) {
                 Text(fmtTime(shownPos), color = w55, fontSize = 11.sp)
                 Spacer(Modifier.weight(1f))
                 Text(fmtTime(st.durMs), color = w55, fontSize = 11.sp)
