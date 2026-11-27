@@ -12,8 +12,8 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 152
-        versionName = "3.84.23"
+        versionCode = 153
+        versionName = "3.84.24"
     }
 
     // 固定签名：工作流把 Secrets 里的固定 keystore 还原成 app/debug.keystore 时，debug 构建就用它签，

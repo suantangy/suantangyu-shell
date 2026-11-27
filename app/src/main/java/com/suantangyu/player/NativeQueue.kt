@@ -49,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -322,9 +323,19 @@ fun NativeQueueRoot(
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val sheetHState = remember { mutableStateOf(0) }
+    val screenPx = with(density) { LocalConfiguration.current.screenHeightDp.dp.toPx() }
     val offsetY = remember { Animatable(10000f) }
     // 遮罩透明度(3.84.17 对齐网页版 .sheet-mask:满 0.45、.36s 同曲线淡入淡出)
     val maskAlpha = remember { Animatable(0f) }
+    // 面板透明度(3.84.24 与播放页看齐:面板本身也边滑边淡,拖动时跟手)
+    val panelAlpha = remember { Animatable(0f) }
+    // 速度对齐(3.84.24):面板只有约 0.6 屏高,与播放页同 450ms 时像素
+    // 速度只有六成(cheng 体感队列收回慢)。时长按面板高/屏高缩放,
+    // 速度曲线与播放页逐点重合
+    fun slideRatio(): Float {
+        val h = sheetHState.value
+        return if (h > 0 && screenPx > 0f) (h / screenPx).coerceIn(0.3f, 1f) else 1f
+    }
     var closing by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
@@ -332,13 +343,24 @@ fun NativeQueueRoot(
         scope.launch {
             val h = sheetHState.value
             val frac = if (h > 0) (offsetY.value / h).coerceIn(0f, 1f) else 0f
-            val dur = (450 * frac).toInt().coerceIn(120, 450)
+            val ratio = slideRatio()
+            val dur = (450 * ratio * frac).toInt().coerceIn(80, 450)
+            val fadeDur = (360 * ratio * frac).toInt().coerceIn(60, 360)
             launch {
                 maskAlpha.animateTo(
                     0.45f,
                     tween(
-                        durationMillis = (360 * frac).toInt().coerceIn(100, 360),
+                        durationMillis = fadeDur,
                         easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+                    )
+                )
+            }
+            launch {
+                panelAlpha.animateTo(
+                    1f,
+                    tween(
+                        durationMillis = fadeDur,
+                        easing = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f)
                     )
                 )
             }
@@ -356,14 +378,21 @@ fun NativeQueueRoot(
         closing = true
         scope.launch {
             val h = sheetHState.value
+            val remaining = if (h > 0) ((h - offsetY.value) / h).coerceIn(0f, 1f) else 1f
+            val ratio = slideRatio()
+            val fadeDur = (360 * ratio * remaining).toInt().coerceIn(60, 360)
             launch {
                 maskAlpha.animateTo(
-                    0f, tween(durationMillis = 360, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
+                    0f, tween(durationMillis = fadeDur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
+                )
+            }
+            launch {
+                panelAlpha.animateTo(
+                    0f, tween(durationMillis = fadeDur, easing = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f))
                 )
             }
             try {
-                val remaining = if (h > 0) ((h - offsetY.value) / h).coerceIn(0f, 1f) else 1f
-                val dur = (450 * remaining).toInt().coerceIn(120, 450)
+                val dur = (450 * ratio * remaining).toInt().coerceIn(80, 450)
                 offsetY.animateTo(
                     if (h > 0) h.toFloat() else 10000f,
                     tween(durationMillis = dur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
@@ -380,19 +409,25 @@ fun NativeQueueRoot(
     // 取消,动画死在半路(真机:点队列滑不出来)。改为等到量高出现
     // (300ms 没量到按屏高兜底),只跑一次;参数对齐网页版 .sheet:
     // 位移 .45s cubic-bezier(0.32,0.72,0,1),遮罩 .36s 同曲线
-    val screenPx = with(density) { LocalConfiguration.current.screenHeightDp.dp.toPx() }
     LaunchedEffect(Unit) {
-        launch {
-            maskAlpha.animateTo(
-                0.45f, tween(durationMillis = 360, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
-            )
-        }
         val h = withTimeoutOrNull(300) {
             snapshotFlow { sheetHState.value }.first { it > 0 }
         }
+        val ratio = slideRatio()
+        val fadeDur = (360 * ratio).toInt().coerceIn(120, 360)
+        launch {
+            maskAlpha.animateTo(
+                0.45f, tween(durationMillis = fadeDur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
+            )
+        }
+        launch {
+            panelAlpha.animateTo(
+                1f, tween(durationMillis = fadeDur, easing = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f))
+            )
+        }
         offsetY.snapTo((h ?: screenPx.toInt()).toFloat())
         offsetY.animateTo(
-            0f, tween(durationMillis = 450, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
+            0f, tween(durationMillis = (450 * ratio).toInt().coerceIn(120, 450), easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
         )
     }
     // hideSignal 跨开关累加:以本次合成值为基线(同播放页 3.82.2 教训)
@@ -409,7 +444,10 @@ fun NativeQueueRoot(
                 scope.launch {
                     offsetY.snapTo(newOff)
                     val h = sheetHState.value
-                    if (h > 0) maskAlpha.snapTo(0.45f * (1f - (newOff / h).coerceIn(0f, 1f)))
+                    if (h > 0) {
+                        maskAlpha.snapTo(0.45f * (1f - (newOff / h).coerceIn(0f, 1f)))
+                        panelAlpha.snapTo(1f - (newOff / h).coerceIn(0f, 1f))
+                    }
                 }
                 return Offset(0f, consumedY)
             }
@@ -428,7 +466,10 @@ fun NativeQueueRoot(
                 val consumedY = newOff - offsetY.value
                 scope.launch {
                     offsetY.snapTo(newOff)
-                    if (h > 0) maskAlpha.snapTo(0.45f * (1f - (newOff / h).coerceIn(0f, 1f)))
+                    if (h > 0) {
+                        maskAlpha.snapTo(0.45f * (1f - (newOff / h).coerceIn(0f, 1f)))
+                        panelAlpha.snapTo(1f - (newOff / h).coerceIn(0f, 1f))
+                    }
                 }
                 return Offset(0f, consumedY)
             }
@@ -467,6 +508,7 @@ fun NativeQueueRoot(
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .offset { IntOffset(0, offsetY.value.roundToInt()) }
+                .alpha(panelAlpha.value)
                 .onSizeChanged { sheetHState.value = it.height }
                 .shadow(12.dp, RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
                 .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
@@ -495,7 +537,10 @@ fun NativeQueueRoot(
                                 scope.launch {
                                     offsetY.snapTo(dragPos)
                                     val h = sheetHState.value
-                                    if (h > 0) maskAlpha.snapTo(0.45f * (1f - (dragPos / h).coerceIn(0f, 1f)))
+                                    if (h > 0) {
+                                        maskAlpha.snapTo(0.45f * (1f - (dragPos / h).coerceIn(0f, 1f)))
+                                        panelAlpha.snapTo(1f - (dragPos / h).coerceIn(0f, 1f))
+                                    }
                                 }
                             },
                             onDragEnd = {

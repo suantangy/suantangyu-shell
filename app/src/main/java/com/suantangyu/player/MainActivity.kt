@@ -714,7 +714,7 @@ class MainActivity : AppCompatActivity() {
                 if (arr != null) {
                     for (i in 0 until arr.length()) {
                         val l = arr.optJSONObject(i) ?: continue
-                        list.add(PlayerLine(l.optLong("t"), l.optString("x")))
+                        list.add(PlayerLine(l.optLong("t"), l.optString("x"), l.optString("tr")))
                     }
                 }
                 NativePlayerStore.lyrics = list

@@ -17,6 +17,8 @@ package com.suantangyu.player
 import android.graphics.Bitmap
 import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -64,6 +66,7 @@ import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
@@ -109,7 +112,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
-data class PlayerLine(val t: Long, val x: String)
+data class PlayerLine(val t: Long, val x: String, val tr: String = "")
 
 object NativePlayerStore {
     var visible by mutableStateOf(false)
@@ -201,6 +204,59 @@ private fun SvgIconStroke(pathData: String, size: Dp, color: Color, strokeDp: Dp
     }
 }
 
+// 播放页歌词行(3.84.24 照网页 .ly 三档复刻):当前 22px/800、相邻
+// 15px、远行 14px;远行带 0.5px 模糊与 0.94 缩放、相邻 0.97;字号用
+// 网页同款弹簧曲线 .28s 涨落、颜色 .25s 过渡;长行换行不截断;
+// 开译时主行下跟 12px 译文行(网页 .ly-trans)
+@Composable
+private fun PlayerLyricLine(
+    line: PlayerLine, tier: Int, lyOn: Color, base: Color,
+    showTr: Boolean, onClick: () -> Unit
+) {
+    val targetSize = when (tier) { 2 -> 22f; 1 -> 15f; else -> 14f }
+    val animSize by animateFloatAsState(
+        targetSize,
+        tween(280, easing = CubicBezierEasing(0.34f, 1.56f, 0.64f, 1f)),
+        label = "lySize"
+    )
+    val targetColor = when (tier) {
+        2 -> lyOn
+        1 -> base.copy(alpha = 0.75f)
+        else -> base.copy(alpha = 0.42f)
+    }
+    val animColor by animateColorAsState(targetColor, tween(250), label = "lyColor")
+    val targetScale = when (tier) { 2 -> 1f; 1 -> 0.97f; else -> 0.94f }
+    val animScale by animateFloatAsState(targetScale, tween(250), label = "lyScale")
+    Column(
+        Modifier.fillMaxWidth()
+            .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 7.dp)
+            .graphicsLayer { scaleX = animScale; scaleY = animScale }
+            .then(if (tier == 0) Modifier.blur(0.5.dp) else Modifier),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            line.x,
+            color = animColor,
+            fontSize = animSize.sp,
+            fontWeight = if (tier == 2) FontWeight.ExtraBold else FontWeight.Medium,
+            letterSpacing = if (tier == 2) (-0.03f * animSize).sp else 0.sp,
+            lineHeight = (animSize * 1.4f).sp,
+            textAlign = TextAlign.Center
+        )
+        if (showTr && line.tr.isNotEmpty()) {
+            Text(
+                line.tr,
+                color = base.copy(alpha = 0.45f),
+                fontSize = 12.sp,
+                lineHeight = 16.8.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 1.dp)
+            )
+        }
+    }
+}
+
 // 网页版 #npWave 的 42 根预设高度(heart 样式),逐值照搬
 private val WAVE_H = intArrayOf(
     44, 99, 70, 47, 11, 20, 39, 75, 18, 32, 70, 30, 99, 95, 44, 100, 28, 32,
@@ -217,7 +273,7 @@ private fun SeekVisual(
         "heart" -> {
             val onN = (frac * WAVE_H.size).roundToInt().coerceIn(0, WAVE_H.size)
             Row(
-                Modifier.fillMaxWidth().height(36.dp),
+                Modifier.fillMaxWidth().height(44.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -263,7 +319,7 @@ private fun SeekVisual(
         }
         "glow" -> {
             Box(
-                Modifier.fillMaxWidth().height(28.dp),
+                Modifier.fillMaxWidth().height(44.dp),
                 contentAlignment = Alignment.CenterStart
             ) {
                 Box(
@@ -289,7 +345,7 @@ private fun SeekVisual(
         else -> {
             // orbit 星轨(网页默认):暂停直线、播放起浪——18 周期正弦、
             // 波幅最大 2.4/48、相位 2π/4.5s 右→左推进,已播段与圆钮用主题深色
-            Canvas(Modifier.fillMaxWidth().height(48.dp)) {
+            Canvas(Modifier.fillMaxWidth().height(36.dp)) {
                 val w = size.width
                 val mid = size.height / 2f
                 val ampPx = amp / 48f * size.height
@@ -829,12 +885,30 @@ fun NativePlayerRoot(
         }
     }
     val accent = st.accent
+    // 切歌氛围黏性(3.84.24):网页版新封面没就绪前一直用上一首的氛围,
+    // 齐了才整体换。原生此前新歌数据一到就切,而取色/合成还没好,
+    // darkUi 默认 false 把整页塌成黑底白字一闪(cheng:切歌闪屏、
+    // 没网页自然)。shownCover 黏住上一首,等新歌取色+(浅底时)合成
+    // 背景都进缓存才整帧换过去;2.5s 兜底防死等
+    var shownCover by remember { mutableStateOf(st.cover) }
+    LaunchedEffect(st.cover) {
+        val target = st.cover
+        if (target != shownCover) {
+            val deadline = SystemClock.elapsedRealtime() + 2500
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val pa = CoverCache.paletteOf(target)
+                if (pa != null && (!pa.darkUi || CoverCache.composedOf(target) != null)) break
+                delay(50)
+            }
+            shownCover = target
+        }
+    }
     // 明暗自适应(网页版同规则):封面取色 lum>88 → 深字浅底,否则白字深底
-    val fullBmp = CoverBitmap(st.cover)
+    val fullBmp = CoverBitmap(shownCover)
     val asyncPalette = remember(fullBmp) { fullBmp?.let { sampleCoverPalette(it) } }
     // 切歌时已预合成取色(postTrack → CoverCache.precompute):命中
     // 缓存时首帧即有取色,不必等封面异步加载(3.84.18)
-    val palette = CoverCache.paletteOf(st.cover) ?: asyncPalette
+    val palette = CoverCache.paletteOf(shownCover) ?: asyncPalette
     val darkUi = palette?.darkUi ?: false
     val lyOn = if (darkUi) mixColor(st.npAccent, Color.Black, 0.28f) else st.npAccent
     val wht = if (darkUi) Color(0xFF1C1C1E) else Color.White
@@ -843,7 +917,7 @@ fun NativePlayerRoot(
     val w50 = wht.copy(alpha = 0.5f)
 
     // 封面取色就绪标记:fullBmp 到手的那次合成里 palette 已同步算出
-    var artReady by remember { mutableStateOf(CoverCache.paletteOf(st.cover) != null) }
+    var artReady by remember { mutableStateOf(CoverCache.paletteOf(shownCover) != null) }
     LaunchedEffect(fullBmp) { if (fullBmp != null) artReady = true }
     LaunchedEffect(Unit) {
         st.composeBeat++
@@ -881,7 +955,7 @@ fun NativePlayerRoot(
         // (页面深主题 .32)。参数由 21 首网页版截图离线全栈模拟
         // 拟合(条带均差 8.2,旧栈真机约 14)。浅底走 composeLightBg
         // 离线合成 + npBgSatPaint 绘制;深底仍走旧路径
-        val blurBmp = CoverBitmap(st.cover, blurred = true)
+        val blurBmp = CoverBitmap(shownCover, blurred = true)
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val bw = constraints.maxWidth
             val bh = constraints.maxHeight
@@ -900,10 +974,10 @@ fun NativePlayerRoot(
                 // 此前 produceState 异步现算:约 0.2s 才换上,封面上下
                 // 两条背景带一步跳变(cheng 两段录屏逐帧实锤);异步到
                 // 达这件事本身就是闪的来源,不再依赖缓存命中与否
-                val comp = remember(blurBmp, pa, bw, bh, st.cover) {
-                    CoverCache.composedOf(st.cover) ?: runCatching {
+                val comp = remember(blurBmp, pa, bw, bh, shownCover) {
+                    CoverCache.composedOf(shownCover) ?: runCatching {
                         composeLightBg(blurBmp, pa, bw, bh)
-                    }.getOrNull()?.also { CoverCache.putComposed(st.cover, it) }
+                    }.getOrNull()?.also { CoverCache.putComposed(shownCover, it) }
                 }
                 if (comp != null) {
                     Canvas(Modifier.fillMaxSize()) {
@@ -1039,7 +1113,7 @@ fun NativePlayerRoot(
                     .padding(start = 36.dp, end = 36.dp, top = 8.dp, bottom = 12.dp),
                 contentAlignment = Alignment.Center
             ) {
-                val bmp = CoverBitmap(st.cover)
+                val bmp = CoverBitmap(shownCover)
                 Box(Modifier.size(artSize)) {
                     // 手绘柔影代替系统 elevation 阴影(3.84.23):系统阴影
                     // 在整页淡入的离屏层里渲染更深、淡完层一撤就变浅,
@@ -1102,7 +1176,9 @@ fun NativePlayerRoot(
                 LaunchedEffect(curIdx) {
                     if (curIdx >= 0 && SystemClock.elapsedRealtime() > holdUntil) {
                         try {
-                            listState.animateScrollToItem(curIdx, scrollOffset = -120)
+                            val vh = listState.layoutInfo.viewportSize.height
+                            val off = if (vh > 0) (-(vh * 0.42f).toInt() + 150) else -120
+                            listState.animateScrollToItem(curIdx, scrollOffset = off)
                         } catch (_: Exception) {
                         }
                     }
@@ -1138,17 +1214,15 @@ fun NativePlayerRoot(
                         }
                 ) {
                     itemsIndexed(lines, key = { i, l -> "$i|${l.t}" }) { i, line ->
-                        val on = i == curIdx
-                        Text(
-                            line.x,
-                            color = if (on) lyOn else w55,
-                            fontSize = if (on) 16.sp else 14.5.sp,
-                            fontWeight = if (on) FontWeight.Bold else FontWeight.Normal,
-                            textAlign = TextAlign.Center,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.fillMaxWidth()
-                                .clickable { onSeek(line.t) }
-                                .padding(vertical = 5.dp)
+                        PlayerLyricLine(
+                            line = line,
+                            tier = when {
+                                i == curIdx -> 2
+                                kotlin.math.abs(i - curIdx) == 1 -> 1
+                                else -> 0
+                            },
+                            lyOn = lyOn, base = wht, showTr = st.transOn,
+                            onClick = { onSeek(line.t) }
                         )
                     }
                 }
@@ -1190,12 +1264,16 @@ fun NativePlayerRoot(
             // bar 线条/glow 流光,跟随网页设置 aq_np_seek)
             val dur = maxOf(st.durMs, 1L)
             val seekFrac = (shownPos.toFloat() / dur).coerceIn(0f, 1f)
+            // 盒高对齐网页 .np-seek(3.84.24):orbit 36、heart/glow 44;
+            // 此前 orbit 48 把时间/控制行整体顶低约 14dp(cheng 实测
+            // 网页进度条偏上)
             val seekH = when (st.seekStyle) {
-                "orbit" -> 48.dp
-                "heart" -> 36.dp
+                "orbit" -> 36.dp
+                "heart" -> 44.dp
+                "glow" -> 44.dp
                 else -> 28.dp
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             Box(
                 Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(seekH)
                     .pointerInput(dur) {
@@ -1264,7 +1342,7 @@ fun NativePlayerRoot(
                 Box(
                     Modifier.size(40.dp).clip(CircleShape).clickable { onQueue() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(P_LIST, 22.dp, sideTint) }
+                ) { SvgIconStroke("M4 6h16M4 12h16M4 18h10", 22.dp, sideTint, 2.2.dp) }
             }
             // 工具卡(网页 .np-tools 同款:margin 4/18/(18+安全区)、圆角 18、
             // padding 6;每格宽 = (卡内宽 - 6) / 5.28,一屏正好露 5.28 个;
