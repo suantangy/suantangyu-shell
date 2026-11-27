@@ -140,6 +140,84 @@ private fun fmtTime(ms: Long): String {
     return "${sec / 60}:${(sec % 60).toString().padStart(2, '0')}"
 }
 
+// ================= 封面取色(网页版同算法) =================
+// 48x48 采样:滤太黑/太白/近灰,16 级量化桶取众数色,再按鲜艳色加权混合;
+// lum = 0.65*lum(主色) + 0.35*lum(鲜艳色),经典模式 lum>88 → 深字浅底
+private class CoverPalette(val darkUi: Boolean, val lyOn: Color)
+
+private class PalBucket { var n = 0; var r = 0L; var g = 0L; var b = 0L; var sat = 0.0 }
+
+private fun mixColor(c1: Color, c2: Color, t: Float): Color = Color(
+    red = c1.red + (c2.red - c1.red) * t,
+    green = c1.green + (c2.green - c1.green) * t,
+    blue = c1.blue + (c2.blue - c1.blue) * t
+)
+
+private fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
+    try {
+        val w = 48; val h = 48
+        val scaled = Bitmap.createScaledBitmap(bmp, w, h, true)
+        val px = IntArray(w * h)
+        scaled.getPixels(px, 0, w, 0, 0, w, h)
+        if (scaled !== bmp) scaled.recycle()
+        val buckets = HashMap<Int, PalBucket>()
+        var vividR = 0; var vividG = 0; var vividB = 0; var vividSat = 0.0; var vividScore = -1.0
+        var validN = 0
+        for (p in px) {
+            if (android.graphics.Color.alpha(p) < 150) continue
+            val rr = android.graphics.Color.red(p)
+            val gg = android.graphics.Color.green(p)
+            val bb = android.graphics.Color.blue(p)
+            val mx = maxOf(rr, gg, bb); val mn = minOf(rr, gg, bb)
+            val lum = 0.299 * rr + 0.587 * gg + 0.114 * bb
+            if (lum < 38 || lum > 242) continue
+            if (rr > 250 && gg > 250 && bb > 250) continue
+            val sat = if (mx == 0) 0.0 else (mx - mn).toDouble() / mx
+            if (sat < 0.12) continue
+            validN++
+            val key = ((rr shr 4) shl 8) or ((gg shr 4) shl 4) or (bb shr 4)
+            val bk = buckets.getOrPut(key) { PalBucket() }
+            bk.n++; bk.r += rr; bk.g += gg; bk.b += bb; bk.sat += sat
+            if (sat >= 0.22) {
+                val score = sat * 1.15 + ((mx - mn) / 255.0) * 0.55 + (lum / 255.0) * 0.35
+                if (score > vividScore) {
+                    vividScore = score; vividR = rr; vividG = gg; vividB = bb; vividSat = sat
+                }
+            }
+        }
+        if (validN == 0) return null
+        var dom: PalBucket? = null
+        for (b in buckets.values) {
+            val cur = dom
+            if (cur == null || b.n > cur.n) dom = b
+        }
+        val d = dom ?: return null
+        val domR = d.r.toDouble() / d.n; val domG = d.g.toDouble() / d.n; val domB = d.b.toDouble() / d.n
+        val domSat = d.sat / d.n
+        var fr = domR; var fg2 = domG; var fb = domB
+        if (vividScore >= 0) {
+            val domShare = d.n.toDouble() / validN
+            var wVivid = 0.18 + minOf(0.2, (vividSat - 0.22) * 0.45)
+            if (domShare > 0.22 && domSat >= 0.18) wVivid = minOf(wVivid, 0.22)
+            if (domShare > 0.35) wVivid = minOf(wVivid, 0.15)
+            fr = domR * (1 - wVivid) + vividR * wVivid
+            fg2 = domG * (1 - wVivid) + vividG * wVivid
+            fb = domB * (1 - wVivid) + vividB * wVivid
+        }
+        val base = Color(
+            fr.toInt().coerceIn(0, 255), fg2.toInt().coerceIn(0, 255), fb.toInt().coerceIn(0, 255)
+        )
+        val lumBase = 0.299 * fr + 0.587 * fg2 + 0.114 * fb
+        val lumVivid = if (vividScore >= 0) 0.299 * vividR + 0.587 * vividG + 0.114 * vividB else lumBase
+        val lum = lumBase * 0.65 + lumVivid * 0.35
+        val darkUi = lum > 88
+        val lyOn = if (darkUi) mixColor(base, Color.Black, 0.42f) else mixColor(base, Color.White, 0.12f)
+        return CoverPalette(darkUi, lyOn)
+    } catch (e: Exception) {
+        return null
+    }
+}
+
 @Composable
 fun NativePlayerRoot(
     onClose: () -> Unit,
@@ -212,16 +290,21 @@ fun NativePlayerRoot(
     }
     val shownPos = if (seeking) seekPos else dispPos
     val accent = st.accent
-    val wht = Color.White
-    val w70 = Color.White.copy(alpha = 0.72f)
-    val w55 = Color.White.copy(alpha = 0.55f)
-    val w50 = Color.White.copy(alpha = 0.5f)
+    // 明暗自适应(网页版同规则):封面取色 lum>88 → 深字浅底,否则白字深底
+    val fullBmp = CoverBitmap(st.cover)
+    val palette = remember(fullBmp) { fullBmp?.let { sampleCoverPalette(it) } }
+    val darkUi = palette?.darkUi ?: false
+    val lyOn = palette?.lyOn ?: accent
+    val wht = if (darkUi) Color(0xFF1C1C1E) else Color.White
+    val w70 = wht.copy(alpha = if (darkUi) 0.62f else 0.72f)
+    val w55 = wht.copy(alpha = if (darkUi) 0.48f else 0.55f)
+    val w50 = wht.copy(alpha = 0.5f)
 
     Box(
         Modifier
             .fillMaxSize()
             .offset { IntOffset(0, offsetY.value.roundToInt()) }
-            .background(Color(0xFF101013))
+            .background(if (darkUi) Color(0xFFF4F1EC) else Color(0xFF101013))
     ) {
         // 氛围底:封面低清图放大铺满(天然模糊)+暗罩,与网页 np-bg 同思路
         val blurBmp = CoverBitmap(st.cover, tiny = true)
@@ -231,7 +314,11 @@ fun NativePlayerRoot(
                 Modifier.fillMaxSize(), contentScale = ContentScale.Crop
             )
         }
-        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+        Box(
+            Modifier.fillMaxSize().background(
+                if (darkUi) Color.White.copy(alpha = 0.45f) else Color.Black.copy(alpha = 0.38f)
+            )
+        )
 
         Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
             Spacer(Modifier.height(26.dp))
@@ -243,7 +330,7 @@ fun NativePlayerRoot(
                 Box(
                     Modifier.size(width = 38.dp, height = 5.dp)
                         .clip(RoundedCornerShape(3.dp))
-                        .background(Color.White.copy(alpha = 0.25f))
+                        .background(wht.copy(alpha = 0.28f))
                 )
             }
             // 信息区(可拖关闭)
@@ -314,7 +401,7 @@ fun NativePlayerRoot(
                 }
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxWidth().height(168.dp)
+                    modifier = Modifier.fillMaxWidth().weight(1f)
                         .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                         .drawWithContent {
                             drawContent()
@@ -331,7 +418,7 @@ fun NativePlayerRoot(
                         val on = i == curIdx
                         Text(
                             line.x,
-                            color = if (on) wht else w55,
+                            color = if (on) lyOn else w55,
                             fontSize = if (on) 16.sp else 14.5.sp,
                             fontWeight = if (on) FontWeight.Bold else FontWeight.Normal,
                             textAlign = TextAlign.Center,
@@ -378,7 +465,7 @@ fun NativePlayerRoot(
                 Box(
                     Modifier.fillMaxWidth().height(4.dp)
                         .clip(RoundedCornerShape(2.dp))
-                        .background(Color.White.copy(alpha = 0.25f))
+                        .background(wht.copy(alpha = 0.22f))
                 )
                 Box(
                     Modifier.fillMaxWidth(frac).height(4.dp)
@@ -431,7 +518,7 @@ fun NativePlayerRoot(
                 Box(
                     Modifier.size(68.dp).clip(CircleShape).clickable { onToggle() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 42.dp, wht) }
+                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 38.dp, wht) }
                 Box(
                     Modifier.size(52.dp).clip(CircleShape).clickable { onNext() },
                     contentAlignment = Alignment.Center
