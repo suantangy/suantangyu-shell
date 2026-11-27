@@ -1,7 +1,8 @@
 // NativePlayer.kt — 逐面原生化二期:播放页全复刻(3.84.0;3.84.1 按
 // cheng 截图对照批次对齐:工具格 (100%-6)/5.28、图标 24/描边 2.15/
 // 透明色、卡圆角 18、背景换网页原图模糊、整列按网页间距重排、
-// 控制键 56/40 分大小号)。
+// 控制键 56/40 分大小号;3.84.2 修背景糊度(中间图 72→20px)+
+// 亮度矩阵只乘对角发灰的 bug)。
 // 氛围底+明暗自适应(网页取色算法)+标题/歌手+原封面+译+整行歌词+
 // 歌曲故事/喜欢/评论+四种进度样式(orbit 星轨/heart 心跳波/bar/glow,
 // 跟随网页 aq_np_seek)+模式/上下首/播放/队列+工具卡全套(倍速/定时
@@ -629,9 +630,13 @@ fun NativePlayerRoot(
             val bgMatrix = remember {
                 ColorMatrix().apply {
                     setToSaturation(1.25f)
-                    this[0, 0] = this[0, 0] * 1.12f
-                    this[1, 1] = this[1, 1] * 1.12f
-                    this[2, 2] = this[2, 2] * 1.12f
+                    // brightness 1.12:每行 RGB 三系数同乘(只乘对角会
+                    // 破坏饱和矩阵的通道混合、画面发灰,3.84.1 的教训)
+                    for (r in 0..2) {
+                        for (c in 0..2) {
+                            this[r, c] = this[r, c] * 1.12f
+                        }
+                    }
                 }
             }
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

@@ -123,15 +123,17 @@ object CoverCache {
         return tiny
     }
 
-    /** 强模糊版(网页 .np-bg 同款做法):原图先缩到宽 72px、再放大回
-     *  原尺寸,糊度约等于 CSS blur(56px);键加 |blur 后缀独立缓存 */
+    /** 强模糊版(网页 .np-bg 同款做法):原图先缩到宽 20px、再放大回
+     *  原尺寸。CSS blur(56px) 在 145% 铺放下 σ 极大,72px 中间图实测
+     *  (3.84.1)糊度差约 4 倍、封面字形还透得出,20px 才对得上;
+     *  键加 |blur 后缀独立缓存 */
     suspend fun loadBlurred(url: String): Bitmap? {
         if (url.isEmpty() || !url.startsWith("http")) return null
         val key = "$url|blur"
         cache.get(key)?.let { return it }
         val full = load(url) ?: return null
         val blurred = try {
-            val tw = 72
+            val tw = 20
             val th = maxOf(1, full.height * tw / full.width)
             val small = Bitmap.createScaledBitmap(full, tw, th, true)
             Bitmap.createScaledBitmap(small, full.width, full.height, true)
