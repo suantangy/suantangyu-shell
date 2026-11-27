@@ -434,7 +434,10 @@ class BaoBridge(private val activity: MainActivity) {
 
     @JavascriptInterface
     fun showNativePlayer(dark: Boolean, accent: String) {
-        activity.runOnUiThread { activity.showNativePlayer(dark, accent) }
+        activity.runOnUiThread {
+            activity.dbgToast("P1 桥已调用")
+            activity.showNativePlayer(dark, accent)
+        }
     }
 
     /** 3.82.0:网页推播放页数据(喜欢/音质/整行歌词),__aqPlayerPush 发起 */

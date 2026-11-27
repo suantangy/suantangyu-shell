@@ -85,6 +85,7 @@ object NativePlayerStore {
     var anchorAtMs by mutableStateOf(0L)
     var durMs by mutableStateOf(0L)
     var sleepLabel by mutableStateOf("定时")
+    var composeBeat by mutableStateOf(0)
     var accent by mutableStateOf(Color(0xFFE4002B))
 
     fun livePosMs(): Long {
@@ -137,7 +138,8 @@ fun NativePlayerRoot(
     onRate: (Float) -> Unit,
     onSleep: (Int, Boolean, String) -> Unit,
     onQueue: () -> Unit,
-    onOpenWeb: () -> Unit
+    onOpenWeb: () -> Unit,
+    onComposed: () -> Unit = {}
 ) {
     val st = NativePlayerStore
     if (!st.visible) return
@@ -158,6 +160,8 @@ fun NativePlayerRoot(
     }
     LaunchedEffect(st.hideSignal) { if (st.hideSignal > 0) close() }
     LaunchedEffect(Unit) {
+        st.composeBeat++
+        onComposed()
         offsetY.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 260f))
     }
     val dragMod = Modifier.pointerInput(Unit) {
