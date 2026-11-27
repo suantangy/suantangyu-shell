@@ -25,6 +25,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -229,7 +231,7 @@ private fun PlayerLyricLine(
     val animScale by animateFloatAsState(targetScale, tween(250), label = "lyScale")
     Column(
         Modifier.fillMaxWidth()
-            .clickable { onClick() }
+            .aqClickable(1f, 0.72f) { onClick() }
             .padding(horizontal = 12.dp, vertical = 7.dp)
             .graphicsLayer { scaleX = animScale; scaleY = animScale }
             .then(if (tier == 0) Modifier.blur(0.5.dp) else Modifier),
@@ -381,6 +383,24 @@ private fun SeekVisual(
     }
 }
 
+// 按钮回馈对齐网页版(3.84.31):网页 :active 是按钮本体缩放
+// (0.88~0.96)+透明度微降、基本不铺底色块;Compose 默认水波纹
+// 会在按钮范围里闪灰块(圆钮圆块、工具格圆角方块、歌词行全宽
+// 长方块),cheng 点破。故关掉 indication,改按压时整体缩放+
+// 变淡,松手自动回弹。歌词行传 scaleTo=1 只变淡(照网页行 :active)
+@Composable
+private fun Modifier.aqClickable(
+    scaleTo: Float = 0.92f, alphaTo: Float = 0.9f, onClick: () -> Unit
+): Modifier {
+    val src = remember { MutableInteractionSource() }
+    val pressed by src.collectIsPressedAsState()
+    val s by animateFloatAsState(if (pressed) scaleTo else 1f, tween(120), label = "aqS")
+    val a by animateFloatAsState(if (pressed) alphaTo else 1f, tween(120), label = "aqA")
+    return this
+        .graphicsLayer { scaleX = s; scaleY = s; this.alpha = a }
+        .clickable(interactionSource = src, indication = null) { onClick() }
+}
+
 @Composable
 private fun ToolItem(
     kind: String, label: String, fg: Color, onColor: Color,
@@ -391,7 +411,7 @@ private fun ToolItem(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier.width(cellW)
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onClick() }
+            .aqClickable { onClick() }
             .padding(vertical = 5.dp)
     ) {
         if (kind == "sleep") SvgIcon(P_MOON, 24.dp, tint) else ToolIcon(kind, tint)
@@ -1201,7 +1221,7 @@ fun NativePlayerRoot(
                         fontSize = 13.sp,
                         fontWeight = if (st.transOn) FontWeight.SemiBold else FontWeight.Normal,
                         modifier = Modifier.clip(RoundedCornerShape(8.dp))
-                            .clickable { onTool("trans") }
+                            .aqClickable { onTool("trans") }
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     )
                 }
@@ -1244,14 +1264,14 @@ fun NativePlayerRoot(
                     Text(
                         "歌曲故事", color = w70, fontSize = 13.sp,
                         modifier = Modifier.clip(RoundedCornerShape(8.dp))
-                            .clickable { onTool("story") }
+                            .aqClickable { onTool("story") }
                             .padding(horizontal = 4.dp, vertical = 6.dp)
                     )
                 }
                 Spacer(Modifier.weight(1f))
                 Box(
                     Modifier.size(38.dp).clip(CircleShape)
-                        .clickable { onFav() },
+                        .aqClickable { onFav() },
                     contentAlignment = Alignment.Center
                 ) {
                     if (st.fav) SvgIcon(P_HEART, 23.dp, accent)
@@ -1260,7 +1280,7 @@ fun NativePlayerRoot(
                 if (st.commentOn) {
                     Box(
                         Modifier.size(38.dp).clip(CircleShape)
-                            .clickable { onTool("comment") },
+                            .aqClickable { onTool("comment") },
                         contentAlignment = Alignment.Center
                     ) {
                         SvgIconStroke(P_COMMENT, 23.dp, wht, 1.8.dp)
@@ -1325,7 +1345,7 @@ fun NativePlayerRoot(
             ) {
                 val sideTint = wht.copy(alpha = 0.88f)
                 Box(
-                    Modifier.size(40.dp).clip(CircleShape).clickable { onMode() },
+                    Modifier.size(40.dp).clip(CircleShape).aqClickable { onMode() },
                     contentAlignment = Alignment.Center
                 ) {
                     when (st.mode) {
@@ -1342,7 +1362,7 @@ fun NativePlayerRoot(
                     }
                 }
                 Box(
-                    Modifier.size(56.dp).clip(CircleShape).clickable { onPrev() },
+                    Modifier.size(56.dp).clip(CircleShape).aqClickable { onPrev() },
                     contentAlignment = Alignment.Center
                 ) { SvgIcon(P_PREV, 36.dp, wht) }
                 Box(
@@ -1350,15 +1370,15 @@ fun NativePlayerRoot(
                     // 64px !important、svg 44px——3.84.1 审计读漏了
                     // 这条覆盖规则、误记 56/34,控制行因此矮 8dp,
                     // 上面进度/时间整串低 8dp(cheng 两图实测对账)
-                    Modifier.size(64.dp).clip(CircleShape).clickable { onToggle() },
+                    Modifier.size(64.dp).clip(CircleShape).aqClickable { onToggle() },
                     contentAlignment = Alignment.Center
                 ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 44.dp, wht) }
                 Box(
-                    Modifier.size(56.dp).clip(CircleShape).clickable { onNext() },
+                    Modifier.size(56.dp).clip(CircleShape).aqClickable { onNext() },
                     contentAlignment = Alignment.Center
                 ) { SvgIcon(P_NEXT, 36.dp, wht) }
                 Box(
-                    Modifier.size(40.dp).clip(CircleShape).clickable { onQueue() },
+                    Modifier.size(40.dp).clip(CircleShape).aqClickable { onQueue() },
                     contentAlignment = Alignment.Center
                 ) { SvgIconStroke("M4 6h16M4 12h16M4 18h10", 22.dp, sideTint, 2.2.dp) }
             }
@@ -1417,7 +1437,7 @@ fun NativePlayerRoot(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.width(cellW)
                             .clip(RoundedCornerShape(12.dp))
-                            .clickable { onOpenWeb() }
+                            .aqClickable { onOpenWeb() }
                             .padding(vertical = 5.dp)
                     ) {
                         SvgIcon(P_GRID, 24.dp, toolFg)
