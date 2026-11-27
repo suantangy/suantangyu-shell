@@ -132,9 +132,9 @@ object CoverCache {
         cache.get(key)?.let { return it }
         val full = load(url) ?: return null
         val blurred = try {
-            val tw = 12
+            val tw = 7
             val th = maxOf(1, full.height * tw / full.width)
-            // 逐块面积平均缩到 12px:不能用 createScaledBitmap 一步缩——
+            // 逐块面积平均缩到 7px:不能用 createScaledBitmap 一步缩——
             // 它是采样不是面积平均,亮笔画会被采样保留、放大后成一团
             // 团白光斑(3.84.4 真机实锤:顶部书法字白斑;离线 PIL 面积
             // 平均版同参数与网页版只差约 5)。放大回去可以走系统缩放
