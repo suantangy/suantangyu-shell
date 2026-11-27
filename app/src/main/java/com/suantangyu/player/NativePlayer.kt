@@ -684,9 +684,10 @@ fun NativePlayerRoot(
                 if (blurBmp != null) {
                     val imgMatrix = remember(darkUi) {
                         ColorMatrix().apply {
-                            // 图自身饱和 × backdrop 的 1.4(饱和是线性
-                            // 运算、与 alpha 混合可交换,直接乘进来)
-                            setToSaturation(if (darkUi) 1.75f else 1.82f)
+                            // 饱和取实测拟合值(见下方罩色注释):名义
+                            // 1.25×1.4=1.75 渲染出来到不了他截图的浓
+                            // 度,拟合总饱和约 1.4
+                            setToSaturation(if (darkUi) 1.4f else 1.45f)
                             val b = if (darkUi) 1.12f else 0.7f
                             for (r in 0..2) {
                                 for (c in 0..2) {
@@ -700,7 +701,7 @@ fun NativePlayerRoot(
                             blurBmp.asImageBitmap(), null,
                             Modifier.fillMaxSize(1.45f),
                             contentScale = ContentScale.Crop,
-                            alpha = if (darkUi) 0.5f else 0.65f,
+                            alpha = if (darkUi) 0.9f else 0.85f,
                             colorFilter = ColorFilter.colorMatrix(imgMatrix)
                         )
                     }
@@ -709,7 +710,10 @@ fun NativePlayerRoot(
             Box(
                 Modifier.fillMaxSize().background(
                     if (darkUi) {
-                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.45f)
+                        // 罩 .35/图 .9 是对着 cheng 网页版截图 39 点
+                        // 拟合的结果(均差约 9.5):CSS 名义值(图 .5/
+                        // 罩 .45)在他机上渲染出来明显更淡,以实测为准
+                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.35f)
                     } else {
                         Color.Black.copy(alpha = 0.35f)
                     }
