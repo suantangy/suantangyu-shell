@@ -15,7 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
-import android.os.Looper
+import android.os.SystemClockimport android.os.Looper
 import android.view.View
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -398,6 +398,8 @@ class MainActivity : AppCompatActivity() {
         onBackPressedDispatcher.addCallback(this) {
             if (NativeQueueStore.visible) {
                 NativeQueueStore.hideSignal++
+            } else if (NativePlayerStore.visible) {
+                NativePlayerStore.hideSignal++
             } else if (webView.canGoBack()) webView.goBack() else finish()
         }
 
@@ -513,7 +515,23 @@ class MainActivity : AppCompatActivity() {
                 onRemove = { key -> nativeQueueRemove(key) },
                 onMove = { key, to -> nativeQueueMove(key, to) },
                 onLoadMore = { nativeQueueEdit("loadmore", "", 0) },
-                onHidden = { queueComposeView?.visibility = View.GONE }
+                onHidden = { syncNativeComposeVisibility() }
+            )
+            NativePlayerRoot(
+                onClose = { onNativePlayerHidden() },
+                onToggle = { nativePlayerToggle() },
+                onPrev = { nativePlayerStep(next = false) },
+                onNext = { nativePlayerStep(next = true) },
+                onSeek = { pos -> nativePlayerSeek(pos) },
+                onMode = { runJsOnPage("window.__aqPlayerCmd&&window.__aqPlayerCmd('mode')") },
+                onFav = { runJsOnPage("window.__aqPlayerCmd&&window.__aqPlayerCmd('fav')") },
+                onRate = { r -> nativePlayerRate(r) },
+                onSleep = { mins, after, label -> nativePlayerSleep(mins, after, label) },
+                onQueue = { showNativeQueue(playerLastDark, playerLastAccent) },
+                onOpenWeb = {
+                    NativePlayerStore.hideSignal++
+                    runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
+                }
             )
         }
         addContentView(
@@ -537,14 +555,152 @@ class MainActivity : AppCompatActivity() {
         }
         NativeQueueStore.editMode = false
         refreshNativeQueue()
-        queueComposeView?.visibility = View.VISIBLE
         NativeQueueStore.visible = true
+        syncNativeComposeVisibility()
     }
 
-    /** 脑状态推送时（KeepAliveService.pushSync）顺带刷新原生队列 */
+    /** 脑状态推送时（KeepAliveService.pushSync）顺带刷新原生队列/播放页 */
     fun onBrainSyncNotify() {
-        if (!NativeQueueStore.visible) return
-        runOnUiThread { refreshNativeQueue() }
+        if (NativeQueueStore.visible) runOnUiThread { refreshNativeQueue() }
+        if (NativePlayerStore.visible) runOnUiThread { refreshNativePlayer() }
+    }
+
+    /** Compose 盖层显隐:队列或播放页任一在场就 VISIBLE(两者共用一个 ComposeView) */
+    private fun syncNativeComposeVisibility() {
+        val v = queueComposeView ?: return
+        v.visibility =
+            if (NativeQueueStore.visible || NativePlayerStore.visible) View.VISIBLE else View.GONE
+    }
+
+    // ===== 3.82.0 原生播放页（二期）=====
+    private var playerLastDark = false
+    private var playerLastAccent = "#E4002B"
+    private val playerPollHandler = Handler(Looper.getMainLooper())
+    private var playerPollActive = false
+    private val playerPollRunnable = object : Runnable {
+        override fun run() {
+            if (!playerPollActive) return
+            runJsOnPage("window.__aqPlayerPush&&window.__aqPlayerPush()")
+            refreshNativePlayer()
+            playerPollHandler.postDelayed(this, 2000)
+        }
+    }
+
+    /** 桥入口（BaoBridge.showNativePlayer 已切主线程） */
+    fun showNativePlayer(dark: Boolean, accentHex: String) {
+        playerLastDark = dark
+        playerLastAccent = accentHex
+        try {
+            NativePlayerStore.accent = androidx.compose.ui.graphics.Color(
+                android.graphics.Color.parseColor(accentHex)
+            )
+        } catch (_: Exception) {
+        }
+        refreshNativePlayer()
+        runJsOnPage("window.__aqPlayerPush&&window.__aqPlayerPush()")
+        NativePlayerStore.visible = true
+        syncNativeComposeVisibility()
+        try {
+            WindowInsetsControllerCompat(window, window.decorView)
+                .isAppearanceLightStatusBars = false
+        } catch (_: Exception) {
+        }
+        if (!playerPollActive) {
+            playerPollActive = true
+            playerPollHandler.postDelayed(playerPollRunnable, 2000)
+        }
+    }
+
+    private fun onNativePlayerHidden() {
+        playerPollActive = false
+        playerPollHandler.removeCallbacks(playerPollRunnable)
+        try {
+            WindowInsetsControllerCompat(window, window.decorView)
+                .isAppearanceLightStatusBars = true
+        } catch (_: Exception) {
+        }
+        syncNativeComposeVisibility()
+    }
+
+    private fun refreshNativePlayer() {
+        val svc = KeepAliveService.instance ?: return
+        try {
+            val o = svc.playerUiSnapshot()
+            NativePlayerStore.title = o.optString("title")
+            NativePlayerStore.artist = o.optString("artist")
+            NativePlayerStore.cover = o.optString("cover")
+            NativePlayerStore.playing = o.optBoolean("playing")
+            NativePlayerStore.mode = o.optString("mode", "list")
+            NativePlayerStore.rate = o.optDouble("rate", 1.0).toFloat()
+            NativePlayerStore.anchorPosMs = o.optLong("pos")
+            NativePlayerStore.anchorAtMs = SystemClock.elapsedRealtime()
+            NativePlayerStore.durMs = o.optLong("dur")
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 网页 postPlayerData 入口（桥线程→主线程） */
+    fun onPlayerData(json: String) {
+        runOnUiThread {
+            try {
+                val o = JSONObject(json)
+                NativePlayerStore.fav = o.optBoolean("fav")
+                NativePlayerStore.quality = o.optString("quality")
+                val arr = o.optJSONArray("lyrics")
+                val list = ArrayList<PlayerLine>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val l = arr.optJSONObject(i) ?: continue
+                        list.add(PlayerLine(l.optLong("t"), l.optString("x")))
+                    }
+                }
+                NativePlayerStore.lyrics = list
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun nativePlayerToggle() {
+        startService(Intent(this, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_TOGGLE
+        })
+    }
+
+    private fun nativePlayerStep(next: Boolean) {
+        startService(Intent(this, KeepAliveService::class.java).apply {
+            action = if (next) KeepAliveService.ACTION_NEXT else KeepAliveService.ACTION_PREV
+        })
+        // 切歌后歌词要重推(轮询 2 秒兜底,这里提前 600ms 要一次)
+        uiHandler.postDelayed({
+            runJsOnPage("window.__aqPlayerPush&&window.__aqPlayerPush()")
+            refreshNativePlayer()
+        }, 600)
+    }
+
+    private fun nativePlayerSeek(pos: Long) {
+        NativePlayerStore.anchorPosMs = pos
+        NativePlayerStore.anchorAtMs = SystemClock.elapsedRealtime()
+        startService(Intent(this, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_NATIVE_SEEK
+            putExtra("pos", pos)
+        })
+    }
+
+    private fun nativePlayerRate(r: Float) {
+        NativePlayerStore.rate = r
+        startService(Intent(this, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_NATIVE_RATE
+            putExtra("rate", r)
+        })
+    }
+
+    private fun nativePlayerSleep(mins: Int, afterTrack: Boolean, label: String) {
+        NativePlayerStore.sleepLabel = label
+        startService(Intent(this, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_SLEEP
+            putExtra("mins", mins)
+            putExtra("afterTrack", afterTrack)
+        })
     }
 
     private fun refreshNativeQueue() {

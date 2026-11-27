@@ -428,6 +428,21 @@ class BaoBridge(private val activity: MainActivity) {
     fun hasNativeQueue(): Boolean = true
 
     /** 3.80.0 原生队列：网页把当前深色/主题色递来，壳弹原生队列 sheet */
+    /** 3.82.0:原生播放页在场标记(网页 openNowPlaying 据此改走原生) */
+    @JavascriptInterface
+    fun hasNativePlayer(): Boolean = true
+
+    @JavascriptInterface
+    fun showNativePlayer(dark: Boolean, accent: String) {
+        activity.runOnUiThread { activity.showNativePlayer(dark, accent) }
+    }
+
+    /** 3.82.0:网页推播放页数据(喜欢/音质/整行歌词),__aqPlayerPush 发起 */
+    @JavascriptInterface
+    fun postPlayerData(json: String) {
+        activity.onPlayerData(json)
+    }
+
     @JavascriptInterface
     fun showNativeQueue(dark: Boolean, accent: String) {
         activity.runOnUiThread { activity.showNativeQueue(dark, accent) }

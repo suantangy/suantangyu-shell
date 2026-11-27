@@ -2771,6 +2771,24 @@ class KeepAliveService : Service() {
         try { inst.onBrainSyncNotify() } catch (_: Exception) {}
     }
 
+    /** 3.82.0:原生播放页读脑快照(标题/歌手/封面/播放态/进度锚点估算/时长/模式/倍速) */
+    fun playerUiSnapshot(): JSONObject {
+        var pos = positionMs
+        if (playing && anchorAtMs > 0) {
+            pos = anchorPosMs + ((SystemClock.elapsedRealtime() - anchorAtMs) * pendingRate).toLong()
+        }
+        if (durationMs > 0) pos = pos.coerceIn(0, durationMs) else pos = maxOf(0, pos)
+        return JSONObject()
+            .put("title", title)
+            .put("artist", artist)
+            .put("cover", coverUrl)
+            .put("playing", playing)
+            .put("pos", pos)
+            .put("dur", durationMs)
+            .put("mode", brainMode)
+            .put("rate", pendingRate.toDouble())
+    }
+
     /** 3.80.0：原生队列读脑快照（队列/当前键/模式/播放态）。封面字段序与网页 songCover 对齐 */
     fun queueUiSnapshot(): JSONObject {
         val arr = org.json.JSONArray()

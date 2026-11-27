@@ -80,7 +80,7 @@ object NativeQueueStore {
     var hideSignal by mutableStateOf(0)
 }
 
-private object CoverCache {
+object CoverCache {
     private val cache = LruCache<String, Bitmap>(48)
 
     fun get(url: String): Bitmap? = cache.get(url)
@@ -107,6 +107,35 @@ private object CoverCache {
         if (bmp != null) cache.put(url, bmp)
         return bmp
     }
+}
+
+    /** 低清版(24px):给播放页氛围底当模糊源,键加 |tiny 后缀独立缓存 */
+    suspend fun loadTiny(url: String): Bitmap? {
+        if (url.isEmpty() || !url.startsWith("http")) return null
+        val key = "$url|tiny"
+        cache.get(key)?.let { return it }
+        val full = load(url) ?: return null
+        val tiny = try {
+            Bitmap.createScaledBitmap(full, 24, 24, true)
+        } catch (_: Exception) {
+            full
+        }
+        cache.put(key, tiny)
+        return tiny
+    }
+}
+
+/** 封面 Bitmap 助手(队列/播放页共用;tiny=true 取低清版当模糊底) */
+@Composable
+fun CoverBitmap(url: String, tiny: Boolean = false): Bitmap? {
+    val key = if (tiny) "$url|tiny" else url
+    var bmp by remember(key) { mutableStateOf(CoverCache.get(key)) }
+    LaunchedEffect(key) {
+        if (bmp == null && url.isNotEmpty()) {
+            bmp = if (tiny) CoverCache.loadTiny(url) else CoverCache.load(url)
+        }
+    }
+    return bmp
 }
 
 @Composable
