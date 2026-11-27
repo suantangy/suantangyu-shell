@@ -134,7 +134,38 @@ object CoverCache {
         val blurred = try {
             val tw = 12
             val th = maxOf(1, full.height * tw / full.width)
-            val small = Bitmap.createScaledBitmap(full, tw, th, true)
+            // 逐块面积平均缩到 12px:不能用 createScaledBitmap 一步缩——
+            // 它是采样不是面积平均,亮笔画会被采样保留、放大后成一团
+            // 团白光斑(3.84.4 真机实锤:顶部书法字白斑;离线 PIL 面积
+            // 平均版同参数与网页版只差约 5)。放大回去可以走系统缩放
+            val px = IntArray(full.width * full.height)
+            full.getPixels(px, 0, full.width, 0, 0, full.width, full.height)
+            val small = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+            for (oy in 0 until th) {
+                val y0 = oy * full.height / th
+                val y1 = maxOf(y0 + 1, (oy + 1) * full.height / th)
+                for (ox in 0 until tw) {
+                    val x0 = ox * full.width / tw
+                    val x1 = maxOf(x0 + 1, (ox + 1) * full.width / tw)
+                    var r = 0L; var g = 0L; var b = 0L; var n = 0L
+                    for (yy in y0 until y1) {
+                        var idx = yy * full.width + x0
+                        for (xx in x0 until x1) {
+                            val c = px[idx++]
+                            r += (c shr 16) and 0xFF
+                            g += (c shr 8) and 0xFF
+                            b += c and 0xFF
+                            n++
+                        }
+                    }
+                    small.setPixel(
+                        ox, oy,
+                        android.graphics.Color.rgb(
+                            (r / n).toInt(), (g / n).toInt(), (b / n).toInt()
+                        )
+                    )
+                }
+            }
             Bitmap.createScaledBitmap(small, full.width, full.height, true)
         } catch (_: Exception) {
             full
