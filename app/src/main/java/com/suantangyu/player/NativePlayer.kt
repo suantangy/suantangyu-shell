@@ -83,6 +83,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -678,11 +679,17 @@ fun NativePlayerRoot(
     val screenHPx = with(density) { conf.screenHeightDp.dp.toPx() }
     val offsetY = remember { Animatable(screenHPx) }
     var closing by remember { mutableStateOf(false) }
-    fun close() {
+    // iv=松手时拖动的速度(px/s):带进弹簧初速,页面保持手指的速度
+    // 飞出去,不再在松手点刹停一帧再从零加速(3.84.13 修;录屏实测
+    // 旧版收回=跟手滑 205px→整帧纹丝不动→才弹走,断在交接这一拍)
+    fun close(iv: Float = 0f) {
         if (closing) return
         closing = true
         scope.launch {
-            offsetY.animateTo(screenHPx, spring(dampingRatio = 0.92f, stiffness = 300f))
+            offsetY.animateTo(
+                screenHPx, spring(dampingRatio = 0.92f, stiffness = 300f),
+                initialVelocity = iv.coerceIn(-6000f, 6000f)
+            )
             st.visible = false
             onClose()
         }
@@ -698,20 +705,36 @@ fun NativePlayerRoot(
         offsetY.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 260f))
     }
     val dragMod = Modifier.pointerInput(Unit) {
+        val tracker = VelocityTracker()
+        var dragPos = 0f
+        fun rebound(v: Float) {
+            scope.launch {
+                offsetY.animateTo(
+                    0f, spring(dampingRatio = 0.88f, stiffness = 300f),
+                    initialVelocity = v.coerceIn(-6000f, 6000f)
+                )
+            }
+        }
         detectVerticalDragGestures(
-            onDragStart = { scope.launch { offsetY.stop() } },
-            onVerticalDrag = { _, dy ->
-                scope.launch { offsetY.snapTo((offsetY.value + dy).coerceAtLeast(0f)) }
+            onDragStart = {
+                tracker.resetTracking()
+                dragPos = offsetY.value
+                scope.launch { offsetY.stop() }
+            },
+            onVerticalDrag = { change, dy ->
+                dragPos = (dragPos + dy).coerceAtLeast(0f)
+                tracker.addPosition(change.uptimeMillis, Offset(0f, dragPos))
+                scope.launch { offsetY.snapTo(dragPos) }
             },
             onDragEnd = {
-                if (offsetY.value > 130.dp.toPx()) close()
-                else scope.launch {
-                    offsetY.animateTo(0f, spring(dampingRatio = 0.88f, stiffness = 300f))
+                val v = tracker.calculateVelocity().y
+                when {
+                    v < -1500f -> rebound(v) // 向上甩够快=想留下
+                    offsetY.value > 130.dp.toPx() || v > 1500f -> close(v)
+                    else -> rebound(v)
                 }
             },
-            onDragCancel = {
-                scope.launch { offsetY.animateTo(0f, spring(dampingRatio = 0.88f, stiffness = 300f)) }
-            }
+            onDragCancel = { rebound(0f) }
         )
     }
 
