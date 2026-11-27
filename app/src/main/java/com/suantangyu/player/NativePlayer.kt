@@ -1039,17 +1039,40 @@ fun NativePlayerRoot(
                 contentAlignment = Alignment.Center
             ) {
                 val bmp = CoverBitmap(st.cover)
-                Box(
-                    Modifier.size(artSize)
-                        .shadow(28.dp, RoundedCornerShape(16.dp))
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(Color(0xFF2A2A2E))
-                ) {
-                    if (bmp != null) {
-                        Image(
-                            bmp.asImageBitmap(), null,
-                            Modifier.fillMaxSize(), contentScale = ContentScale.Crop
-                        )
+                Box(Modifier.size(artSize)) {
+                    // 手绘柔影代替系统 elevation 阴影(3.84.23):系统阴影
+                    // 在整页淡入的离屏层里渲染更深、淡完层一撤就变浅,
+                    // 开页约 0.36s 时封面下方那块阴影一步跳变(cheng 指
+                    // 认「封面下面歌词上面那块」;逐帧实测:跳变只落在
+                    // 封面正下方的阴影 footprint 内、左右纯背景纹丝不
+                    // 动)。BlurMaskFilter 是普通绘制,层内外一个样
+                    Box(
+                        Modifier.fillMaxSize().drawBehind {
+                            val paint = android.graphics.Paint().apply {
+                                color = android.graphics.Color.argb(54, 0, 0, 0)
+                                maskFilter = android.graphics.BlurMaskFilter(
+                                    24.dp.toPx(),
+                                    android.graphics.BlurMaskFilter.Blur.NORMAL
+                                )
+                            }
+                            val dy = 6.dp.toPx()
+                            val r = 16.dp.toPx()
+                            drawContext.canvas.nativeCanvas.drawRoundRect(
+                                0f, dy, size.width, size.height + dy, r, r, paint
+                            )
+                        }
+                    )
+                    Box(
+                        Modifier.fillMaxSize()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(Color(0xFF2A2A2E))
+                    ) {
+                        if (bmp != null) {
+                            Image(
+                                bmp.asImageBitmap(), null,
+                                Modifier.fillMaxSize(), contentScale = ContentScale.Crop
+                            )
+                        }
                     }
                 }
             }
