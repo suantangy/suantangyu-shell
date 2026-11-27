@@ -94,6 +94,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -679,17 +680,34 @@ fun NativePlayerRoot(
     val screenHPx = with(density) { conf.screenHeightDp.dp.toPx() }
     val offsetY = remember { Animatable(screenHPx) }
     var closing by remember { mutableStateOf(false) }
-    // iv=松手时拖动的速度(px/s):带进弹簧初速,页面保持手指的速度
-    // 飞出去,不再在松手点刹停一帧再从零加速(3.84.13 修;录屏实测
-    // 旧版收回=跟手滑 205px→整帧纹丝不动→才弹走,断在交接这一拍)
+    // 关闭:弹簧目标设在屏外(1.3×屏高),offsetY 一到屏高就取消动画
+    // 并收页——页面全程带速出画。旧版目标就是屏高,弹簧(ζ0.92)在
+    // 最后一段渐近爬行:原始帧率录屏实测主滑行后还有约 0.25s 低速
+    // 蠕动(帧间差 22→9.7→4.3→2.0→1.2 缓降),页面顶条在屏底慢慢
+    // 蹭完最后一程(cheng:「快回到底部了还停一下才彻底收回」)。
+    // iv=松手速度(拖动关闭时带入,3.84.13)
     fun close(iv: Float = 0f) {
         if (closing) return
         closing = true
         scope.launch {
-            offsetY.animateTo(
-                screenHPx, spring(dampingRatio = 0.92f, stiffness = 300f),
-                initialVelocity = iv.coerceIn(-6000f, 6000f)
-            )
+            var finished = false
+            try {
+                offsetY.animateTo(
+                    screenHPx * 1.3f,
+                    spring(dampingRatio = 0.92f, stiffness = 300f),
+                    initialVelocity = iv.coerceIn(-6000f, 6000f)
+                ) {
+                    if (value >= screenHPx) cancelAnimation()
+                }
+                finished = true
+            } catch (e: CancellationException) {
+                finished = offsetY.value >= screenHPx
+            }
+            if (!finished) {
+                // 被新拖动打断:不算关闭,交还给手势
+                closing = false
+                return@launch
+            }
             st.visible = false
             onClose()
         }
