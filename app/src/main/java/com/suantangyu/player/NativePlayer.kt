@@ -1162,7 +1162,12 @@ fun NativePlayerRoot(
                 idx
             }
             if (lines.isEmpty()) {
-                Box(Modifier.fillMaxWidth().height(120.dp), contentAlignment = Alignment.Center) {
+                // 空态也要占满弹性区(3.84.26):此前是固定 120dp 盒、
+                // 整列没有 weight 元素,下方进度/时间/控制/工具整串
+                // 不贴底、被抬高约 110dp,歌词一到又掉回去(cheng
+                // 录屏实锤:暂无歌词时下面整串浮起)。与有词时同高,
+                // 位置恒定
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                     Text("暂无歌词", color = w50, fontSize = 14.sp)
                 }
             } else {
