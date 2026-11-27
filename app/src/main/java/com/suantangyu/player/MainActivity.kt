@@ -534,6 +534,15 @@ class MainActivity : AppCompatActivity() {
                     NativePlayerStore.hideSignal++
                     runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
                 },
+                onTool = { tool ->
+                    NativePlayerStore.hideSignal++
+                    runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
+                    playerPollHandler.postDelayed({
+                        runJsOnPage(
+                            "window.__aqPlayerCmd&&window.__aqPlayerCmd('tool:$tool')"
+                        )
+                    }, 750)
+                },
             )
         }
         addContentView(
@@ -658,6 +667,23 @@ class MainActivity : AppCompatActivity() {
                 val o = JSONObject(json)
                 NativePlayerStore.fav = o.optBoolean("fav")
                 NativePlayerStore.quality = o.optString("quality")
+                val npAcc = o.optString("npAccent")
+                if (npAcc.isNotEmpty()) {
+                    try {
+                        NativePlayerStore.npAccent =
+                            androidx.compose.ui.graphics.Color(
+                                android.graphics.Color.parseColor(npAcc)
+                            )
+                    } catch (_: Exception) {
+                    }
+                }
+                val ss = o.optString("seekStyle")
+                if (ss.isNotEmpty()) NativePlayerStore.seekStyle = ss
+                NativePlayerStore.storyOn = o.optBoolean("storyOn")
+                NativePlayerStore.commentOn = o.optBoolean("commentOn", true)
+                NativePlayerStore.dmOn = o.optBoolean("dmOn")
+                NativePlayerStore.ktvOn = o.optBoolean("ktvOn")
+                NativePlayerStore.transOn = o.optBoolean("transOn")
                 val arr = o.optJSONArray("lyrics")
                 val list = ArrayList<PlayerLine>()
                 if (arr != null) {
