@@ -71,6 +71,8 @@ import androidx.compose.ui.zIndex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.URL
@@ -289,6 +291,8 @@ fun NativeQueueRoot(
     val density = LocalDensity.current
     val sheetHState = remember { mutableStateOf(0) }
     val offsetY = remember { Animatable(10000f) }
+    // 遮罩透明度(3.84.17 对齐网页版 .sheet-mask:满 0.45、.36s 同曲线淡入淡出)
+    val maskAlpha = remember { Animatable(0f) }
     var closing by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
@@ -296,10 +300,19 @@ fun NativeQueueRoot(
         scope.launch {
             val h = sheetHState.value
             val frac = if (h > 0) (offsetY.value / h).coerceIn(0f, 1f) else 0f
-            val dur = (350 * frac).toInt().coerceIn(120, 350)
+            val dur = (450 * frac).toInt().coerceIn(120, 450)
+            launch {
+                maskAlpha.animateTo(
+                    0.45f,
+                    tween(
+                        durationMillis = (360 * frac).toInt().coerceIn(100, 360),
+                        easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+                    )
+                )
+            }
             try {
                 offsetY.animateTo(
-                    0f, tween(durationMillis = dur, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+                    0f, tween(durationMillis = dur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
                 )
             } catch (_: Exception) {
             }
@@ -311,12 +324,17 @@ fun NativeQueueRoot(
         closing = true
         scope.launch {
             val h = sheetHState.value
+            launch {
+                maskAlpha.animateTo(
+                    0f, tween(durationMillis = 360, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
+                )
+            }
             try {
                 val remaining = if (h > 0) ((h - offsetY.value) / h).coerceIn(0f, 1f) else 1f
-                val dur = (300 * remaining).toInt().coerceIn(120, 300)
+                val dur = (450 * remaining).toInt().coerceIn(120, 450)
                 offsetY.animateTo(
                     if (h > 0) h.toFloat() else 10000f,
-                    tween(durationMillis = dur, easing = CubicBezierEasing(0.3f, 0f, 0.8f, 0.15f))
+                    tween(durationMillis = dur, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
                 )
             } catch (_: Exception) {
             }
@@ -325,15 +343,25 @@ fun NativeQueueRoot(
         }
     }
 
-    // 打开:面板量到高度后先瞬移贴底,再补间滑入(与播放页同规格)
-    LaunchedEffect(sheetHState.value) {
-        val h = sheetHState.value
-        if (h > 0 && offsetY.value > h) {
-            offsetY.snapTo(h.toFloat())
-            offsetY.animateTo(
-                0f, tween(durationMillis = 350, easing = CubicBezierEasing(0.2f, 0f, 0f, 1f))
+    // 打开(3.84.17 修正):一次性等面板量到高度再滑入。3.84.16 用
+    // LaunchedEffect(sheetH) 触发,高度在首帧布局里多变、效应被反复
+    // 取消,动画死在半路(真机:点队列滑不出来)。改为等到量高出现
+    // (300ms 没量到按屏高兜底),只跑一次;参数对齐网页版 .sheet:
+    // 位移 .45s cubic-bezier(0.32,0.72,0,1),遮罩 .36s 同曲线
+    val screenPx = with(density) { LocalConfiguration.current.screenHeightDp.dp.toPx() }
+    LaunchedEffect(Unit) {
+        launch {
+            maskAlpha.animateTo(
+                0.45f, tween(durationMillis = 360, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
             )
         }
+        val h = withTimeoutOrNull(300) {
+            snapshotFlow { sheetHState.value }.first { it > 0 }
+        }
+        offsetY.snapTo((h ?: screenPx.toInt()).toFloat())
+        offsetY.animateTo(
+            0f, tween(durationMillis = 450, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f))
+        )
     }
     // hideSignal 跨开关累加:以本次合成值为基线(同播放页 3.82.2 教训)
     val openSignal = remember { store.hideSignal }
@@ -346,7 +374,11 @@ fun NativeQueueRoot(
             if (available.y < 0f && offsetY.value > 0f) {
                 val newOff = (offsetY.value + available.y).coerceAtLeast(0f)
                 val consumedY = newOff - offsetY.value
-                scope.launch { offsetY.snapTo(newOff) }
+                scope.launch {
+                    offsetY.snapTo(newOff)
+                    val h = sheetHState.value
+                    if (h > 0) maskAlpha.snapTo(0.45f * (1f - (newOff / h).coerceIn(0f, 1f)))
+                }
                 return Offset(0f, consumedY)
             }
             return Offset.Zero
@@ -362,7 +394,10 @@ fun NativeQueueRoot(
                 val newOff = (offsetY.value + available.y)
                     .coerceIn(0f, if (h > 0) h.toFloat() else Float.MAX_VALUE)
                 val consumedY = newOff - offsetY.value
-                scope.launch { offsetY.snapTo(newOff) }
+                scope.launch {
+                    offsetY.snapTo(newOff)
+                    if (h > 0) maskAlpha.snapTo(0.45f * (1f - (newOff / h).coerceIn(0f, 1f)))
+                }
                 return Offset(0f, consumedY)
             }
             return Offset.Zero
@@ -382,21 +417,16 @@ fun NativeQueueRoot(
         }
     }
 
-    val sheetH = sheetHState.value
-    val progress = if (sheetH > 0) {
-        (1f - (offsetY.value / sheetH).coerceIn(0f, 1f))
-    } else 0f
-
     Box(Modifier.fillMaxSize()) {
-        // 遮罩:随滑入淡入(满 0.32 黑,与 M3 同值),点击关闭
+        // 遮罩:独立补间淡入淡出(参数见上),点击关闭
         Box(
             Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.32f * progress))
+                .background(Color.Black.copy(alpha = maskAlpha.value))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
-                    enabled = sheetH > 0
+                    enabled = sheetHState.value > 0
                 ) { dismiss() }
         )
         val items = store.items
@@ -430,7 +460,11 @@ fun NativeQueueRoot(
                                 dragPos = (dragPos + dy)
                                     .coerceIn(0f, if (sheetHState.value > 0) sheetHState.value.toFloat() else Float.MAX_VALUE)
                                 tracker.addPosition(change.uptimeMillis, Offset(0f, dragPos))
-                                scope.launch { offsetY.snapTo(dragPos) }
+                                scope.launch {
+                                    offsetY.snapTo(dragPos)
+                                    val h = sheetHState.value
+                                    if (h > 0) maskAlpha.snapTo(0.45f * (1f - (dragPos / h).coerceIn(0f, 1f)))
+                                }
                             },
                             onDragEnd = {
                                 val v = tracker.calculateVelocity().y
