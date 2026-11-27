@@ -18,7 +18,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import org.json.JSONObject
-import android.widget.Toast
 import android.view.View
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -535,7 +534,6 @@ class MainActivity : AppCompatActivity() {
                     NativePlayerStore.hideSignal++
                     runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
                 },
-                onComposed = { dbgToast("P3 播放页已合成") }
             )
         }
         addContentView(
@@ -590,14 +588,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 3.82.1 临时诊断 toast（三点打点定位原生播放页弹不出，定位后删） */
-    fun dbgToast(msg: String) {
-        try {
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-        } catch (_: Exception) {
-        }
-    }
-
     /** 桥入口（BaoBridge.showNativePlayer 已切主线程） */
     fun showNativePlayer(dark: Boolean, accentHex: String) {
         playerLastDark = dark
@@ -621,13 +611,11 @@ class MainActivity : AppCompatActivity() {
             playerPollActive = true
             playerPollHandler.postDelayed(playerPollRunnable, 2000)
         }
-        dbgToast("P2 已置 visible")
         // 兜底：700ms 内播放页没合成出来（composeBeat 没跳），自动回落网页
         // 播放页，绝不让点迷你条变成没反应。3.82.1 起常驻。
         val beatBefore = NativePlayerStore.composeBeat
         uiHandler.postDelayed({
             if (NativePlayerStore.visible && NativePlayerStore.composeBeat == beatBefore) {
-                dbgToast("P3 缺席，回落网页播放页")
                 NativePlayerStore.visible = false
                 onNativePlayerHidden()
                 runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")

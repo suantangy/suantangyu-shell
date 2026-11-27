@@ -158,7 +158,11 @@ fun NativePlayerRoot(
             onClose()
         }
     }
-    LaunchedEffect(st.hideSignal) { if (st.hideSignal > 0) close() }
+    // hideSignal 跨开关持久累加:以本次合成时的值为基线,否则重开瞬间
+    // 旧信号会被 LaunchedEffect 重放、页面刚合成就自我关闭(3.82.0/3.82.1
+    // 「第一次能弹、后面弹不出」的真凶)
+    val openSignal = remember { st.hideSignal }
+    LaunchedEffect(st.hideSignal) { if (st.hideSignal > openSignal) close() }
     LaunchedEffect(Unit) {
         st.composeBeat++
         onComposed()
