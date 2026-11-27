@@ -17,7 +17,9 @@ package com.suantangyu.player
 import android.graphics.Bitmap
 import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -680,36 +682,31 @@ fun NativePlayerRoot(
     val screenHPx = with(density) { conf.screenHeightDp.dp.toPx() }
     val offsetY = remember { Animatable(screenHPx) }
     var closing by remember { mutableStateOf(false) }
-    // 关闭:弹簧目标设在屏外(1.3×屏高),offsetY 一到屏高就取消动画
-    // 并收页——页面全程带速出画。旧版目标就是屏高,弹簧(ζ0.92)在
-    // 最后一段渐近爬行:原始帧率录屏实测主滑行后还有约 0.25s 低速
+    // 关闭:定长补间,到点即结束——和网页版收回同一个机制(网页版
+    // 实测 3 帧加速出画、无尾巴)。旧版弹簧(ζ0.92、目标=屏高)在最
+    // 后一段渐近爬行:原始帧率录屏实测主滑行后还有约 0.25s 低速
     // 蠕动(帧间差 22→9.7→4.3→2.0→1.2 缓降),页面顶条在屏底慢慢
     // 蹭完最后一程(cheng:「快回到底部了还停一下才彻底收回」)。
-    // iv=松手速度(拖动关闭时带入,3.84.13)
+    // 时长按剩余距离等比(全程 300ms、下限 140ms);iv=松手速度
+    // (拖动甩关时缩短到 200ms 内,3.84.13)
     fun close(iv: Float = 0f) {
         if (closing) return
         closing = true
         scope.launch {
-            var finished = false
             try {
+                val frac = ((screenHPx - offsetY.value) / screenHPx).coerceIn(0f, 1f)
+                var dur = (300 * frac).toInt().coerceIn(140, 300)
+                if (iv >= 1500f) dur = minOf(dur, 200)
                 offsetY.animateTo(
-                    screenHPx * 1.3f,
-                    spring(dampingRatio = 0.92f, stiffness = 300f),
-                    initialVelocity = iv.coerceIn(-6000f, 6000f)
-                ) {
-                    if (value >= screenHPx) cancelAnimation()
-                }
-                finished = true
+                    screenHPx,
+                    tween(durationMillis = dur, easing = CubicBezierEasing(0.3f, 0f, 0.8f, 0.15f))
+                )
+                st.visible = false
+                onClose()
             } catch (e: CancellationException) {
-                finished = offsetY.value >= screenHPx
-            }
-            if (!finished) {
                 // 被新拖动打断:不算关闭,交还给手势
                 closing = false
-                return@launch
             }
-            st.visible = false
-            onClose()
         }
     }
     // hideSignal 跨开关持久累加:以本次合成时的值为基线,否则重开瞬间
