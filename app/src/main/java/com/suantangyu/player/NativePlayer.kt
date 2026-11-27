@@ -592,13 +592,16 @@ private fun composeLightBg(blur: Bitmap, pa: CoverPalette, w: Int, h: Int): Bitm
 }
 
 /** 整叠扩散(网页 ::after 的 backdrop-filter: blur(12px)):底+染色
- *  +图合成后还要再过一遍约 σ12 CSS px 的高斯扩散,颜色才「摊开」
+ *  +图合成后还要再过一遍约 σ50 CSS px 的高斯扩散,颜色才「摊开」
  *  而不是各层聚在自己的区域里(3.84.9 漏了这层,cheng 对照
  *  Got It 13 等多首指出网页版颜色扩散、App 版集聚)。这里用三遍
- *  可分离盒式模糊近似:半分辨率下半径 ≈ 宽×0.029(σ≈13),边缘钳制 */
+ *  可分离盒式模糊近似:半分辨率下半径 ≈ 宽×0.125(σ≈50),边缘钳制。
+ *  3.84.10 的 σ≈13 在真机剖面上没登记出变化(与 3.84.9 逐点相同);
+ *  Cherry Candy 对照剖面:网页版全宽缓坡、App 版高原+43 点陡降,
+ *  离线验算 σ≈50 可把陡降压到约 18、形状贴网页版,故 3.84.11 加到此档 */
 private fun stackBlur(src: Bitmap): Bitmap {
     val w = src.width; val h = src.height
-    val radius = maxOf(3, (w * 0.029f).roundToInt())
+    val radius = maxOf(3, (w * 0.125f).roundToInt())
     var cur = IntArray(w * h)
     src.getPixels(cur, 0, w, 0, 0, w, h)
     val tmp = IntArray(w * h)
