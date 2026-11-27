@@ -600,6 +600,7 @@ class MainActivity : AppCompatActivity() {
     /** 桥入口（BaoBridge.showNativePlayer 已切主线程） */
     fun showNativePlayer(dark: Boolean, accentHex: String) {
         playerLastDark = dark
+        NativePlayerStore.pageDark = dark
         playerLastAccent = accentHex
         try {
             NativePlayerStore.accent = androidx.compose.ui.graphics.Color(

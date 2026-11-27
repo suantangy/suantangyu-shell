@@ -1,4 +1,7 @@
-// NativePlayer.kt — 逐面原生化二期:播放页全复刻(3.84.0)。
+// NativePlayer.kt — 逐面原生化二期:播放页全复刻(3.84.0;3.84.1 按
+// cheng 截图对照批次对齐:工具格 (100%-6)/5.28、图标 24/描边 2.15/
+// 透明色、卡圆角 18、背景换网页原图模糊、整列按网页间距重排、
+// 控制键 56/40 分大小号)。
 // 氛围底+明暗自适应(网页取色算法)+标题/歌手+原封面+译+整行歌词+
 // 歌曲故事/喜欢/评论+四种进度样式(orbit 星轨/heart 心跳波/bar/glow,
 // 跟随网页 aq_np_seek)+模式/上下首/播放/队列+工具卡全套(倍速/定时
@@ -24,6 +27,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -56,6 +64,8 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.graphicsLayer
@@ -104,6 +114,7 @@ object NativePlayerStore {
     var anchorAtMs by mutableStateOf(0L)
     var durMs by mutableStateOf(0L)
     var sleepLabel by mutableStateOf("定时")
+    var pageDark by mutableStateOf(false)
     var npAccent by mutableStateOf(Color(0xFFB83A4E))
     var seekStyle by mutableStateOf("orbit")
     var storyOn by mutableStateOf(false)
@@ -304,17 +315,17 @@ private fun SeekVisual(
 @Composable
 private fun ToolItem(
     kind: String, label: String, fg: Color, onColor: Color,
-    on: Boolean, onClick: () -> Unit
+    on: Boolean, cellW: Dp, onClick: () -> Unit
 ) {
     val tint = if (on) onColor else fg
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.width(52.dp)
+        modifier = Modifier.width(cellW)
             .clip(RoundedCornerShape(12.dp))
             .clickable { onClick() }
             .padding(vertical = 5.dp)
     ) {
-        if (kind == "sleep") SvgIcon(P_MOON, 22.dp, tint) else ToolIcon(kind, tint)
+        if (kind == "sleep") SvgIcon(P_MOON, 24.dp, tint) else ToolIcon(kind, tint)
         Spacer(Modifier.height(3.dp))
         Text(label, color = tint, fontSize = 11.sp, maxLines = 1)
     }
@@ -323,9 +334,9 @@ private fun ToolItem(
 // 工具卡图标:照网页版 SVG 的描边画法(24 网格、圆头描边)
 @Composable
 private fun ToolIcon(kind: String, color: Color) {
-    Canvas(Modifier.size(22.dp)) {
+    Canvas(Modifier.size(24.dp)) {
         val sc = size.width / 24f
-        val sw = 1.9.dp.toPx()
+        val sw = 2.15.dp.toPx()
         val stroke = Stroke(width = sw, cap = StrokeCap.Round, join = StrokeJoin.Round)
         fun pt(x: Float, y: Float) = Offset(x * sc, y * sc)
         fun line(x1: Float, y1: Float, x2: Float, y2: Float) =
@@ -610,36 +621,54 @@ fun NativePlayerRoot(
             .offset { IntOffset(0, offsetY.value.roundToInt()) }
             .background(if (darkUi) Color(0xFFF4F1EC) else Color(0xFF101013))
     ) {
-        // 氛围底:封面低清图放大铺满(天然模糊)+暗罩,与网页 np-bg 同思路
-        val blurBmp = CoverBitmap(st.cover, tiny = true)
+        // 氛围底(网页 .np-bg 同款):原图封面 145% 铺放 + 强模糊 +
+        // saturate 1.25/brightness 1.12 + opacity 0.5,上罩白
+        // (页面浅主题 0.45/深主题 0.32,同 CSS ::after)
+        val blurBmp = CoverBitmap(st.cover, blurred = true)
         if (blurBmp != null) {
-            Image(
-                blurBmp.asImageBitmap(), null,
-                Modifier.fillMaxSize(), contentScale = ContentScale.Crop
-            )
+            val bgMatrix = remember {
+                ColorMatrix().apply {
+                    setToSaturation(1.25f)
+                    this[0, 0] = this[0, 0] * 1.12f
+                    this[1, 1] = this[1, 1] * 1.12f
+                    this[2, 2] = this[2, 2] * 1.12f
+                }
+            }
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Image(
+                    blurBmp.asImageBitmap(), null,
+                    Modifier.fillMaxSize(1.45f),
+                    contentScale = ContentScale.Crop,
+                    alpha = 0.5f,
+                    colorFilter = ColorFilter.colorMatrix(bgMatrix)
+                )
+            }
         }
         Box(
             Modifier.fillMaxSize().background(
-                if (darkUi) Color.White.copy(alpha = 0.45f) else Color.Black.copy(alpha = 0.38f)
+                Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.45f)
             )
         )
 
-        Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
-            Spacer(Modifier.height(26.dp))
-            // 抓手
+        val safeTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+        val safeBot = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+        Column(Modifier.fillMaxSize()) {
+            // 抓手(网页 .np-grab:margin-top = 10px + 安全区,36x5)
+            Spacer(Modifier.height(safeTop + 10.dp))
             Box(
-                Modifier.fillMaxWidth().then(dragMod).padding(vertical = 6.dp),
+                Modifier.fillMaxWidth().then(dragMod),
                 contentAlignment = Alignment.Center
             ) {
                 Box(
-                    Modifier.size(width = 38.dp, height = 5.dp)
+                    Modifier.size(width = 36.dp, height = 5.dp)
                         .clip(RoundedCornerShape(3.dp))
                         .background(wht.copy(alpha = 0.28f))
                 )
             }
-            // 信息区(可拖关闭)
+            // 信息区(网页 .np-info:padding 8/28/4;可拖关闭)
             Column(
-                Modifier.fillMaxWidth().then(dragMod),
+                Modifier.fillMaxWidth().then(dragMod)
+                    .padding(start = 28.dp, end = 28.dp, top = 8.dp, bottom = 4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
@@ -654,10 +683,15 @@ fun NativePlayerRoot(
                     modifier = Modifier.padding(top = 4.dp)
                 )
             }
-            Spacer(Modifier.height(16.dp))
-            // 封面(原封面;72vw 上限 320dp、圆角 16——与网页 .np-art 一致;可拖关闭)
+            // 封面(网页 .np-art-wrap:margin-top 10、padding 8/36/12、
+            // margin-bottom 4;.np-art = min(72vw, 320px)、圆角 16;可拖关闭)
+            Spacer(Modifier.height(10.dp))
             val artSize = minOf(conf.screenWidthDp * 0.72f, 320f).dp
-            Box(Modifier.fillMaxWidth().then(dragMod), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier.fillMaxWidth().then(dragMod)
+                    .padding(start = 36.dp, end = 36.dp, top = 8.dp, bottom = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
                 val bmp = CoverBitmap(st.cover)
                 Box(
                     Modifier.size(artSize)
@@ -673,7 +707,7 @@ fun NativePlayerRoot(
                     }
                 }
             }
-            Spacer(Modifier.height(14.dp))
+            Spacer(Modifier.height(4.dp))
             // 歌词(整行;点行 seek;自动跟当前行,手动滚动后 3 秒内不抢)
             val lines = st.lyrics
             val curIdx = remember(shownPos, lines) {
@@ -704,7 +738,10 @@ fun NativePlayerRoot(
                     }
                 }
                 // 译(与网页版同位:歌词区上方、右对齐;开时用主题色)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+                    horizontalArrangement = Arrangement.End
+                ) {
                     Text(
                         "译",
                         color = if (st.transOn) accent else w70,
@@ -749,7 +786,7 @@ fun NativePlayerRoot(
             Spacer(Modifier.height(6.dp))
             // 歌曲故事(左)/喜欢+评论(右):进度条上方一行,与网页版同位同款
             Row(
-                Modifier.fillMaxWidth(),
+                Modifier.fillMaxWidth().padding(horizontal = 24.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (st.storyOn) {
@@ -788,8 +825,9 @@ fun NativePlayerRoot(
                 "heart" -> 36.dp
                 else -> 28.dp
             }
+            Spacer(Modifier.height(8.dp))
             Box(
-                Modifier.fillMaxWidth().height(seekH)
+                Modifier.fillMaxWidth().padding(horizontal = 24.dp).height(seekH)
                     .pointerInput(dur) {
                         fun fracOf(x: Float) = (x / size.width).coerceIn(0f, 1f)
                         detectDragGestures(
@@ -811,112 +849,119 @@ fun NativePlayerRoot(
                     darkUi, st.npAccent, wht
                 )
             }
-            Row(Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
                 Text(fmtTime(shownPos), color = w55, fontSize = 11.sp)
                 Spacer(Modifier.weight(1f))
                 Text(fmtTime(st.durMs), color = w55, fontSize = 11.sp)
             }
-            Spacer(Modifier.height(10.dp))
-            // 控制行
+            // 控制行(网页 .np-controls:padding 8/18/10、gap 26)
+            Spacer(Modifier.height(8.dp))
             Row(
-                Modifier.fillMaxWidth(),
+                Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 10.dp),
                 horizontalArrangement = Arrangement.spacedBy(26.dp, Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                val sideTint = wht.copy(alpha = 0.88f)
                 Box(
-                    Modifier.size(46.dp).clip(CircleShape).clickable { onMode() },
+                    Modifier.size(40.dp).clip(CircleShape).clickable { onMode() },
                     contentAlignment = Alignment.Center
                 ) {
                     when (st.mode) {
-                        "shuffle" -> SvgIcon(P_SHUFFLE, 25.dp, wht)
+                        "shuffle" -> SvgIcon(P_SHUFFLE, 22.dp, sideTint)
                         "single" -> Box(contentAlignment = Alignment.Center) {
-                            SvgIcon(P_REPEAT, 25.dp, wht)
+                            SvgIcon(P_REPEAT, 22.dp, sideTint)
                             Text(
-                                "1", color = wht, fontSize = 9.sp,
+                                "1", color = sideTint, fontSize = 8.sp,
                                 fontWeight = FontWeight.Bold,
                                 modifier = Modifier.offset(y = 1.dp)
                             )
                         }
-                        else -> SvgIcon(P_REPEAT, 25.dp, wht)
+                        else -> SvgIcon(P_REPEAT, 22.dp, sideTint)
                     }
                 }
                 Box(
-                    Modifier.size(52.dp).clip(CircleShape).clickable { onPrev() },
+                    Modifier.size(56.dp).clip(CircleShape).clickable { onPrev() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(P_PREV, 32.dp, wht) }
+                ) { SvgIcon(P_PREV, 36.dp, wht) }
                 Box(
-                    Modifier.size(68.dp).clip(CircleShape).clickable { onToggle() },
+                    Modifier.size(56.dp).clip(CircleShape).clickable { onToggle() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 38.dp, wht) }
+                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 34.dp, wht) }
                 Box(
-                    Modifier.size(52.dp).clip(CircleShape).clickable { onNext() },
+                    Modifier.size(56.dp).clip(CircleShape).clickable { onNext() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(P_NEXT, 32.dp, wht) }
+                ) { SvgIcon(P_NEXT, 36.dp, wht) }
                 Box(
-                    Modifier.size(46.dp).clip(CircleShape).clickable { onQueue() },
+                    Modifier.size(40.dp).clip(CircleShape).clickable { onQueue() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(P_LIST, 25.dp, wht) }
+                ) { SvgIcon(P_LIST, 22.dp, sideTint) }
             }
-            Spacer(Modifier.height(14.dp))
-            Spacer(Modifier.height(12.dp))
-            // 工具卡(与网页版全套一致:倍速/音质/定时/海报/漫游/弹幕/音效/
-            // 封面/跟唱/切源,末尾加壳专属的网页版入口;倍速/定时原生直改,
-            // 其余切到网页播放页打开对应面板/功能)
-            val toolFg = if (darkUi) Color(0xFF1C1C1E) else Color.White
+            // 工具卡(网页 .np-tools 同款:margin 4/18/(18+安全区)、圆角 18、
+            // padding 6;每格宽 = (卡内宽 - 6) / 5.28,一屏正好露 5.28 个;
+            // 倍速/定时原生直改,其余经 onTool 切网页播放页执行)
+            Spacer(Modifier.height(4.dp))
+            val toolFg = if (darkUi) {
+                Color(0xFF1C1C1E).copy(alpha = 0.72f)
+            } else {
+                Color.White.copy(alpha = 0.78f)
+            }
             val rateText = if (st.rate == st.rate.toLong().toFloat()) {
                 "${st.rate.toLong()}.0x"
             } else "${st.rate}x"
-            Row(
-                Modifier.fillMaxWidth()
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(
-                        if (darkUi) Color.White.copy(alpha = 0.55f)
-                        else Color(0xFF1C1C1E).copy(alpha = 0.55f)
-                    )
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = 4.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                ToolItem("speed", rateText, toolFg, accent, false) {
-                    val steps = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
-                    val cur = steps.minByOrNull { kotlin.math.abs(it - st.rate) } ?: 1f
-                    onRate(steps[(steps.indexOf(cur) + 1) % steps.size])
-                }
-                ToolItem("quality", "音质", toolFg, accent, false) { onTool("quality") }
-                ToolItem("sleep", st.sleepLabel, toolFg, accent, false) {
-                    val opts = listOf(
-                        Triple(0, false, "定时"),
-                        Triple(15, false, "15分"),
-                        Triple(30, false, "30分"),
-                        Triple(60, false, "60分"),
-                        Triple(0, true, "本首后")
-                    )
-                    val idx = opts.indexOfFirst { it.third == st.sleepLabel }
-                    val next = opts[(idx + 1) % opts.size]
-                    onSleep(next.first, next.second, next.third)
-                }
-                ToolItem("poster", "海报", toolFg, accent, false) { onTool("poster") }
-                ToolItem("roam", "漫游", toolFg, accent, false) { onTool("roam") }
-                ToolItem("danmaku", "弹幕", toolFg, accent, st.dmOn) { onTool("danmaku") }
-                ToolItem("eq", "音效", toolFg, accent, false) { onTool("eq") }
-                ToolItem("cover", "封面", toolFg, accent, false) { onTool("cover") }
-                ToolItem("ktv", "跟唱", toolFg, accent, st.ktvOn) { onTool("ktv") }
-                ToolItem("more", "切源", toolFg, accent, false) { onTool("more") }
-                // 壳专属:回网页播放页(网页版工具卡无此项,原生需要这个出口)
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.width(52.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .clickable { onOpenWeb() }
-                        .padding(vertical = 5.dp)
+            BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 18.dp)) {
+                val cellW = (maxWidth - 12.dp - 6.dp) / 5.28f
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(
+                            if (darkUi) Color.White.copy(alpha = 0.55f)
+                            else Color(0xFF1C1C1E).copy(alpha = 0.55f)
+                        )
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 6.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    SvgIcon(P_GRID, 22.dp, toolFg)
-                    Spacer(Modifier.height(3.dp))
-                    Text("网页版", color = toolFg, fontSize = 11.sp, maxLines = 1)
+                    ToolItem("speed", rateText, toolFg, accent, false, cellW) {
+                        val steps = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+                        val cur = steps.minByOrNull { kotlin.math.abs(it - st.rate) } ?: 1f
+                        onRate(steps[(steps.indexOf(cur) + 1) % steps.size])
+                    }
+                    ToolItem("quality", "音质", toolFg, accent, false, cellW) { onTool("quality") }
+                    ToolItem("sleep", st.sleepLabel, toolFg, accent, false, cellW) {
+                        val opts = listOf(
+                            Triple(0, false, "定时"),
+                            Triple(15, false, "15分"),
+                            Triple(30, false, "30分"),
+                            Triple(60, false, "60分"),
+                            Triple(0, true, "本首后")
+                        )
+                        val idx = opts.indexOfFirst { it.third == st.sleepLabel }
+                        val next = opts[(idx + 1) % opts.size]
+                        onSleep(next.first, next.second, next.third)
+                    }
+                    ToolItem("poster", "海报", toolFg, accent, false, cellW) { onTool("poster") }
+                    ToolItem("roam", "漫游", toolFg, accent, false, cellW) { onTool("roam") }
+                    ToolItem("danmaku", "弹幕", toolFg, accent, st.dmOn, cellW) { onTool("danmaku") }
+                    ToolItem("eq", "音效", toolFg, accent, false, cellW) { onTool("eq") }
+                    ToolItem("cover", "封面", toolFg, accent, false, cellW) { onTool("cover") }
+                    ToolItem("ktv", "跟唱", toolFg, accent, st.ktvOn, cellW) { onTool("ktv") }
+                    ToolItem("more", "切源", toolFg, accent, false, cellW) { onTool("more") }
+                    // 壳专属:回网页播放页(网页版工具卡无此项,原生需要这个出口)
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.width(cellW)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { onOpenWeb() }
+                            .padding(vertical = 5.dp)
+                    ) {
+                        SvgIcon(P_GRID, 24.dp, toolFg)
+                        Spacer(Modifier.height(3.dp))
+                        Text("网页版", color = toolFg, fontSize = 11.sp, maxLines = 1)
+                    }
                 }
             }
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(18.dp + safeBot))
+
 
         }
     }

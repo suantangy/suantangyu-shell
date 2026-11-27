@@ -122,16 +122,43 @@ object CoverCache {
         cache.put(key, tiny)
         return tiny
     }
+
+    /** 强模糊版(网页 .np-bg 同款做法):原图先缩到宽 72px、再放大回
+     *  原尺寸,糊度约等于 CSS blur(56px);键加 |blur 后缀独立缓存 */
+    suspend fun loadBlurred(url: String): Bitmap? {
+        if (url.isEmpty() || !url.startsWith("http")) return null
+        val key = "$url|blur"
+        cache.get(key)?.let { return it }
+        val full = load(url) ?: return null
+        val blurred = try {
+            val tw = 72
+            val th = maxOf(1, full.height * tw / full.width)
+            val small = Bitmap.createScaledBitmap(full, tw, th, true)
+            Bitmap.createScaledBitmap(small, full.width, full.height, true)
+        } catch (_: Exception) {
+            full
+        }
+        cache.put(key, blurred)
+        return blurred
+    }
 }
 
-/** 封面 Bitmap 助手(队列/播放页共用;tiny=true 取低清版当模糊底) */
+/** 封面 Bitmap 助手(队列/播放页共用;tiny=低清版,blurred=强模糊版) */
 @Composable
-fun CoverBitmap(url: String, tiny: Boolean = false): Bitmap? {
-    val key = if (tiny) "$url|tiny" else url
+fun CoverBitmap(url: String, tiny: Boolean = false, blurred: Boolean = false): Bitmap? {
+    val key = when {
+        blurred -> "$url|blur"
+        tiny -> "$url|tiny"
+        else -> url
+    }
     var bmp by remember(key) { mutableStateOf(CoverCache.get(key)) }
     LaunchedEffect(key) {
         if (bmp == null && url.isNotEmpty()) {
-            bmp = if (tiny) CoverCache.loadTiny(url) else CoverCache.load(url)
+            bmp = when {
+                blurred -> CoverCache.loadBlurred(url)
+                tiny -> CoverCache.loadTiny(url)
+                else -> CoverCache.load(url)
+            }
         }
     }
     return bmp
