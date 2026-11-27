@@ -425,7 +425,8 @@ private fun fmtTime(ms: Long): String {
 
 // ================= 封面取色(网页版同算法) =================
 // 48x48 采样:滤太黑/太白/近灰,16 级量化桶取众数色,再按鲜艳色加权混合;
-// lum = 0.65*lum(主色) + 0.35*lum(鲜艳色),经典模式 lum>88 → 深字浅底
+// 明暗判定(网页 syncNpUiContrast):lum = 0.65*lum(c1) + 0.35*lum(c2),
+// c1/c2 是提亮后的氛围色对(未过 sat14),lum>88 → 深字浅底
 private class CoverPalette(
     val darkUi: Boolean, val lyOn: Color, val c1: Color, val c2: Color
 )
@@ -492,9 +493,16 @@ private fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
         val base = Color(
             fr.toInt().coerceIn(0, 255), fg2.toInt().coerceIn(0, 255), fb.toInt().coerceIn(0, 255)
         )
-        val lumBase = 0.299 * fr + 0.587 * fg2 + 0.114 * fb
-        val lumVivid = if (vividScore >= 0) 0.299 * vividR + 0.587 * vividG + 0.114 * vividB else lumBase
-        val lum = lumBase * 0.65 + lumVivid * 0.35
+        // 明暗判定必须用提亮后的 c1/c2(网页 syncNpUiContrast 同口径,
+        // c1/c2 取未过 sat14 的原对):早先用原始主色/鲜艳色判,落日类
+        // 封面被误判成深底白字(3.84.7 真机与网页版对照实锤)
+        fun punchRaw(v: Double, lift: Double) = minOf(255.0, v * 0.85 + lift)
+        val pc1r = punchRaw(fr, 70.0); val pc1g = punchRaw(fg2, 40.0); val pc1b = punchRaw(fb, 50.0)
+        val pc2r = minOf(255.0, fr * 0.5 + 120)
+        val pc2g = minOf(255.0, fg2 * 0.5 + 110)
+        val pc2b = minOf(255.0, fb * 0.5 + 120)
+        val lum = (0.299 * pc1r + 0.587 * pc1g + 0.114 * pc1b) * 0.65 +
+            (0.299 * pc2r + 0.587 * pc2g + 0.114 * pc2b) * 0.35
         val darkUi = lum > 88
         val lyOn = if (darkUi) mixColor(base, Color.Black, 0.42f) else mixColor(base, Color.White, 0.12f)
         // 网页 rgbToAmbientPair 经典分支:punch 提亮得 c1、半量提亮得 c2;
