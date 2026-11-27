@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -11,8 +12,8 @@ android {
         applicationId = "com.suantangyu.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 121
-        versionName = "3.79.0"
+        versionCode = 122
+        versionName = "3.80.0"
     }
 
     // 固定签名：工作流把 Secrets 里的固定 keystore 还原成 app/debug.keystore 时，debug 构建就用它签，
@@ -32,6 +33,8 @@ android {
     // BaoBridge.getShellVersion() 用 BuildConfig.VERSION_NAME，AGP 8 默认不生成 BuildConfig，必须显式打开
     buildFeatures {
         buildConfig = true
+        // 3.80.0：原生队列试点引入 Compose
+        compose = true
     }
 
     buildTypes {
@@ -63,4 +66,12 @@ dependencies {
     implementation("org.chromium.net:cronet-embedded:119.6045.31")
     // 3.3.0 原生解析：QuickJS 引擎（LX 音源脚本在服务内运行，不依赖 WebView）
     implementation("wang.harlon.quickjs:wrapper-android:3.2.3")
+    // 3.80.0：Compose（原生队列 sheet；BOM 与 Kotlin 2.0.20 对齐）
+    implementation(platform("androidx.compose:compose-bom:2024.10.00"))
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.runtime:runtime")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }

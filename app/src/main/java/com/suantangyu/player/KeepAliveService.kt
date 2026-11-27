@@ -53,6 +53,10 @@ import java.net.URL
 class KeepAliveService : Service() {
 
     companion object {
+        /** 3.80.0：原生队列要直接读脑状态，给活动一个服务实例入口 */
+        @Volatile
+        var instance: KeepAliveService? = null
+
         const val CHANNEL_ID = "bao_playback_v2"
         const val NOTIFY_ID = 1
         const val ACTION_UPDATE_TRACK = "com.suantangyu.player.UPDATE_TRACK"
@@ -2764,6 +2768,39 @@ class KeepAliveService : Service() {
     private fun pushSync(o: JSONObject) {
         val inst = MainActivity.instance ?: return
         inst.runJsOnPage("window.__baoSync && window.__baoSync(" + o.toString() + ")")
+        try { inst.onBrainSyncNotify() } catch (_: Exception) {}
+    }
+
+    /** 3.80.0：原生队列读脑快照（队列/当前键/模式/播放态）。封面字段序与网页 songCover 对齐 */
+    fun queueUiSnapshot(): JSONObject {
+        val arr = org.json.JSONArray()
+        val coverFields = arrayOf(
+            "cover", "pic", "albumPic", "album_pic", "picurl", "picUrl",
+            "albumpic", "hts_albumpic", "img", "image", "albumImg"
+        )
+        for (i in brainQueue.indices) {
+            val o = brainQueue[i]
+            var cover = ""
+            for (f in coverFields) {
+                val v = o.optString(f, "")
+                if (v.startsWith("http")) { cover = v; break }
+            }
+            arr.put(
+                JSONObject()
+                    .put("key", if (i < brainQueueKeys.size) brainQueueKeys[i] else "")
+                    .put("name", o.optString("name", "未知"))
+                    .put(
+                        "artist",
+                        o.optString("artist").ifEmpty { o.optString("singer", "—") }
+                    )
+                    .put("cover", cover)
+            )
+        }
+        return JSONObject()
+            .put("queue", arr)
+            .put("curKey", brainCurrentKey())
+            .put("mode", brainMode)
+            .put("playing", playing)
     }
 
     private fun pushSyncState() {
@@ -2844,6 +2881,7 @@ class KeepAliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         // 3.53.0：崩溃捕获——崩了先把堆栈同步写进引擎日志再死，
         // 下次熄屏退出一眼可定是崩了还是被杀（2026-11-14 实证：
         // 壳无崩溃记录，无法区分）。写日志失败也不掩盖崩溃。
@@ -2922,6 +2960,7 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        if (instance === this) instance = null
         releaseSessionLocks()
         cancelPendingAdvance()
         try {

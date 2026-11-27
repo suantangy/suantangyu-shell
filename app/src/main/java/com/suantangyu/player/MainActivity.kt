@@ -30,6 +30,8 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import androidx.activity.addCallback
+import androidx.compose.ui.platform.ComposeView
+import android.view.ViewGroup
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -281,6 +283,7 @@ class MainActivity : AppCompatActivity() {
         // 系统白连成一段，灰段、黑段都没有，页面带着内容一次到位。
         webView.setBackgroundColor(Color.WHITE)
         setContentView(webView)
+        setupNativeQueueView()
 
         with(webView.settings) {
             javaScriptEnabled = true
@@ -391,9 +394,11 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // 返回键：网页能后退就后退，否则退出
+        // 返回键：原生队列开着先收它；再网页能后退就后退，否则退出
         onBackPressedDispatcher.addCallback(this) {
-            if (webView.canGoBack()) webView.goBack() else finish()
+            if (NativeQueueStore.visible) {
+                NativeQueueStore.hideSignal++
+            } else if (webView.canGoBack()) webView.goBack() else finish()
         }
 
         if (savedInstanceState == null) {
@@ -494,5 +499,110 @@ class MainActivity : AppCompatActivity() {
         }
         instance = null
         super.onDestroy()
+    }
+
+    // ===== 3.80.0 原生队列（一期试点）=====
+    private var queueComposeView: ComposeView? = null
+
+    private fun setupNativeQueueView() {
+        val cv = ComposeView(this)
+        cv.visibility = View.GONE
+        cv.setContent {
+            NativeQueueRoot(
+                onPlay = { key -> nativeQueuePlay(key) },
+                onRemove = { key -> nativeQueueRemove(key) },
+                onMove = { key, to -> nativeQueueMove(key, to) },
+                onLoadMore = { nativeQueueEdit("loadmore", "", 0) },
+                onHidden = { queueComposeView?.visibility = View.GONE }
+            )
+        }
+        addContentView(
+            cv,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        queueComposeView = cv
+    }
+
+    /** 桥入口（BaoBridge.showNativeQueue 已切主线程） */
+    fun showNativeQueue(dark: Boolean, accentHex: String) {
+        NativeQueueStore.dark = dark
+        try {
+            NativeQueueStore.accent = androidx.compose.ui.graphics.Color(
+                android.graphics.Color.parseColor(accentHex)
+            )
+        } catch (_: Exception) {
+        }
+        NativeQueueStore.editMode = false
+        refreshNativeQueue()
+        queueComposeView?.visibility = View.VISIBLE
+        NativeQueueStore.visible = true
+    }
+
+    /** 脑状态推送时（KeepAliveService.pushSync）顺带刷新原生队列 */
+    fun onBrainSyncNotify() {
+        if (!NativeQueueStore.visible) return
+        runOnUiThread { refreshNativeQueue() }
+    }
+
+    private fun refreshNativeQueue() {
+        val snap = KeepAliveService.instance?.queueUiSnapshot() ?: return
+        try {
+            val arr = snap.optJSONArray("queue") ?: return
+            val list = ArrayList<QItem>(arr.length())
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                list.add(
+                    QItem(
+                        key = o.optString("key"),
+                        name = o.optString("name", "未知"),
+                        artist = o.optString("artist", "—"),
+                        cover = o.optString("cover")
+                    )
+                )
+            }
+            NativeQueueStore.items = list
+            NativeQueueStore.curKey = snap.optString("curKey")
+            NativeQueueStore.playing = snap.optBoolean("playing")
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun nativeQueuePlay(key: String) {
+        NativeQueueStore.curKey = key
+        val intent = Intent(this, KeepAliveService::class.java).apply {
+            action = KeepAliveService.ACTION_BRAIN_CMD
+            putExtra("cmd", "playkey")
+            putExtra("key", key)
+        }
+        startService(intent)
+        NativeQueueStore.hideSignal++
+    }
+
+    private fun nativeQueueRemove(key: String) {
+        NativeQueueStore.items = NativeQueueStore.items.filterNot { it.key == key }
+        nativeQueueEdit("remove", key, 0)
+    }
+
+    private fun nativeQueueMove(key: String, to: Int) {
+        val cur = NativeQueueStore.items
+        val from = cur.indexOfFirst { it.key == key }
+        if (from >= 0 && to in cur.indices && from != to) {
+            val m = cur.toMutableList()
+            val it = m.removeAt(from)
+            m.add(to, it)
+            NativeQueueStore.items = m
+        }
+        nativeQueueEdit("move", key, to)
+    }
+
+    /** 编辑命令回网页执行（队列的唯一编辑者仍是网页，它改完自会快照回脑） */
+    private fun nativeQueueEdit(action: String, key: String, arg: Int) {
+        val js = "window.__aqQueueEdit && window.__aqQueueEdit(" +
+            org.json.JSONObject.quote(action) + "," +
+            org.json.JSONObject.quote(key) + "," + arg + ")"
+        runJsOnPage(js)
     }
 }

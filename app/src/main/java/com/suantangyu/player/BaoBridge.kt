@@ -423,6 +423,16 @@ class BaoBridge(private val activity: MainActivity) {
         activity.startService(intent)
     }
 
+    /** 3.80.0 原生队列：网页问壳有没有（老壳无此法、网页自动走网页队列） */
+    @JavascriptInterface
+    fun hasNativeQueue(): Boolean = true
+
+    /** 3.80.0 原生队列：网页把当前深色/主题色递来，壳弹原生队列 sheet */
+    @JavascriptInterface
+    fun showNativeQueue(dark: Boolean, accent: String) {
+        activity.runOnUiThread { activity.showNativeQueue(dark, accent) }
+    }
+
     /** 壳原生下载（3.9.0）：网页把当场解析好的地址与歌曲信息递来，壳自己拉
      * 文件存盘——网页抓文件会被 CDN 跨域挡死（只剩名单），原生请求没有这道墙 */
     @JavascriptInterface
