@@ -939,10 +939,35 @@ fun NativePlayerRoot(
         offsetY.animateTo(0f, tween(durationMillis = 450, easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)))
     }
 
+    // 顶边羽化(3.84.27):上滑时播放页顶边与主页(近白 243)之间是
+    // 单像素硬分界,页面底约 165、对比 65-80,高速上扫再叠淡入
+    // 拉大对比,看着像一条线在闪(cheng 指认、录屏逐帧实锤:中间
+    // 帧分界行 y=239→154→47 一路单行台阶)。页面离位(offsetY>0)
+    // 时给整页加 DstIn 渐变罩:顶行透明度随离位量压低、28dp 处
+    // 恢复 1,硬边化开;到位(offsetY=0)渐变恒等、无残留。关闭与
+    // 下拉跟手时同理(离位即生效)
+    val featherPx = with(density) { 28.dp.toPx() }
     Box(
         Modifier
             .fillMaxSize()
             .offset { IntOffset(0, offsetY.value.roundToInt()) }
+            .then(
+                if (offsetY.value > 0.5f) {
+                    Modifier.drawWithContent {
+                        drawContent()
+                        val topA = 1f - (offsetY.value / featherPx).coerceIn(0f, 1f)
+                        drawRect(
+                            brush = Brush.verticalGradient(
+                                0f to Color.Black.copy(alpha = topA),
+                                1f to Color.Black,
+                                startY = 0f,
+                                endY = featherPx
+                            ),
+                            blendMode = BlendMode.DstIn
+                        )
+                    }
+                } else Modifier
+            )
             .alpha(pageAlpha.value)
             .background(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
     ) {
