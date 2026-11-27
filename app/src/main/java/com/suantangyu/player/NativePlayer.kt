@@ -789,7 +789,11 @@ fun NativePlayerRoot(
             val bw = constraints.maxWidth
             val bh = constraints.maxHeight
             val pa = palette
-            if (!darkUi && pa != null && blurBmp != null) {
+            // 3.84.9 起此处条件曾写反(!darkUi):浅底页(darkUi=true,
+            // 绝大多数歌)一直走下面的旧路径,composeLightBg 只在深底页
+            // 跑过——3.84.10/3.84.11 调的扩散对浅底页全程没生效,真机
+            // 剖面逐点不变就是这个原因。3.84.12 改回 darkUi。
+            if (darkUi && pa != null && blurBmp != null) {
                 val comp = remember(blurBmp, pa, bw, bh) {
                     composeLightBg(blurBmp, pa, bw, bh)
                 }
