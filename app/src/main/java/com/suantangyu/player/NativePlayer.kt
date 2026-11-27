@@ -688,7 +688,7 @@ fun NativePlayerRoot(
                             // 1.25×1.4=1.75 渲染出来到不了他截图的浓
                             // 度,拟合总饱和约 1.4
                             setToSaturation(if (darkUi) 1.4f else 1.45f)
-                            val b = if (darkUi) 1.12f else 0.7f
+                            val b = if (darkUi) 1.16f else 0.7f
                             for (r in 0..2) {
                                 for (c in 0..2) {
                                     this[r, c] = this[r, c] * b
@@ -710,10 +710,11 @@ fun NativePlayerRoot(
             Box(
                 Modifier.fillMaxSize().background(
                     if (darkUi) {
-                        // 罩 .35/图 .9 是对着 cheng 网页版截图 39 点
-                        // 拟合的结果(均差约 9.5):CSS 名义值(图 .5/
-                        // 罩 .45)在他机上渲染出来明显更淡,以实测为准
-                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.35f)
+                        // 罩 .48:离线拟合(图 .9/罩 .35)落到真机后
+                        // 边缘纯背景条实测整体偏暗约 (20,11,10)——
+                        // 拟合与真机渲染有系统差,按真机条带数据把
+                        // 罩提回 .48、图亮度 1.12→1.16 补齐
+                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.48f)
                     } else {
                         Color.Black.copy(alpha = 0.35f)
                     }
