@@ -48,8 +48,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.input.pointer.pointerInput
@@ -113,12 +120,19 @@ private const val P_GRID = "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z"
 
 @Composable
 private fun SvgIcon(pathData: String, size: Dp, color: Color, modifier: Modifier = Modifier) {
-    val path: Path = remember(pathData) { PathParser().parsePathString(pathData).toPath() }
-    Canvas(modifier.size(size)) {
-        val s = this.size.minDimension / 24f
-        drawContext.transform.scale(s, s)
-        drawPath(path, color)
+    // 缩放必须预先烘进路径坐标:drawContext.transform.scale 的支点是画布
+    // 中心,24 单位的小路径会被整体推出画布外——3.82.0/3.82.1 真机所有
+    // 图标 invisible 的真凶(文字/图片/色块不走这条路,故只有图标全灭)
+    val density = LocalDensity.current
+    val px = with(density) { size.toPx() }
+    val path: Path = remember(pathData, px) {
+        val p = PathParser().parsePathString(pathData).toPath()
+        val m = Matrix()
+        m.scale(px / 24f, px / 24f)
+        p.transform(m)
+        p
     }
+    Canvas(modifier.size(size)) { drawPath(path, color) }
 }
 
 private fun fmtTime(ms: Long): String {
@@ -229,28 +243,25 @@ fun NativePlayerRoot(
                 Box(
                     Modifier.size(width = 38.dp, height = 5.dp)
                         .clip(RoundedCornerShape(3.dp))
-                        .background(Color.White.copy(alpha = 0.35f))
+                        .background(Color.White.copy(alpha = 0.25f))
                 )
             }
             // 信息区(可拖关闭)
-            Column(Modifier.then(dragMod)) {
+            Column(
+                Modifier.fillMaxWidth().then(dragMod),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
                 Text(
                     st.title.ifEmpty { "—" }, color = wht, fontSize = 22.sp,
                     fontWeight = FontWeight.Bold, maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center
                 )
                 Text(
                     st.artist, color = w70, fontSize = 16.sp,
                     fontWeight = FontWeight.Medium, maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
                     modifier = Modifier.padding(top = 4.dp)
                 )
-                if (st.quality.isNotEmpty()) {
-                    Text(
-                        "音质 ${st.quality}", color = w50, fontSize = 12.sp,
-                        modifier = Modifier.padding(top = 3.dp)
-                    )
-                }
             }
             Spacer(Modifier.height(16.dp))
             // 封面(原封面;72vw 上限 320dp、圆角 16——与网页 .np-art 一致;可拖关闭)
@@ -259,7 +270,7 @@ fun NativePlayerRoot(
                 val bmp = CoverBitmap(st.cover)
                 Box(
                     Modifier.size(artSize)
-                        .shadow(18.dp, RoundedCornerShape(16.dp))
+                        .shadow(28.dp, RoundedCornerShape(16.dp))
                         .clip(RoundedCornerShape(16.dp))
                         .background(Color(0xFF2A2A2E))
                 ) {
@@ -303,7 +314,18 @@ fun NativePlayerRoot(
                 }
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxWidth().height(150.dp)
+                    modifier = Modifier.fillMaxWidth().height(168.dp)
+                        .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                        .drawWithContent {
+                            drawContent()
+                            drawRect(
+                                brush = Brush.verticalGradient(
+                                    0f to Color.Transparent, 0.14f to Color.Black,
+                                    0.86f to Color.Black, 1f to Color.Transparent
+                                ),
+                                blendMode = BlendMode.DstIn
+                            )
+                        }
                 ) {
                     itemsIndexed(lines, key = { i, l -> "$i|${l.t}" }) { i, line ->
                         val on = i == curIdx
@@ -382,7 +404,7 @@ fun NativePlayerRoot(
             // 控制行
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
+                horizontalArrangement = Arrangement.spacedBy(26.dp, Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
@@ -409,7 +431,7 @@ fun NativePlayerRoot(
                 Box(
                     Modifier.size(68.dp).clip(CircleShape).clickable { onToggle() },
                     contentAlignment = Alignment.Center
-                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 46.dp, wht) }
+                ) { SvgIcon(if (st.playing) P_PAUSE else P_PLAY, 42.dp, wht) }
                 Box(
                     Modifier.size(52.dp).clip(CircleShape).clickable { onNext() },
                     contentAlignment = Alignment.Center
