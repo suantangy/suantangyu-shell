@@ -588,6 +588,66 @@ private fun composeLightBg(blur: Bitmap, pa: CoverPalette, w: Int, h: Int): Bitm
         isFilterBitmap = true
     }
     cv.drawBitmap(blur, null, android.graphics.Rect(0, 0, W, H), ip)
+    return stackBlur(out)
+}
+
+/** 整叠扩散(网页 ::after 的 backdrop-filter: blur(12px)):底+染色
+ *  +图合成后还要再过一遍约 σ12 CSS px 的高斯扩散,颜色才「摊开」
+ *  而不是各层聚在自己的区域里(3.84.9 漏了这层,cheng 对照
+ *  Got It 13 等多首指出网页版颜色扩散、App 版集聚)。这里用三遍
+ *  可分离盒式模糊近似:半分辨率下半径 ≈ 宽×0.029(σ≈13),边缘钳制 */
+private fun stackBlur(src: Bitmap): Bitmap {
+    val w = src.width; val h = src.height
+    val radius = maxOf(3, (w * 0.029f).roundToInt())
+    var cur = IntArray(w * h)
+    src.getPixels(cur, 0, w, 0, 0, w, h)
+    val tmp = IntArray(w * h)
+    fun blurPassH(r: Int) {
+        for (y in 0 until h) {
+            var sr = 0L; var sg = 0L; var sb = 0L
+            val row = y * w
+            for (i in -r..r) {
+                val c = cur[row + i.coerceIn(0, w - 1)]
+                sr += (c shr 16) and 0xFF; sg += (c shr 8) and 0xFF; sb += c and 0xFF
+            }
+            val n = (2 * r + 1).toLong()
+            for (x in 0 until w) {
+                tmp[row + x] = android.graphics.Color.rgb(
+                    (sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt()
+                )
+                val co = cur[row + (x - r).coerceIn(0, w - 1)]
+                val ci = cur[row + (x + r + 1).coerceIn(0, w - 1)]
+                sr += ((ci shr 16) and 0xFF) - ((co shr 16) and 0xFF)
+                sg += ((ci shr 8) and 0xFF) - ((co shr 8) and 0xFF)
+                sb += (ci and 0xFF) - (co and 0xFF)
+            }
+        }
+        System.arraycopy(tmp, 0, cur, 0, cur.size)
+    }
+    fun blurPassV(r: Int) {
+        for (x in 0 until w) {
+            var sr = 0L; var sg = 0L; var sb = 0L
+            for (i in -r..r) {
+                val c = cur[i.coerceIn(0, h - 1) * w + x]
+                sr += (c shr 16) and 0xFF; sg += (c shr 8) and 0xFF; sb += c and 0xFF
+            }
+            val n = (2 * r + 1).toLong()
+            for (y in 0 until h) {
+                tmp[y * w + x] = android.graphics.Color.rgb(
+                    (sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt()
+                )
+                val co = cur[(y - r).coerceIn(0, h - 1) * w + x]
+                val ci = cur[(y + r + 1).coerceIn(0, h - 1) * w + x]
+                sr += ((ci shr 16) and 0xFF) - ((co shr 16) and 0xFF)
+                sg += ((ci shr 8) and 0xFF) - ((co shr 8) and 0xFF)
+                sb += (ci and 0xFF) - (co and 0xFF)
+            }
+        }
+        System.arraycopy(tmp, 0, cur, 0, cur.size)
+    }
+    repeat(3) { blurPassH(radius); blurPassV(radius) }
+    val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    out.setPixels(cur, 0, w, 0, 0, w, h)
     return out
 }
 
@@ -716,7 +776,8 @@ fun NativePlayerRoot(
         // 是封面 145% 居中 cover 铺放,屏幕只见封面中央窗,位置对
         // 位置;层序=底 #FAFAFC → c1/c2 径向染色(原始色 .28/.22)
         // → 图(中央窗强模糊、sat 1.25、亮 1.12、alpha .80)→
-        // 整叠 saturate(1.4)(::after 的 backdrop)→ 白罩 .35
+        // 整叠先过 ::after 的 backdrop blur(12px) 扩散、再
+        // saturate(1.4)(npBgSatPaint)→ 白罩 .35
         // (页面深主题 .32)。参数由 21 首网页版截图离线全栈模拟
         // 拟合(条带均差 8.2,旧栈真机约 14)。浅底走 composeLightBg
         // 离线合成 + npBgSatPaint 绘制;深底仍走旧路径
