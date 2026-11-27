@@ -526,14 +526,7 @@ class MainActivity : AppCompatActivity() {
                 onOpenWeb = {
                     NativePlayerStore.hideSignal++
                     runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
-                    NativeQueueRoot(
-                onPlay = { key -> nativeQueuePlay(key) },
-                onRemove = { key -> nativeQueueRemove(key) },
-                onMove = { key, to -> nativeQueueMove(key, to) },
-                onLoadMore = { nativeQueueEdit("loadmore", "", 0) },
-                onHidden = { syncNativeComposeVisibility() }
-            )
-        },
+                },
                 onTool = { tool ->
                     NativePlayerStore.hideSignal++
                     runJsOnPage("window.__aqOpenWebPlayer&&window.__aqOpenWebPlayer()")
@@ -543,6 +536,13 @@ class MainActivity : AppCompatActivity() {
                         )
                     }, 750)
                 },
+            )
+            NativeQueueRoot(
+                onPlay = { key -> nativeQueuePlay(key) },
+                onRemove = { key -> nativeQueueRemove(key) },
+                onMove = { key, to -> nativeQueueMove(key, to) },
+                onLoadMore = { nativeQueueEdit("loadmore", "", 0) },
+                onHidden = { syncNativeComposeVisibility() }
             )
         }
         addContentView(
