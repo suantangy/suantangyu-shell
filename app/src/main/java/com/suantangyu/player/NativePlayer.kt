@@ -426,7 +426,9 @@ private fun fmtTime(ms: Long): String {
 // ================= 封面取色(网页版同算法) =================
 // 48x48 采样:滤太黑/太白/近灰,16 级量化桶取众数色,再按鲜艳色加权混合;
 // lum = 0.65*lum(主色) + 0.35*lum(鲜艳色),经典模式 lum>88 → 深字浅底
-private class CoverPalette(val darkUi: Boolean, val lyOn: Color)
+private class CoverPalette(
+    val darkUi: Boolean, val lyOn: Color, val c1: Color, val c2: Color
+)
 
 private class PalBucket { var n = 0; var r = 0L; var g = 0L; var b = 0L; var sat = 0.0 }
 
@@ -495,7 +497,15 @@ private fun sampleCoverPalette(bmp: Bitmap): CoverPalette? {
         val lum = lumBase * 0.65 + lumVivid * 0.35
         val darkUi = lum > 88
         val lyOn = if (darkUi) mixColor(base, Color.Black, 0.42f) else mixColor(base, Color.White, 0.12f)
-        return CoverPalette(darkUi, lyOn)
+        // 网页 rgbToAmbientPair 经典分支:punch 提亮得 c1、半量提亮得 c2
+        fun punch(v: Double, lift: Double) = minOf(255.0, v * 0.85 + lift).toInt()
+        val c1 = Color(punch(fr, 70.0), punch(fg2, 40.0), punch(fb, 50.0))
+        val c2 = Color(
+            minOf(255.0, fr * 0.5 + 120).toInt(),
+            minOf(255.0, fg2 * 0.5 + 110).toInt(),
+            minOf(255.0, fb * 0.5 + 120).toInt()
+        )
+        return CoverPalette(darkUi, lyOn, c1, c2)
     } catch (e: Exception) {
         return null
     }
@@ -620,40 +630,84 @@ fun NativePlayerRoot(
         Modifier
             .fillMaxSize()
             .offset { IntOffset(0, offsetY.value.roundToInt()) }
-            .background(if (darkUi) Color(0xFFF4F1EC) else Color(0xFF101013))
+            .background(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
     ) {
-        // 氛围底(网页 .np-bg 同款):原图封面 145% 铺放 + 强模糊 +
-        // saturate 1.25/brightness 1.12 + opacity 0.5,上罩白
-        // (页面浅主题 0.45/深主题 0.32,同 CSS ::after)
+        // 氛围底(网页全栈复刻):底色 + c1/c2 两团径向染色 + 原图 145%
+        // 强模糊(参数按明暗两套),整层再 saturate 1.4(模拟 ::after 的
+        // backdrop saturate),最后罩色——浅底:白 .45(页面深主题 .32);
+        // 深底:黑 .35。3.84.1/3.84.2 只搬了图和罩、漏了染色与整层
+        // 饱和,所以底子发灰发白、跟网页对不上
         val blurBmp = CoverBitmap(st.cover, blurred = true)
-        if (blurBmp != null) {
-            val bgMatrix = remember {
-                ColorMatrix().apply {
-                    setToSaturation(1.25f)
-                    // brightness 1.12:每行 RGB 三系数同乘(只乘对角会
-                    // 破坏饱和矩阵的通道混合、画面发灰,3.84.1 的教训)
-                    for (r in 0..2) {
-                        for (c in 0..2) {
-                            this[r, c] = this[r, c] * 1.12f
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val bw = constraints.maxWidth.toFloat()
+            val bh = constraints.maxHeight.toFloat()
+            val satLayer = remember {
+                ColorMatrix().apply { setToSaturation(1.4f) }
+            }
+            Box(
+                Modifier.fillMaxSize().graphicsLayer {
+                    colorFilter = ColorFilter.colorMatrix(satLayer)
+                }
+            ) {
+                Canvas(Modifier.fillMaxSize()) {
+                    drawRect(if (darkUi) Color(0xFFFAFAFC) else Color.Black)
+                    val pa = palette
+                    if (pa != null) {
+                        drawRect(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    pa.c1.copy(alpha = if (darkUi) 0.28f else 0.36f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(bw * 0.5f, -bh * 0.10f),
+                                radius = bw * 0.66f
+                            )
+                        )
+                        drawRect(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    pa.c2.copy(alpha = if (darkUi) 0.22f else 0.23f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(bw, bh * 0.40f),
+                                radius = bw * 0.45f
+                            )
+                        )
+                    }
+                }
+                if (blurBmp != null) {
+                    val imgMatrix = remember(darkUi) {
+                        ColorMatrix().apply {
+                            setToSaturation(if (darkUi) 1.25f else 1.3f)
+                            val b = if (darkUi) 1.12f else 0.7f
+                            for (r in 0..2) {
+                                for (c in 0..2) {
+                                    this[r, c] = this[r, c] * b
+                                }
+                            }
                         }
+                    }
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Image(
+                            blurBmp.asImageBitmap(), null,
+                            Modifier.fillMaxSize(1.45f),
+                            contentScale = ContentScale.Crop,
+                            alpha = if (darkUi) 0.5f else 0.65f,
+                            colorFilter = ColorFilter.colorMatrix(imgMatrix)
+                        )
                     }
                 }
             }
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Image(
-                    blurBmp.asImageBitmap(), null,
-                    Modifier.fillMaxSize(1.45f),
-                    contentScale = ContentScale.Crop,
-                    alpha = 0.5f,
-                    colorFilter = ColorFilter.colorMatrix(bgMatrix)
+            Box(
+                Modifier.fillMaxSize().background(
+                    if (darkUi) {
+                        Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.45f)
+                    } else {
+                        Color.Black.copy(alpha = 0.35f)
+                    }
                 )
-            }
-        }
-        Box(
-            Modifier.fillMaxSize().background(
-                Color.White.copy(alpha = if (st.pageDark) 0.32f else 0.45f)
             )
-        )
+        }
 
         val safeTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
         val safeBot = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
