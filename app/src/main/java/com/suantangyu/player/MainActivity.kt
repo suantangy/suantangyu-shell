@@ -788,8 +788,46 @@ class MainActivity : AppCompatActivity() {
             NativeDockStore.anchorPosMs = o.optLong("pos")
             NativeDockStore.anchorAtMs = SystemClock.elapsedRealtime()
             NativeDockStore.durMs = o.optLong("dur")
+            // 3.85.19：Dock 的歌词（NativePlayerStore.lyrics）原先只有打开
+            // 播放页时才向网页要——不点开播放页，迷你歌词永远不来（cheng
+            // 报）。这里在每次脑同步时跟住当前歌：uiKey 一变就清掉上一首
+            // 的歌词/喜欢/音质（与 refreshNativePlayer 同款，lastPlayerUiKey
+            // 也在此跟住，onPlayerData 的 key 守卫才不会把新歌歌词误杀），
+            // 并向网页补要播放页数据；歌词还没到时，后续同步再单次补要
+            val uiKey = o.optString("uiKey")
+            if (uiKey.isNotEmpty() && uiKey != lastPlayerUiKey) {
+                lastPlayerUiKey = uiKey
+                NativePlayerStore.lyrics = emptyList()
+                NativePlayerStore.fav = false
+                NativePlayerStore.quality = ""
+                requestPlayerPushBurst()
+            } else if (uiKey.isNotEmpty() &&
+                NativePlayerStore.lyrics.isEmpty()
+            ) {
+                runJsOnPage("window.__aqPlayerPush&&window.__aqPlayerPush()")
+            }
         } catch (_: Exception) {
         }
+    }
+
+    // 3.85.19：切歌后向网页要播放页数据的连发——网页歌词是异步加载的
+    // （paintNow→loadLyrics），切歌瞬间要到的多半是空表，隔 1.8s 补要，
+    // 共 4 次覆盖约 5.4s；网页侧 __aqPlayerPush 有 sig 去重，不重复推
+    private var lyricPushLeft = 0
+    private val lyricPushRetry = object : Runnable {
+        override fun run() {
+            runJsOnPage("window.__aqPlayerPush&&window.__aqPlayerPush()")
+            if (lyricPushLeft > 0) {
+                lyricPushLeft--
+                playerPollHandler.postDelayed(this, 1800)
+            }
+        }
+    }
+
+    private fun requestPlayerPushBurst() {
+        playerPollHandler.removeCallbacks(lyricPushRetry)
+        lyricPushLeft = 3
+        lyricPushRetry.run()
     }
 
     // —— 3.85.1 真毛玻璃：截 Dock 背后的网页画面 → 缩小 → 糊化+增艳 → 供 NativeDock 切片垫底 ——
