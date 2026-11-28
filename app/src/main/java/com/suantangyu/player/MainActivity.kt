@@ -727,9 +727,7 @@ class MainActivity : AppCompatActivity() {
                 val oldCollapsed = NativeDockStore.collapsed
                 val oldDetail = NativeDockStore.detail
                 // 3.85.20：页面/详情/深浅一变，白化守卫基线清零（新页首图无条件认）
-                lastBackdropMean = -1f
-                backdropRejectStreak = 0
-                NativeDockStore.page = o.optString("page", "home")
+                                NativeDockStore.page = o.optString("page", "home")
                 NativeDockStore.collapsed = o.optBoolean("collapsed")
                 NativeDockStore.detail = o.optBoolean("detail")
                 NativeDockStore.style = o.optString("style", "liuli")
@@ -858,30 +856,37 @@ class MainActivity : AppCompatActivity() {
     private fun dockShiftNow(): Int =
         (dockScrollY - dockCaptureScrollY).coerceIn(-260, 340)
 
-    // 3.85.20 白化守卫的账本：上一张已发布底图的底部条均亮与连丢计数
-    private var lastBackdropMean = -1f
-    private var backdropRejectStreak = 0
-
-    /** 底图底部 40% 条带的平均亮度（小图抽样，0-255） */
-    private fun backdropStripMean(bmp: Bitmap): Float {
+    /** 底图底部 40% 条带的（平均亮度， 标准差）（小图抽样，0-255）。
+     * 3.85.22：白化的签名是「又白又平」（实测 251±2、整片无内容），不是
+     * 「亮」——真实的白页面条带里有文字和封面、标准差大得多。旧悬崖规则
+     * 只看相对上一张的均亮跳升，分不清白化与「深色内容划过后的正常亮
+     * 图」，基线被一张深色图毒化后整页底图冻死（3.85.21 主页粉红冻结
+     * 实锤），故改判平坦度、逐张独立判决、不留基线 */
+    private fun backdropStripStats(bmp: Bitmap): Pair<Float, Float> {
         val w = bmp.width
         val h = bmp.height
-        if (w <= 0 || h <= 0) return -1f
+        if (w <= 0 || h <= 0) return Pair(-1f, 0f)
         val y0 = (h * 0.6f).toInt()
         val px = IntArray(w * (h - y0))
         bmp.getPixels(px, 0, w, 0, y0, w, h - y0)
-        var sum = 0L
+        var sum = 0.0
+        var sumSq = 0.0
         var n = 0
         var i = 0
         while (i < px.size) {
             val c = px[i]
-            sum += (android.graphics.Color.red(c) +
+            val lum = (android.graphics.Color.red(c) +
                 android.graphics.Color.green(c) +
-                android.graphics.Color.blue(c)) / 3
+                android.graphics.Color.blue(c)) / 3.0
+            sum += lum
+            sumSq += lum * lum
             n++
             i += 7
         }
-        return if (n > 0) sum.toFloat() / n else -1f
+        if (n == 0) return Pair(-1f, 0f)
+        val mean = sum / n
+        val variance = (sumSq / n - mean * mean).coerceAtLeast(0.0)
+        return Pair(mean.toFloat(), kotlin.math.sqrt(variance).toFloat())
     }
 
     /** 3.85.2/3.85.4：网页在滚 → 先按位移补偿顶一帧，同时重截＋停稳补截 */
@@ -945,29 +950,19 @@ class MainActivity : AppCompatActivity() {
             Thread {
                 try {
                     val out = blurAndSaturate(raw, 35)
-                    // 3.85.20：详情页滚到中途截取会整张发白（WebView 绘制
-                    // 白化，cheng 录屏实锤：背后明明是深色列表、迷你却变
-                    // 纯白）。发布前验一道：新图底部条（坞自身那截）均亮
-                    // 比上一张跳升 >55 且上一张不亮 → 判白化、丢弃不用，
-                    // 旧图继续靠位移补偿顶着；连丢 4 张则认页面真变了、放行
-                    val mean = backdropStripMean(out)
+                    // 3.85.22：发布前验一道——平坦纯白（均亮 >235 且标准
+                    // 差 <6）判为 WebView 绘制白化、丢弃不用，旧图继续靠
+                    // 位移补偿顶着；带内容的亮图（哪怕刚划过深色内容）
+                    // 标准差大、照常放行，底图不会再被冻死
+                    val (mean, std) = backdropStripStats(out)
                     runOnUiThread {
-                        val cliff = lastBackdropMean >= 0f &&
-                            lastBackdropMean < 170f &&
-                            mean > lastBackdropMean + 55f
-                        if (cliff) {
-                            // 3.85.21：无条件拦——白化是持续性的，原「连丢
-                            // 4 张放行」只会把白图放行并锁死成新基线（cheng
-                            // 第二段录屏实锤）；页面真切换时 onDockState 已
-                            // 清基线、新页首图无条件认，不靠连丢放行
+                        if (mean > 235f && std < 6f) {
                             if (dockCapturePending) {
                                 dockCapturePending = false
                                 captureDockBackdrop(true)
                             }
                             return@runOnUiThread
                         }
-                        backdropRejectStreak = 0
-                        lastBackdropMean = mean
                         NativeDockStore.backdrop = out.asImageBitmap()
                         NativeDockStore.backdropTopPx = top
                         NativeDockStore.backdropScale = scale
