@@ -10,7 +10,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import androidx.compose.ui.graphics.asImageBitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -322,6 +328,8 @@ class MainActivity : AppCompatActivity() {
                 pageReady = true
                 injectSafeArea()
                 maybeReveal()
+                // 3.85.1：新页渲染完补截一张毛玻璃底图
+                uiHandler.postDelayed({ captureDockBackdrop(true) }, 500)
             }
         }
         // 进度起来后 DOM 基本可用，提前注入一次，缩短隐身等待（最终显示仍以校验为准）
@@ -742,7 +750,12 @@ class MainActivity : AppCompatActivity() {
                 }
                 val wasEnabled = NativeDockStore.enabled
                 NativeDockStore.enabled = true
-                if (!wasEnabled) syncNativeComposeVisibility()
+                if (!wasEnabled) {
+                    syncNativeComposeVisibility()
+                    // 3.85.1：真毛玻璃截取循环启动（滚动监听＋2.5s 兜底）
+                    startDockBackdropLoop()
+                    uiHandler.postDelayed({ captureDockBackdrop(true) }, 350)
+                }
                 refreshNativeDock()
             } catch (_: Exception) {
             }
@@ -766,6 +779,117 @@ class MainActivity : AppCompatActivity() {
             NativeDockStore.durMs = o.optLong("dur")
         } catch (_: Exception) {
         }
+    }
+
+    // —— 3.85.1 真毛玻璃：截 Dock 背后的网页画面 → 缩小 → 糊化+增艳 → 供 NativeDock 切片垫底 ——
+    private var dockBackdropBusy = false
+    private var lastDockBackdropAt = 0L
+    private var lastDockScrollY = -1
+    private var dockBackdropLoopStarted = false
+    private val dockBackdropLoop = object : Runnable {
+        override fun run() {
+            captureDockBackdrop()
+            uiHandler.postDelayed(this, 2500)
+        }
+    }
+
+    private fun startDockBackdropLoop() {
+        if (dockBackdropLoopStarted) return
+        dockBackdropLoopStarted = true
+        try {
+            webView.viewTreeObserver.addOnScrollChangedListener {
+                val y = webView.scrollY
+                if (y != lastDockScrollY) {
+                    lastDockScrollY = y
+                    captureDockBackdrop()
+                }
+            }
+        } catch (_: Exception) {
+        }
+        uiHandler.postDelayed(dockBackdropLoop, 600)
+    }
+
+    private fun captureDockBackdrop(force: Boolean = false) {
+        if (!NativeDockStore.enabled || NativeDockStore.imeOpen) return
+        if (!::webView.isInitialized) return
+        val top = NativeDockStore.regionTopPx
+        if (top < 0 || webView.width <= 0 || webView.height <= top + 40) return
+        val now = SystemClock.uptimeMillis()
+        if (!force && now - lastDockBackdropAt < 110) return
+        if (dockBackdropBusy) return
+        lastDockBackdropAt = now
+        dockBackdropBusy = true
+        try {
+            val scale = 0.18f
+            val regionH = webView.height - top
+            val bw = (webView.width * scale).toInt().coerceAtLeast(1)
+            val bh = (regionH * scale).toInt().coerceAtLeast(1)
+            val raw = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(raw)
+            canvas.scale(scale, scale)
+            canvas.translate(0f, -top.toFloat())
+            webView.draw(canvas)
+            Thread {
+                try {
+                    val out = blurAndSaturate(raw, 26)
+                    runOnUiThread {
+                        NativeDockStore.backdrop = out.asImageBitmap()
+                        NativeDockStore.backdropTopPx = top
+                        NativeDockStore.backdropScale = scale
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    dockBackdropBusy = false
+                }
+            }.start()
+        } catch (_: Exception) {
+            dockBackdropBusy = false
+        }
+    }
+
+    /** 小图糊化（盒式模糊横竖各两遍）＋饱和提升（网页 backdrop 还有 saturate 180%） */
+    private fun blurAndSaturate(src: Bitmap, radius: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val tmp = IntArray(w * h)
+        fun boxPass(horizontal: Boolean) {
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    var r = 0
+                    var g = 0
+                    var b = 0
+                    var a = 0
+                    var n = 0
+                    for (k in -radius..radius) {
+                        val xx = if (horizontal) (x + k).coerceIn(0, w - 1) else x
+                        val yy = if (horizontal) y else (y + k).coerceIn(0, h - 1)
+                        val c = px[yy * w + xx]
+                        a += android.graphics.Color.alpha(c)
+                        r += android.graphics.Color.red(c)
+                        g += android.graphics.Color.green(c)
+                        b += android.graphics.Color.blue(c)
+                        n++
+                    }
+                    tmp[y * w + x] = android.graphics.Color.argb(a / n, r / n, g / n, b / n)
+                }
+            }
+            System.arraycopy(tmp, 0, px, 0, px.size)
+        }
+        boxPass(true)
+        boxPass(false)
+        boxPass(true)
+        boxPass(false)
+        val blurred = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        blurred.setPixels(px, 0, w, 0, 0, w, h)
+        val cm = ColorMatrix()
+        cm.setSaturation(1.5f)
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c2 = Canvas(out)
+        val paint = Paint().apply { colorFilter = ColorMatrixColorFilter(cm) }
+        c2.drawBitmap(blurred, 0f, 0f, paint)
+        return out
     }
 
     /** 网页 postPlayerData 入口（桥线程→主线程） */

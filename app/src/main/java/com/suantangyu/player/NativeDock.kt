@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -54,6 +55,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -67,12 +69,15 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -103,6 +108,11 @@ object NativeDockStore {
     var accentHex by mutableStateOf("#fa2d48")
     var npAccent by mutableStateOf(Color(0xFFFA2D48))
     var imeOpen by mutableStateOf(false)
+    // 3.85.1 真毛玻璃：MainActivity 截取 Dock 背后网页画面糊化后垫底（backdropTopPx=截取区顶边窗口坐标）
+    var backdrop by mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null)
+    var backdropTopPx by mutableStateOf(-1)
+    var backdropScale by mutableStateOf(0.18f)
+    var regionTopPx by mutableStateOf(-1)
     var hasTrack by mutableStateOf(false)
     var title by mutableStateOf("")
     var artist by mutableStateOf("")
@@ -202,7 +212,7 @@ private fun lerpF(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 
 /** 玻璃面（网页 backdrop 毛玻璃的近似：同值半透明渐变＋边＋软影） */
 @Composable
-private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: Boolean): Modifier {
+private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: Boolean, bg: Boolean = true): Modifier {
     val bg = if (dark) {
         if (shown) Color(0xC72C2C2E) else Color(0xD11C1C1E)
     } else {
@@ -216,12 +226,55 @@ private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: 
         ambientColor = Color.Black.copy(alpha = shadowA),
         spotColor = Color.Black.copy(alpha = shadowA)
     )
-    m = if (dark) m.background(bg, shape)
-    else m.background(
-        Brush.verticalGradient(listOf(Color.White.copy(0.78f), Color.White.copy(0.62f))),
-        shape
-    )
+    if (bg) {
+        m = if (dark) m.background(bg, shape)
+        else m.background(
+            Brush.verticalGradient(listOf(Color.White.copy(0.78f), Color.White.copy(0.62f))),
+            shape
+        )
+    }
     return m.border(0.5.dp, borderC, shape)
+}
+
+/**
+ * 3.85.1 真毛玻璃切片：把 MainActivity 截好的糊化图按本元素在窗口中的位置对位画出，
+ * 再压一层与网页玻璃同值的罩（wash）。须放在已被 clip 的容器内当第一个子元素。
+ */
+@Composable
+private fun DockBackdropSlice(wash: Brush) {
+    val st = NativeDockStore
+    val bmp = st.backdrop ?: return
+    var winPos by remember { mutableStateOf(Offset.Zero) }
+    Box(
+        Modifier.fillMaxSize()
+            .onGloballyPositioned { winPos = it.positionInWindow() }
+            .drawBehind {
+                val scale = st.backdropScale
+                val dstW = (bmp.width / scale).roundToInt()
+                val dstH = (bmp.height / scale).roundToInt()
+                drawImage(
+                    bmp,
+                    srcOffset = IntOffset.Zero,
+                    srcSize = IntSize(bmp.width, bmp.height),
+                    dstOffset = IntOffset(
+                        -winPos.x.roundToInt(),
+                        -(winPos.y - st.backdropTopPx).roundToInt()
+                    ),
+                    dstSize = IntSize(dstW, dstH)
+                )
+                drawRect(wash, size = size)
+            }
+    )
+}
+
+/** 与 dockGlass 的底色同值：有截取图时改由切片画（图在下、罩在上） */
+private fun dockWash(shown: Boolean, dark: Boolean): Brush {
+    return if (dark) {
+        val c = if (shown) Color(0xC72C2C2E) else Color(0xD11C1C1E)
+        Brush.verticalGradient(listOf(c, c))
+    } else {
+        Brush.verticalGradient(listOf(Color.White.copy(0.78f), Color.White.copy(0.62f)))
+    }
 }
 
 private class DockParticle(
@@ -372,10 +425,12 @@ private fun DockSideBtn(
     else if (dark) Color(235, 235, 245).copy(0.68f)
     else Color(60, 60, 67).copy(0.55f)
     Box(
-        Modifier.size(sizeDp.dp).dockGlass(shape, dark, shown = false)
+        Modifier.size(sizeDp.dp)
+            .dockGlass(shape, dark, shown = false, bg = NativeDockStore.backdrop == null)
             .clip(shape).dockPress(0.9f) { onClick() },
         contentAlignment = Alignment.Center
     ) {
+        if (NativeDockStore.backdrop != null) DockBackdropSlice(dockWash(false, dark))
         if (sizeDp > 30f) {
             if (home) DockSvg(D_HOME, 24.dp, col) else DockSearchIcon(24.dp, col)
         }
@@ -385,7 +440,7 @@ private fun DockSideBtn(
 @Composable
 private fun DockMiniBar(
     isLiuli: Boolean, isNetease: Boolean, isHeijiao: Boolean,
-    dark: Boolean, accent: Color, lyricColor: Color,
+    dark: Boolean, accent: Color, lyricColor: Color, lyricText: String,
     miniH: Float, coverS: Float, nameSp: Float, nameWeight: FontWeight,
     nextW: Float, nextAlpha: Float, artistAlpha: Float,
     discOff: Float, discSpacerW: Float, detailT: Float,
@@ -457,12 +512,15 @@ private fun DockMiniBar(
             .onSizeChanged { barWpx = it.width; barHpx = it.height }
     ) {
         Box(
-            Modifier.fillMaxSize().dockGlass(shape, dark, shown = true).clip(shape)
+            Modifier.fillMaxSize()
+                .dockGlass(shape, dark, shown = true, bg = st.backdrop == null)
+                .clip(shape)
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
                 ) { onOpenPlayer() }
         ) {
+            if (st.backdrop != null) DockBackdropSlice(dockWash(true, dark))
             if (isLiuli && frac > 0f) {
                 val stops = if (dark) arrayOf(
                     0f to accent.copy(0.32f), 0.55f to accent.copy(0.20f),
@@ -521,8 +579,8 @@ private fun DockMiniBar(
                         letterSpacing = (-0.14).sp
                     )
                     Box(Modifier.fillMaxWidth().height(20.dp)) {
-                        if (st.lyric.isNotEmpty()) {
-                            DockLyricLine(st.lyric, lyricColor)
+                        if (lyricText.isNotEmpty()) {
+                            DockLyricLine(lyricText, lyricColor)
                         } else {
                             Text(
                                 st.artist, color = artistColor, fontSize = 12.sp,
@@ -566,6 +624,7 @@ private fun DockMiniBar(
         if (isHeijiao) {
             Box(
                 Modifier.align(Alignment.CenterStart).offset(x = discOff.dp)
+                    .wrapContentSize(unbounded = true)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
@@ -591,9 +650,11 @@ private fun DockTabBar(
         else -> RoundedCornerShape(28.dp)
     }
     Box(Modifier.fillMaxWidth().height(tabH.dp)) {
+        val hasBd = NativeDockStore.backdrop != null
         val inner = if (isNetease) {
             // 网易风通栏：无整圈边框/阴影，只有顶边线；内容坐在上方 60dp
-            if (dark) Modifier.fillMaxSize().background(Color(0xD11C1C1E), shape)
+            if (hasBd) Modifier.fillMaxSize()
+            else if (dark) Modifier.fillMaxSize().background(Color(0xD11C1C1E), shape)
             else Modifier.fillMaxSize().background(
                 Brush.verticalGradient(
                     listOf(Color.White.copy(0.78f), Color.White.copy(0.62f))
@@ -601,9 +662,10 @@ private fun DockTabBar(
                 shape
             )
         } else {
-            Modifier.fillMaxSize().dockGlass(shape, dark, shown = false)
+            Modifier.fillMaxSize().dockGlass(shape, dark, shown = false, bg = !hasBd)
         }
         Box(inner.clip(shape)) {
+            if (hasBd) DockBackdropSlice(dockWash(false, dark))
             if (isNetease) {
                 Box(
                     Modifier.fillMaxWidth().height(0.5.dp).align(Alignment.TopCenter)
@@ -697,6 +759,17 @@ private fun DockRootContent(
         }
     }
     val tickNow = tick
+    // 3.85.1：迷你歌词句自己算——脑的 lyricLine 是锁屏轮换通道（当前句↔下一句每 2.8s 轮换），
+    // 直接显示会抢先；按网页 syncLyrics 规则（行时间 <= 位置+0.15s）从带时间歌词里取当前句
+    val lyricLines = NativePlayerStore.lyrics
+    val dockLyric = if (lyricLines.isEmpty()) "" else {
+        val posL = st.livePosMs() + 150
+        var txt = ""
+        for (ln in lyricLines) {
+            if (ln.t <= posL) txt = ln.x else break
+        }
+        txt.trim()
+    }
     val frac = if (st.durMs > 0 && tickNow >= 0) {
         (st.livePosMs().toFloat() / st.durMs).coerceIn(0f, 1f)
     } else 0f
@@ -777,6 +850,9 @@ private fun DockRootContent(
         Column(
             Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                 .padding(bottom = bottomPad.dp)
+                .onGloballyPositioned {
+                    NativeDockStore.regionTopPx = it.positionInWindow().y.toInt()
+                }
         ) {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 13.dp),
@@ -794,7 +870,7 @@ private fun DockRootContent(
                     if (miniH > 0.5f) {
                         DockMiniBar(
                             isLiuli, isNetease, isHeijiao, st.dark, st.accent,
-                            lyricColor, miniH, coverS, nameSp, nameWeight,
+                            lyricColor, dockLyric, miniH, coverS, nameSp, nameWeight,
                             nextW, nextAlpha, artistAlpha, discOff, discSpacerW,
                             detailT, frac, spin, bmp,
                             onToggle, onNext, onOpenPlayer, onQueue
