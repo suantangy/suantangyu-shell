@@ -31,6 +31,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -45,6 +46,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -209,7 +211,12 @@ private fun SvgIconStroke(pathData: String, size: Dp, color: Color, strokeDp: Dp
 // 播放页歌词行(3.84.24 照网页 .ly 三档复刻):当前 22px/800、相邻
 // 15px、远行 14px;远行带 0.5px 模糊与 0.94 缩放、相邻 0.97;字号用
 // 网页同款弹簧曲线 .28s 涨落、颜色 .25s 过渡;长行换行不截断;
-// 开译时主行下跟 12px 译文行(网页 .ly-trans)
+// 开译时主行下跟 12px 译文行(网页 .ly-trans)。
+// 3.84.32 行槽改固定高:槽高恒 41dp(网页当前行与相邻行的平均行距
+// 40.9px),字在槽内涨落、槽高不随档位变——旧版槽高随字号变(当前
+// 44.8/相邻 35/远行 33.6),滚动落定后上一行收缩把整列往上顶约
+// 38px,看着像滑到了又跳一下。长行换行/带译文时内容更高,槽随
+// 内容长高(该行常量、不随档位变),与网页 .ly 同理
 @Composable
 private fun PlayerLyricLine(
     line: PlayerLine, tier: Int, lyOn: Color, base: Color,
@@ -231,11 +238,13 @@ private fun PlayerLyricLine(
     val animScale by animateFloatAsState(targetScale, tween(250), label = "lyScale")
     Column(
         Modifier.fillMaxWidth()
+            .heightIn(min = 41.dp)
             .aqClickable(1f, 0.72f) { onClick() }
-            .padding(horizontal = 12.dp, vertical = 7.dp)
+            .padding(horizontal = 12.dp)
             .graphicsLayer { scaleX = animScale; scaleY = animScale }
             .then(if (tier == 0) Modifier.blur(0.5.dp) else Modifier),
-        horizontalAlignment = Alignment.CenterHorizontally
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
         Text(
             line.x,
@@ -1203,9 +1212,41 @@ fun NativePlayerRoot(
                 LaunchedEffect(curIdx) {
                     if (curIdx >= 0 && SystemClock.elapsedRealtime() > holdUntil) {
                         try {
+                            // 对齐网页版(3.84.32):网页 syncLyrics 把当前行
+                            // 滚到歌词框正中(行中心对框中心、smooth 滚动)。
+                            // 旧公式 -0.42*vh+150 实测落在歌词区约 1/4 处,
+                            // 当前行比网页高约 6% 屏高(上方只露 1 行、网页
+                            // 露 2 行)。改按 layoutInfo 实测偏差居中:目标行
+                            // 在视口内就 animateScrollBy 一次滑到正中(300ms
+                            // 缓动);不在视口内(远跳/点行跳播)先 scrollToItem
+                            // 拉进视口再居中。行槽已固定高,途中行高不变,
+                            // 不再有落定后的反向小跳
                             val vh = listState.layoutInfo.viewportSize.height
-                            val off = if (vh > 0) (-(vh * 0.42f).toInt() + 150) else -120
-                            listState.animateScrollToItem(curIdx, scrollOffset = off)
+                            if (vh > 0) {
+                                var item = listState.layoutInfo.visibleItemsInfo
+                                    .firstOrNull { it.index == curIdx }
+                                if (item == null) {
+                                    listState.scrollToItem(curIdx)
+                                    item = withTimeoutOrNull(300) {
+                                        snapshotFlow {
+                                            listState.layoutInfo.visibleItemsInfo
+                                                .firstOrNull { it.index == curIdx }
+                                        }.first { it != null }
+                                    }
+                                }
+                                if (item != null) {
+                                    val delta = (item.offset + item.size / 2) - vh / 2
+                                    if (kotlin.math.abs(delta) > 2) {
+                                        listState.animateScrollBy(
+                                            delta.toFloat(),
+                                            tween(
+                                                300,
+                                                easing = CubicBezierEasing(0.22f, 0.61f, 0.36f, 1f)
+                                            )
+                                        )
+                                    }
+                                }
+                            }
                         } catch (_: Exception) {
                         }
                     }
