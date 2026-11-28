@@ -224,12 +224,9 @@ private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: 
     }
     val borderC = if (dark) Color.White.copy(alpha = if (shown) 0.10f else 0.08f)
     else Color.White.copy(alpha = if (shown) 0.85f else 0.55f)
-    val shadowA = if (dark) 0.45f else 0.10f
-    var m = this.shadow(
-        10.dp, shape, clip = false,
-        ambientColor = Color.Black.copy(alpha = shadowA),
-        spotColor = Color.Black.copy(alpha = shadowA)
-    )
+    // 3.85.6：阴影改手绘软影 DockHalo（网页 box-shadow 式四周晕开）；
+    // 系统 elevation 影太硬太小，到不了网页 0 10px 32px 的晕感，此处不再叠
+    var m: Modifier = this
     if (bg) {
         m = if (dark) m.background(bgC, shape)
         else m.background(
@@ -238,6 +235,38 @@ private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: 
         )
     }
     return m.border(0.5.dp, borderC, shape)
+}
+
+/** 3.85.6 网页 box-shadow 软影：手绘模糊圆角矩形——四周晕开＋向下偏移。
+ * alpha2 是近边第二层（小偏移小模糊），参数照网页各面 box-shadow 实值。 */
+@Composable
+private fun DockHalo(radiusDp: Float, offYDp: Float, blurDp: Float, alpha: Float, alpha2: Float = 0f) {
+    Box(
+        Modifier.fillMaxSize().drawBehind {
+            val r = radiusDp.dp.toPx()
+            val oy = offYDp.dp.toPx()
+            val paint = android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(
+                    (alpha * 255).toInt().coerceIn(0, 255), 0, 0, 0
+                )
+                maskFilter = BlurMaskFilter(blurDp.dp.toPx() / 2f, BlurMaskFilter.Blur.NORMAL)
+            }
+            drawContext.canvas.nativeCanvas.drawRoundRect(
+                0f, oy, size.width, size.height + oy, r, r, paint
+            )
+            if (alpha2 > 0f) {
+                val p2 = android.graphics.Paint().apply {
+                    color = android.graphics.Color.argb(
+                        (alpha2 * 255).toInt().coerceIn(0, 255), 0, 0, 0
+                    )
+                    maskFilter = BlurMaskFilter(blurDp.dp.toPx() / 6f, BlurMaskFilter.Blur.NORMAL)
+                }
+                drawContext.canvas.nativeCanvas.drawRoundRect(
+                    0f, oy / 5f, size.width, size.height + oy / 5f, r, r, p2
+                )
+            }
+        }
+    )
 }
 
 /**
@@ -435,7 +464,7 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
         // 中心孔（3.85.5 按 cheng 令加回）：照网页 ::after——总径 7px、底 #0b0b0d、
         // 1.5px 白 .4 边（border-box，黑心实径 4），压在封面之上
         Box(
-            Modifier.size(7.dp).clip(CircleShape).background(Color(0xFF0B0B0D)),
+            Modifier.size(9.dp).clip(CircleShape).background(Color(0xFF0B0B0D)),
             contentAlignment = Alignment.Center
         ) {
             Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
@@ -485,6 +514,9 @@ private fun DockSideBtn(
         Modifier.width(sizeDp.dp).height(52.dp).clipToBounds(),
         contentAlignment = Alignment.Center
     ) {
+        Box(Modifier.size(52.dp)) {
+            DockHalo(26f, 6f, 20f, (if (dark) 0.35f else 0.06f) * t)
+        }
         Box(
             Modifier.size(52.dp)
                 .graphicsLayer {
@@ -509,6 +541,7 @@ private fun DockMiniBar(
     nextW: Float, nextAlpha: Float, artistAlpha: Float,
     discOff: Float, discSpacerW: Float, detailT: Float,
     frac: Float, spin: Float, bmp: Bitmap?,
+    shOff: Float, shBlur: Float, shAlpha: Float, shAlpha2: Float,
     onToggle: () -> Unit, onNext: () -> Unit,
     onOpenPlayer: () -> Unit, onQueue: () -> Unit
 ) {
@@ -575,6 +608,7 @@ private fun DockMiniBar(
         Modifier.fillMaxWidth().height(miniH.dp)
             .onSizeChanged { barWpx = it.width; barHpx = it.height }
     ) {
+        DockHalo(if (isNetease) 18f else miniH / 2f, shOff, shBlur, shAlpha, shAlpha2)
         Box(
             Modifier.fillMaxSize()
                 .dockGlass(shape, dark, shown = true, bg = st.backdrop == null)
@@ -713,7 +747,7 @@ private fun DockTabBar(
         isHeijiao -> RoundedCornerShape(percent = 50)
         else -> RoundedCornerShape(28.dp)
     }
-    Box(Modifier.fillMaxWidth().height(tabH.dp)) {
+    Box(Modifier.fillMaxWidth().height(tabH.dp).clipToBounds()) {
         val hasBd = NativeDockStore.backdrop != null
         val inner = if (isNetease) {
             // 网易风通栏：无整圈边框/阴影，只有顶边线；内容坐在上方 60dp
@@ -740,7 +774,7 @@ private fun DockTabBar(
             }
             Row(
                 Modifier.fillMaxWidth()
-                    .height(if (isNetease) 60.dp else tabH.dp)
+                    .fillMaxHeight()
                     .padding(
                         horizontal = if (isHeijiao) 8.dp else 0.dp,
                         vertical = if (isHeijiao) 4.dp else 0.dp
@@ -935,11 +969,21 @@ private fun DockRootContent(
                         )
                 ) {
                     if (miniH > 0.5f) {
+                        // 阴影照网页：展开 0 10px 32px .10（网易风 30px/.12、深色 8px 28px .45），
+                        // 收起 0 6px 20px .06（深色 .40），随 collapseT 插值
+                        val shOff = if (st.dark) lerpF(8f, 6f, collapseT)
+                            else lerpF(10f, 6f, collapseT)
+                        val shBlur = if (st.dark) lerpF(28f, 20f, collapseT)
+                            else lerpF(if (isNetease) 30f else 32f, 20f, collapseT)
+                        val shAlpha = if (st.dark) lerpF(0.45f, 0.40f, collapseT)
+                            else lerpF(if (isNetease) 0.12f else 0.10f, 0.06f, collapseT)
+                        val shAlpha2 = if (st.dark) 0f else lerpF(0.05f, 0f, collapseT)
                         DockMiniBar(
                             isLiuli, isNetease, isHeijiao, st.dark, st.accent,
                             lyricColor, dockLyric, miniH, coverS, nameSp, nameWeight,
                             nextW, nextAlpha, artistAlpha, discOff, discSpacerW,
                             detailT, frac, spin, bmp,
+                            shOff, shBlur, shAlpha, shAlpha2,
                             onToggle, onNext, onOpenPlayer, onQueue
                         )
                     }
@@ -962,6 +1006,13 @@ private fun DockRootContent(
                             transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0.5f, 1f)
                         }
                 ) {
+                    if (!isNetease) {
+                        DockHalo(
+                            28f, if (st.dark) 8f else 10f, 28f,
+                            if (st.dark) 0.45f else 0.09f,
+                            if (st.dark) 0f else 0.04f
+                        )
+                    }
                     DockTabBar(
                         isNetease, isHeijiao, st.dark, st.accent,
                         st.page, tabH, navInset, onTab
