@@ -1007,11 +1007,15 @@ private fun DockRootContent(
                         }
                 ) {
                     if (!isNetease) {
-                        DockHalo(
-                            28f, if (st.dark) 8f else 10f, 28f,
-                            if (st.dark) 0.45f else 0.09f,
-                            if (st.dark) 0f else 0.04f
-                        )
+                        // 阴影盒必须给死高 tabH：wrapper 是 wrap-content，
+                        // fillMaxSize 子元素会把整列撑满屏（3.85.6 踩过，Dock 跑到屏顶）
+                        Box(Modifier.fillMaxWidth().height(tabH.dp)) {
+                            DockHalo(
+                                28f, if (st.dark) 8f else 10f, 28f,
+                                if (st.dark) 0.45f else 0.09f,
+                                if (st.dark) 0f else 0.04f
+                            )
+                        }
                     }
                     DockTabBar(
                         isNetease, isHeijiao, st.dark, st.accent,
