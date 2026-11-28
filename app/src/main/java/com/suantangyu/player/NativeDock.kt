@@ -544,7 +544,7 @@ private fun DockCover(sizeDp: Float, spin: Float, bmp: Bitmap?, dark: Boolean) {
 @Composable
 private fun DockSideBtn(
     home: Boolean, sizeDp: Float, t: Float, on: Boolean, dark: Boolean,
-    accent: Color, onClick: () -> Unit
+    accent: Color, topAnchor: Boolean = false, onClick: () -> Unit
 ) {
     val shape = RoundedCornerShape(percent = 50)
     val col = if (on) accent
@@ -553,7 +553,8 @@ private fun DockSideBtn(
     // 3.85.5 照网页 .dock-side：槽位宽 0→52 把迷你条推窄，圆钮本体固定 52、
     // scale .72→1＋整钮淡入（旧版圆从 0 长大，入场观感与网页不同）
     Box(
-        Modifier.width(sizeDp.dp).height(52.dp).clipToBounds(),
+        Modifier.width(sizeDp.dp)
+            .height(if (topAnchor) sizeDp.dp else 52.dp).clipToBounds(),
         contentAlignment = Alignment.Center
     ) {
         Box(Modifier.size(52.dp)) {
@@ -1095,20 +1096,42 @@ private fun DockRootContent(
                         }
                     }
                     if (sideS > 0.5f) {
-                        Box(
-                            Modifier.align(Alignment.CenterStart)
-                                .padding(start = 13.dp)
-                        ) {
-                            DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent) {
-                                onTab("home")
+                        if (!colActive) {
+                            // 展开程（3.85.14，沙盒实锤）：网页侧钮展开时是 abspos，
+                            // 静态位都在坞的左上角——搜索钮同帧跳到左角与主页钮
+                            // 叠放，两钮一起收进左上角（右角那个是同帧消失）。
+                            Box(
+                                Modifier.align(Alignment.TopStart)
+                                    .padding(start = 13.dp)
+                            ) {
+                                DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent, topAnchor = true) {
+                                    onTab("home")
+                                }
                             }
-                        }
-                        Box(
-                            Modifier.align(Alignment.CenterEnd)
-                                .padding(end = 13.dp)
-                        ) {
-                            DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent) {
-                                onTab("search")
+                            Box(
+                                Modifier.align(Alignment.TopStart)
+                                    .padding(start = 13.dp)
+                            ) {
+                                DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent, topAnchor = true) {
+                                    onTab("search")
+                                }
+                            }
+                        } else {
+                            Box(
+                                Modifier.align(Alignment.CenterStart)
+                                    .padding(start = 13.dp)
+                            ) {
+                                DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent) {
+                                    onTab("home")
+                                }
+                            }
+                            Box(
+                                Modifier.align(Alignment.CenterEnd)
+                                    .padding(end = 13.dp)
+                            ) {
+                                DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent) {
+                                    onTab("search")
+                                }
                             }
                         }
                     }
