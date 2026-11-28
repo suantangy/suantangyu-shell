@@ -2820,6 +2820,16 @@ class KeepAliveService : Service() {
             .put("uiKey", brainCurrentKey())
     }
 
+    /** 3.85.0：原生 Dock 读脑快照＝播放页快照＋当前歌词句（迷你条副行） */
+    fun dockSnapshot(): JSONObject {
+        val o = playerUiSnapshot()
+        try {
+            o.put("lyric", lyricLine)
+        } catch (_: Exception) {
+        }
+        return o
+    }
+
     /** 3.80.0：原生队列读脑快照（队列/当前键/模式/播放态）。封面字段序与网页 songCover 对齐 */
     fun queueUiSnapshot(): JSONObject {
         val arr = org.json.JSONArray()

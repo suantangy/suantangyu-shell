@@ -370,6 +370,8 @@ class MainActivity : AppCompatActivity() {
             if (pageReady) injectSafeArea()
             maybeReveal()
             val kbCss = (ime.bottom / density).toInt()
+            // 3.85.0：键盘打开时原生 Dock 藏起（网页 Dock 那时也被键盘盖住）
+            NativeDockStore.imeOpen = kbCss > 0
             if (kbCss != lastKbCss) {
                 lastKbCss = kbCss
                 injectKb()
@@ -512,6 +514,17 @@ class MainActivity : AppCompatActivity() {
         val cv = ComposeView(this)
         cv.visibility = View.GONE
         cv.setContent {
+            NativeDockRoot(
+                onTab = { p -> runJsOnPage("window.__aqDockGo&&window.__aqDockGo('$p')") },
+                onToggle = { nativePlayerToggle() },
+                onNext = { nativePlayerStep(next = true) },
+                onOpenPlayer = {
+                    showNativePlayer(NativeDockStore.dark, NativeDockStore.accentHex)
+                },
+                onQueue = {
+                    showNativeQueue(NativeDockStore.dark, NativeDockStore.accentHex)
+                }
+            )
             NativePlayerRoot(
                 onClose = { onNativePlayerHidden() },
                 onToggle = { nativePlayerToggle() },
@@ -574,13 +587,16 @@ class MainActivity : AppCompatActivity() {
     fun onBrainSyncNotify() {
         if (NativeQueueStore.visible) runOnUiThread { refreshNativeQueue() }
         if (NativePlayerStore.visible) runOnUiThread { refreshNativePlayer() }
+        if (NativeDockStore.enabled) runOnUiThread { refreshNativeDock() }
     }
 
     /** Compose 盖层显隐:队列或播放页任一在场就 VISIBLE(两者共用一个 ComposeView) */
     private fun syncNativeComposeVisibility() {
         val v = queueComposeView ?: return
         v.visibility =
-            if (NativeQueueStore.visible || NativePlayerStore.visible) View.VISIBLE else View.GONE
+            if (NativeQueueStore.visible || NativePlayerStore.visible ||
+                NativeDockStore.enabled
+            ) View.VISIBLE else View.GONE
     }
 
     // ===== 3.82.0 原生播放页（二期）=====
@@ -692,6 +708,63 @@ class MainActivity : AppCompatActivity() {
                     precomputeInFlight.remove(cover)
                 }
             }.start()
+        }
+    }
+
+    /** 3.85.0：网页推 Dock 状态入口（桥线程→主线程，1_181 __aqDockPush） */
+    fun onDockState(json: String) {
+        runOnUiThread {
+            try {
+                val o = org.json.JSONObject(json)
+                NativeDockStore.page = o.optString("page", "home")
+                NativeDockStore.collapsed = o.optBoolean("collapsed")
+                NativeDockStore.detail = o.optBoolean("detail")
+                NativeDockStore.style = o.optString("style", "liuli")
+                NativeDockStore.dark = o.optBoolean("dark")
+                val acc = o.optString("accent")
+                if (acc.isNotEmpty()) {
+                    NativeDockStore.accentHex = acc
+                    try {
+                        NativeDockStore.accent = androidx.compose.ui.graphics.Color(
+                            android.graphics.Color.parseColor(acc)
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
+                val np = o.optString("npAccent")
+                if (np.isNotEmpty()) {
+                    try {
+                        NativeDockStore.npAccent = androidx.compose.ui.graphics.Color(
+                            android.graphics.Color.parseColor(np)
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
+                val wasEnabled = NativeDockStore.enabled
+                NativeDockStore.enabled = true
+                if (!wasEnabled) syncNativeComposeVisibility()
+                refreshNativeDock()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun refreshNativeDock() {
+        if (!NativeDockStore.enabled) return
+        val svc = KeepAliveService.instance ?: return
+        try {
+            val o = svc.dockSnapshot()
+            NativeDockStore.hasTrack = o.optString("title").isNotEmpty()
+            NativeDockStore.title = o.optString("title")
+            NativeDockStore.artist = o.optString("artist")
+            NativeDockStore.cover = o.optString("cover")
+            NativeDockStore.lyric = o.optString("lyric")
+            NativeDockStore.playing = o.optBoolean("playing")
+            NativeDockStore.rate = o.optDouble("rate", 1.0).toFloat()
+            NativeDockStore.anchorPosMs = o.optLong("pos")
+            NativeDockStore.anchorAtMs = SystemClock.elapsedRealtime()
+            NativeDockStore.durMs = o.optLong("dur")
+        } catch (_: Exception) {
         }
     }
 

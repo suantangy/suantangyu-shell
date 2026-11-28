@@ -461,6 +461,16 @@ class BaoBridge(private val activity: MainActivity) {
         activity.onPlayerData(json)
     }
 
+    /** 3.85.0 原生 Dock：网页问壳有没有（老壳无此法、网页自动走网页 Dock） */
+    @JavascriptInterface
+    fun hasNativeDock(): Boolean = true
+
+    /** 3.85.0：网页推 Dock 状态（页/收起/详情/样式/深色/主题色/歌词句色），1_181 __aqDockPush 发起 */
+    @JavascriptInterface
+    fun postDockState(json: String) {
+        activity.onDockState(json)
+    }
+
     @JavascriptInterface
     fun showNativeQueue(dark: Boolean, accent: String) {
         activity.runOnUiThread { activity.showNativeQueue(dark, accent) }
