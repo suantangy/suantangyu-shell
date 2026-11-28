@@ -544,7 +544,7 @@ private fun DockCover(sizeDp: Float, spin: Float, bmp: Bitmap?, dark: Boolean) {
 @Composable
 private fun DockSideBtn(
     home: Boolean, sizeDp: Float, t: Float, on: Boolean, dark: Boolean,
-    accent: Color, topAnchor: Boolean = false, onClick: () -> Unit
+    accent: Color, onClick: () -> Unit
 ) {
     val shape = RoundedCornerShape(percent = 50)
     val col = if (on) accent
@@ -553,8 +553,7 @@ private fun DockSideBtn(
     // 3.85.5 照网页 .dock-side：槽位宽 0→52 把迷你条推窄，圆钮本体固定 52、
     // scale .72→1＋整钮淡入（旧版圆从 0 长大，入场观感与网页不同）
     Box(
-        Modifier.width(sizeDp.dp)
-            .height(if (topAnchor) sizeDp.dp else 52.dp).clipToBounds(),
+        Modifier.width(sizeDp.dp).height(52.dp).clipToBounds(),
         contentAlignment = Alignment.Center
     ) {
         Box(Modifier.size(52.dp)) {
@@ -942,7 +941,7 @@ private fun DockRootContent(
     val tabGrow = remember { Animatable(1f) }
     LaunchedEffect(colActive) {
         if (colActive) tabGrow.snapTo(0f)
-        else tabGrow.animateTo(1f, tween(680, easing = DockEase))
+        else tabGrow.animateTo(1f, tween(800, easing = DockEase))
     }
     val screenWDp = LocalConfiguration.current.screenWidthDp.toFloat()
     val miniW = remember { Animatable(0f) }
@@ -984,9 +983,15 @@ private fun DockRootContent(
         else tween(500, easing = EaseCss, delayMillis = 150),
         label = "dkNxtA"
     )
-    val tSide by animateFloatAsState(
-        if (colActive) 1f else 0f, tween(750, easing = DockEase), label = "dkSide"
-    )
+    // 侧钮收起 .75s 长出（网页 .dock-side .75s）；展开在 cheng 真机上是同帧
+    // 消失——类名一翻转钮就没了，宽高过渡没跑起来（2026-11-28 录屏逐帧实锤：
+    // f150 两钮还在、f152 已无影；沙盒桌面 Chrome 会把过渡跑完，不作数）。
+    val tSideA = remember { Animatable(0f) }
+    LaunchedEffect(colActive) {
+        if (colActive) tSideA.animateTo(1f, tween(750, easing = DockEase))
+        else tSideA.snapTo(0f)
+    }
+    val tSide = tSideA.value
     val collapseT = tSide
     val detailT by animateFloatAsState(
         if (st.detail) 1f else 0f, tween(600, easing = DockEase), label = "dkDet"
@@ -1023,8 +1028,8 @@ private fun DockRootContent(
     val sideS = 52f * tSide * (1f - detailT)
     val tabBase = if (isNetease) 60f + navInset else 56f
     val tabVis = tabGrow.value * (1f - detailT)
-    // 网页涨高走 max-height 0→64 的曲线、内容高 56 先饱和：高度/间距按 64 过冲折算，
-    // 比 0→56 直线明显快（沙盒实测 t=200ms 时网页已 45/56、直线只有约 34）
+    // 网页涨高走 max-height 0→64 的曲线、内容高 56 先饱和：高度/间距按 64 过冲
+    // 折算（CSS 原值；cheng 真机录屏里迷你条被涨起的导航栏顶着匀速升到顶）
     val tabHFrac = min(1f, tabGrow.value * (64f / tabBase)) * (1f - detailT)
     val tabH = tabBase * tabHFrac
     val tabAlpha = tabVis
@@ -1096,42 +1101,20 @@ private fun DockRootContent(
                         }
                     }
                     if (sideS > 0.5f) {
-                        if (!colActive) {
-                            // 展开程（3.85.14，沙盒实锤）：网页侧钮展开时是 abspos，
-                            // 静态位都在坞的左上角——搜索钮同帧跳到左角与主页钮
-                            // 叠放，两钮一起收进左上角（右角那个是同帧消失）。
-                            Box(
-                                Modifier.align(Alignment.TopStart)
-                                    .padding(start = 13.dp)
-                            ) {
-                                DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent, topAnchor = true) {
-                                    onTab("home")
-                                }
+                        Box(
+                            Modifier.align(Alignment.CenterStart)
+                                .padding(start = 13.dp)
+                        ) {
+                            DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent) {
+                                onTab("home")
                             }
-                            Box(
-                                Modifier.align(Alignment.TopStart)
-                                    .padding(start = 13.dp)
-                            ) {
-                                DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent, topAnchor = true) {
-                                    onTab("search")
-                                }
-                            }
-                        } else {
-                            Box(
-                                Modifier.align(Alignment.CenterStart)
-                                    .padding(start = 13.dp)
-                            ) {
-                                DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent) {
-                                    onTab("home")
-                                }
-                            }
-                            Box(
-                                Modifier.align(Alignment.CenterEnd)
-                                    .padding(end = 13.dp)
-                            ) {
-                                DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent) {
-                                    onTab("search")
-                                }
+                        }
+                        Box(
+                            Modifier.align(Alignment.CenterEnd)
+                                .padding(end = 13.dp)
+                        ) {
+                            DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent) {
+                                onTab("search")
                             }
                         }
                     }
@@ -1184,11 +1167,7 @@ private fun DockRootContent(
             if (tabH > 0.5f) {
                 Box(
                     Modifier.fillMaxWidth()
-                        .padding(
-                            start = tabStart.dp,
-                            end = (tabEnd + (screenWDp - tabStart - tabEnd) *
-                                (1f - tabGrow.value)).dp
-                        )
+                        .padding(start = tabStart.dp, end = tabEnd.dp)
                         .alpha(tabAlpha)
                         .graphicsLayer {
                             scaleX = tabScale; scaleY = tabScale
