@@ -1105,8 +1105,12 @@ fun NativePlayerRoot(
         val safeTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
         val safeBot = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
         Column(Modifier.fillMaxSize()) {
-            // 抓手(网页 .np-grab:margin-top = 10px + 安全区,36x5)
-            Spacer(Modifier.height(safeTop + 10.dp))
+            // 抓手(网页 .np-grab:margin-top = 10px + 安全区,36x5)。
+            // 3.84.33:实测封面比网页高 26px≈7.4dp——网页文本行盒高
+            // (浏览器 normal 行高约 1.4 倍字号)比 Compose 默认(约
+            // 1.29)高约 4dp、安全区约差 3dp;此处补 3dp,余下靠信息
+            // 区标题/歌手显式行高(见下)补齐,封面落点与网页一致
+            Spacer(Modifier.height(safeTop + 13.dp))
             Box(
                 Modifier.fillMaxWidth().then(dragMod),
                 contentAlignment = Alignment.Center
@@ -1125,11 +1129,12 @@ fun NativePlayerRoot(
             ) {
                 Text(
                     st.title.ifEmpty { "—" }, color = wht, fontSize = 22.sp,
+                    lineHeight = 31.sp,
                     fontWeight = FontWeight.Bold, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center
                 )
                 Text(
-                    st.artist, color = w70, fontSize = 16.sp,
+                    st.artist, color = w70, fontSize = 16.sp, lineHeight = 22.sp,
                     fontWeight = FontWeight.Medium, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
                     modifier = Modifier.padding(top = 4.dp)
@@ -1192,16 +1197,21 @@ fun NativePlayerRoot(
                 }
                 idx
             }
+            // 歌词区(3.84.33 照网页版结构):网页歌词框 flex:1 直抵
+            // 进度区顶,故事/喜欢/评论行(.np-extra-links)是
+            // position:absolute;bottom:100% 浮在进度区上方、叠在
+            // 歌词框底部。此前原生把这行排在列表下方占流,列表被
+            // 吃掉约 44dp(行 38+距 6):当前行比网页高约 2.8% 屏高、
+            // 上下第二行被挤到框外渐隐区里看不见(cheng 录屏实锤
+            // 只各露一行)。改同构:外 Box 占满弹性区(空态同理,
+            // 3.84.26),故事行改浮层贴框底,列表直抵进度区间距
+            Box(Modifier.fillMaxWidth().weight(1f)) {
             if (lines.isEmpty()) {
-                // 空态也要占满弹性区(3.84.26):此前是固定 120dp 盒、
-                // 整列没有 weight 元素,下方进度/时间/控制/工具整串
-                // 不贴底、被抬高约 110dp,歌词一到又掉回去(cheng
-                // 录屏实锤:暂无歌词时下面整串浮起)。与有词时同高,
-                // 位置恒定
-                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text("暂无歌词", color = w50, fontSize = 14.sp)
                 }
             } else {
+                Column(Modifier.fillMaxSize()) {
                 val listState = rememberLazyListState()
                 var holdUntil by remember { mutableStateOf(0L) }
                 LaunchedEffect(listState.isScrollInProgress) {
@@ -1274,8 +1284,8 @@ fun NativePlayerRoot(
                             drawContent()
                             drawRect(
                                 brush = Brush.verticalGradient(
-                                    0f to Color.Transparent, 0.14f to Color.Black,
-                                    0.86f to Color.Black, 1f to Color.Transparent
+                                    0f to Color.Transparent, 0.10f to Color.Black,
+                                    0.90f to Color.Black, 1f to Color.Transparent
                                 ),
                                 blendMode = BlendMode.DstIn
                             )
@@ -1294,11 +1304,13 @@ fun NativePlayerRoot(
                         )
                     }
                 }
+                }
             }
-            Spacer(Modifier.height(6.dp))
-            // 歌曲故事(左)/喜欢+评论(右):进度条上方一行,与网页版同位同款
+            // 故事(左)/喜欢+评论(右)浮层:贴歌词框底部(网页
+            // .np-extra-links 浮在歌词框底同理,歌词从其下滚过)
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+                Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                    .padding(horizontal = 24.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (st.storyOn) {
@@ -1328,6 +1340,8 @@ fun NativePlayerRoot(
                     }
                 }
             }
+            }
+            Spacer(Modifier.height(6.dp))
             // 进度(四种样式与网页版一致:orbit 星轨/heart 心跳波/
             // bar 线条/glow 流光,跟随网页设置 aq_np_seek)
             val dur = maxOf(st.durMs, 1L)
