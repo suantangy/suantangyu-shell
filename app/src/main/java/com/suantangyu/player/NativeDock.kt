@@ -140,7 +140,7 @@ object NativeDockStore {
 
 private const val D_PLAY = "M8 5v14l11-7z"
 private const val D_PAUSE = "M6 5h4v14H6zM14 5h4v14h-4z"
-private const val D_NEXT = "M6 18l8.5-6L6 6v12zM16 6h2v12h-2z"
+private const val D_NEXT = "M6 4l10 8-10 8V4zm12 0h2v16h-2z"
 private const val D_HOME = "M12 3.2L4 10v10h5v-6h6v6h5V10l-8-6.8z"
 private const val D_LIB = "M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h10v2H4v-2z"
 private const val D_GEAR =
@@ -432,6 +432,14 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
                 Box(Modifier.fillMaxSize().border(1.dp, Color.Black.copy(0.35f), CircleShape))
             }
         }
+        // 中心孔（3.85.5 按 cheng 令加回）：照网页 ::after——总径 7px、底 #0b0b0d、
+        // 1.5px 白 .4 边（border-box，黑心实径 4），压在封面之上
+        Box(
+            Modifier.size(7.dp).clip(CircleShape).background(Color(0xFF0B0B0D)),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
+        }
     }
 }
 
@@ -464,21 +472,30 @@ private fun DockCover(sizeDp: Float, spin: Float, bmp: Bitmap?, dark: Boolean) {
 
 @Composable
 private fun DockSideBtn(
-    home: Boolean, sizeDp: Float, on: Boolean, dark: Boolean,
+    home: Boolean, sizeDp: Float, t: Float, on: Boolean, dark: Boolean,
     accent: Color, onClick: () -> Unit
 ) {
     val shape = RoundedCornerShape(percent = 50)
     val col = if (on) accent
     else if (dark) Color(235, 235, 245).copy(0.68f)
     else Color(60, 60, 67).copy(0.55f)
+    // 3.85.5 照网页 .dock-side：槽位宽 0→52 把迷你条推窄，圆钮本体固定 52、
+    // scale .72→1＋整钮淡入（旧版圆从 0 长大，入场观感与网页不同）
     Box(
-        Modifier.size(sizeDp.dp)
-            .dockGlass(shape, dark, shown = false, bg = NativeDockStore.backdrop == null)
-            .clip(shape).dockPress(0.9f) { onClick() },
+        Modifier.width(sizeDp.dp).height(52.dp).clipToBounds(),
         contentAlignment = Alignment.Center
     ) {
-        if (NativeDockStore.backdrop != null) DockBackdropSlice(dockWash(false, dark))
-        if (sizeDp > 30f) {
+        Box(
+            Modifier.size(52.dp)
+                .graphicsLayer {
+                    val sc = 0.72f + 0.28f * t
+                    scaleX = sc; scaleY = sc; alpha = t
+                }
+                .dockGlass(shape, dark, shown = false, bg = NativeDockStore.backdrop == null)
+                .clip(shape).dockPress(0.9f) { onClick() },
+            contentAlignment = Alignment.Center
+        ) {
+            if (NativeDockStore.backdrop != null) DockBackdropSlice(dockWash(false, dark))
             if (home) DockSvg(D_HOME, 24.dp, col) else DockSearchIcon(24.dp, col)
         }
     }
@@ -906,7 +923,7 @@ private fun DockRootContent(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (sideS > 0.5f) {
-                    DockSideBtn(true, sideS, st.page == "home", st.dark, st.accent) {
+                    DockSideBtn(true, sideS, collapseT, st.page == "home", st.dark, st.accent) {
                         onTab("home")
                     }
                 }
@@ -928,7 +945,7 @@ private fun DockRootContent(
                     }
                 }
                 if (sideS > 0.5f) {
-                    DockSideBtn(false, sideS, st.page == "search", st.dark, st.accent) {
+                    DockSideBtn(false, sideS, collapseT, st.page == "search", st.dark, st.accent) {
                         onTab("search")
                     }
                 }

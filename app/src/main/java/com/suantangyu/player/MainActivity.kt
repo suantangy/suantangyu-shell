@@ -724,6 +724,8 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             try {
                 val o = org.json.JSONObject(json)
+                val oldCollapsed = NativeDockStore.collapsed
+                val oldDetail = NativeDockStore.detail
                 NativeDockStore.page = o.optString("page", "home")
                 NativeDockStore.collapsed = o.optBoolean("collapsed")
                 NativeDockStore.detail = o.optBoolean("detail")
@@ -757,6 +759,15 @@ class MainActivity : AppCompatActivity() {
                     uiHandler.postDelayed({ captureDockBackdrop(true) }, 350)
                 }
                 refreshNativeDock()
+                if (NativeDockStore.collapsed != oldCollapsed ||
+                    NativeDockStore.detail != oldDetail
+                ) {
+                    // 3.85.5：收起/详情切换时 Dock 要动约 .8s，沿途连拍底图，
+                    // 防移动中糊影错位、条身发白（cheng 报收起效果与网页不同的一项）
+                    for (d in longArrayOf(120, 320, 560, 820)) {
+                        uiHandler.postDelayed({ captureDockBackdrop(true) }, d)
+                    }
+                }
             } catch (_: Exception) {
             }
         }
@@ -783,6 +794,8 @@ class MainActivity : AppCompatActivity() {
 
     // —— 3.85.1 真毛玻璃：截 Dock 背后的网页画面 → 缩小 → 糊化+增艳 → 供 NativeDock 切片垫底 ——
     private var dockBackdropBusy = false
+    // 3.85.5：忙时来了强制截取先记账，现行截取一落地立刻补一张（不丢帧）
+    private var dockCapturePending = false
     private var lastDockBackdropAt = 0L
     private var lastDockScrollY = -1
     private var dockBackdropLoopStarted = false
@@ -811,9 +824,14 @@ class MainActivity : AppCompatActivity() {
                 dockScrollY = scrollTop
                 NativeDockStore.backdropShiftPx = dockShiftNow()
             }
-            captureDockBackdrop()
+            // 3.85.5：位移已超出拉伸能糊弄的范围（>150px）立刻强制重截，不等节流
+            if (kotlin.math.abs(NativeDockStore.backdropShiftPx) > 150) {
+                captureDockBackdrop(true)
+            } else {
+                captureDockBackdrop()
+            }
             uiHandler.removeCallbacks(dockSettleCapture)
-            uiHandler.postDelayed(dockSettleCapture, 220)
+            uiHandler.postDelayed(dockSettleCapture, 110)
         }
     }
 
@@ -841,7 +859,10 @@ class MainActivity : AppCompatActivity() {
         val capScrollY = dockScrollY
         val now = SystemClock.uptimeMillis()
         if (!force && now - lastDockBackdropAt < 70) return
-        if (dockBackdropBusy) return
+        if (dockBackdropBusy) {
+            if (force) dockCapturePending = true
+            return
+        }
         lastDockBackdropAt = now
         dockBackdropBusy = true
         try {
@@ -863,6 +884,10 @@ class MainActivity : AppCompatActivity() {
                         NativeDockStore.backdropScale = scale
                         dockCaptureScrollY = capScrollY
                         NativeDockStore.backdropShiftPx = dockShiftNow()
+                        if (dockCapturePending) {
+                            dockCapturePending = false
+                            captureDockBackdrop(true)
+                        }
                     }
                 } catch (_: Exception) {
                 } finally {
