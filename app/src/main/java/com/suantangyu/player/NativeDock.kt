@@ -1,6 +1,7 @@
 package com.suantangyu.player
 
 import android.graphics.Bitmap
+import android.util.LruCache
 import android.graphics.BlurMaskFilter
 import android.os.SystemClock
 import androidx.compose.animation.AnimatedContent
@@ -61,6 +62,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -454,14 +456,16 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
                         .border(1.dp, Color.Black.copy(0.35f), CircleShape)
                 )
                 Box(
-                    Modifier.size(44.dp).clip(CircleShape)
-                        .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE)),
+                    Modifier.size(44.dp)
+                        .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE), CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
                     if (bmp != null) {
                         Image(
-                            bmp.asImageBitmap(), null, Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop
+                            remember(bmp) { circleCropBmp(bmp) }.asImageBitmap(), null,
+                            Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                            filterQuality = FilterQuality.High
                         )
                     }
                 }
@@ -473,7 +477,7 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
         // 3.85.9：总径 11（黑心 8）——cheng 逐行实测 App 黑心 Ø≈21.5px < 网页 ≈24px：
         // 原生边框＋抗锯齿对黑心的侵蚀比 CSS 大约 1.4px/边，按实测差额放大黑心补偿
         Box(
-            Modifier.size(11.dp).clip(CircleShape).background(Color(0xFF0B0B0D)),
+            Modifier.size(11.dp).background(Color(0xFF0B0B0D), CircleShape),
             contentAlignment = Alignment.Center
         ) {
             Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
@@ -483,6 +487,32 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
 
 /** 3.85.4：黏性封面——新歌封面没加载完先顶着上一首的图，到了整帧换，
  * 不让 CoverBitmap 在切歌时露 #EEEEEE 白占位（cheng 报的切歌闪白） */
+// 封面预裁成正圆（3.85.10）：Compose 的圆形 clipPath 在不少机器上不抗锯齿、
+// 边缘有刺（cheng 指认）；用 AA 画笔把圆烘进位图本身，再以 High 过滤绘制，边缘才细腻。
+// 网页浏览器对 border-radius 圆图是带 AA 合成的，这步即对齐它。
+private val circleBmpCache = LruCache<Bitmap, Bitmap>(24)
+
+private fun circleCropBmp(src: Bitmap): Bitmap {
+    circleBmpCache.get(src)?.let { return it }
+    val size = minOf(src.width, src.height)
+    if (size <= 0) return src
+    val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val cv = android.graphics.Canvas(out)
+    val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+    cv.drawCircle(size / 2f, size / 2f, size / 2f, p)
+    p.xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_IN)
+    val l = (src.width - size) / 2
+    val t = (src.height - size) / 2
+    cv.drawBitmap(
+        src,
+        android.graphics.Rect(l, t, l + size, t + size),
+        android.graphics.Rect(0, 0, size, size),
+        p
+    )
+    circleBmpCache.put(src, out)
+    return out
+}
+
 @Composable
 private fun DockStickyCover(url: String): Bitmap? {
     val fresh = CoverBitmap(url)
@@ -495,14 +525,15 @@ private fun DockStickyCover(url: String): Bitmap? {
 private fun DockCover(sizeDp: Float, spin: Float, bmp: Bitmap?, dark: Boolean) {
     Box(
         Modifier.size(sizeDp.dp).graphicsLayer { rotationZ = spin }
-            .clip(CircleShape)
-            .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE)),
+            .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE), CircleShape),
         contentAlignment = Alignment.Center
     ) {
         if (bmp != null) {
             Image(
-                bmp.asImageBitmap(), null, Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
+                remember(bmp) { circleCropBmp(bmp) }.asImageBitmap(), null,
+                Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+                filterQuality = FilterQuality.High
             )
         }
     }
