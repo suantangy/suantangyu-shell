@@ -58,6 +58,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -69,7 +70,6 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.drawLayer
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
@@ -287,10 +287,12 @@ private fun DockBackdropSlice(wash: Brush) {
     // （已挂 RenderEffect 模糊），按窗口坐标对位——不再用 WebView 截图糊
     val homeLayer = if (NativeHomeStore.blurActive()) NativeHomeStore.homeLayer else null
     if (homeLayer != null) {
+        // drawLayer 是 ContentDrawScope 的成员（drawBehind 的 DrawScope 没有），
+        // 故这一支走 drawWithContent；本 Box 无子内容，不调 drawContent 无副作用
         Box(
             Modifier.fillMaxSize()
                 .onGloballyPositioned { winPos = it.positionInWindow() }
-                .drawBehind {
+                .drawWithContent {
                     translate(
                         left = (NativeHomeStore.rectLeftPx - winPos.x),
                         top = (NativeHomeStore.rectTopPx - winPos.y)
