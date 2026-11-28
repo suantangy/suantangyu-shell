@@ -61,6 +61,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.layout.ContentScale
@@ -401,6 +402,12 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                         }
                     }
                     drawContent()
+                    // 3.86.4：图层须被真正画进帧里 toImageBitmap 才有内容——
+                    // 3.86.3 没人画它，烘焙出整张透明图，菜单/Dock 的糊全落空。
+                    // 原样画回自身位置：两条录制区与底下同像素，重画无视觉变化
+                    if (vis && !homeScrolling) {
+                        try { drawLayer(layer) } catch (_: Exception) {}
+                    }
                 }
                 .background(pal.bg)
         ) {
@@ -1197,6 +1204,20 @@ private fun bakeHomeBlur(
             }
             System.arraycopy(tmp, 0, px, 0, px.size)
         }
+        // 自检：两条录制带里应有不透明像素（主页底色是不透明的）；
+        // 整图透明＝图层没录到东西，这次烘焙作废、别覆盖旧图
+        var anyOpaque = false
+        val probeY = intArrayOf(2, h / 6, h - 3, (h - 3).coerceAtLeast(0))
+        for (py in probeY) {
+            if (py < 0 || py >= h) continue
+            var xx = 0
+            while (xx < w) {
+                if (android.graphics.Color.alpha(px[py * w + xx]) > 0) { anyOpaque = true; break }
+                xx += 16
+            }
+            if (anyOpaque) break
+        }
+        if (!anyOpaque) return null
         passH(); passV(); passH(); passV(); passH(); passV()
         val blurred = android.graphics.Bitmap.createBitmap(
             w, h, android.graphics.Bitmap.Config.ARGB_8888
