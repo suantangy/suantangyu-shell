@@ -726,6 +726,9 @@ class MainActivity : AppCompatActivity() {
                 val o = org.json.JSONObject(json)
                 val oldCollapsed = NativeDockStore.collapsed
                 val oldDetail = NativeDockStore.detail
+                // 3.85.20：页面/详情/深浅一变，白化守卫基线清零（新页首图无条件认）
+                lastBackdropMean = -1f
+                backdropRejectStreak = 0
                 NativeDockStore.page = o.optString("page", "home")
                 NativeDockStore.collapsed = o.optBoolean("collapsed")
                 NativeDockStore.detail = o.optBoolean("detail")
@@ -855,6 +858,32 @@ class MainActivity : AppCompatActivity() {
     private fun dockShiftNow(): Int =
         (dockScrollY - dockCaptureScrollY).coerceIn(-260, 340)
 
+    // 3.85.20 白化守卫的账本：上一张已发布底图的底部条均亮与连丢计数
+    private var lastBackdropMean = -1f
+    private var backdropRejectStreak = 0
+
+    /** 底图底部 40% 条带的平均亮度（小图抽样，0-255） */
+    private fun backdropStripMean(bmp: Bitmap): Float {
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return -1f
+        val y0 = (h * 0.6f).toInt()
+        val px = IntArray(w * (h - y0))
+        bmp.getPixels(px, 0, w, 0, y0, w, h - y0)
+        var sum = 0L
+        var n = 0
+        var i = 0
+        while (i < px.size) {
+            val c = px[i]
+            sum += (android.graphics.Color.red(c) +
+                android.graphics.Color.green(c) +
+                android.graphics.Color.blue(c)) / 3
+            n++
+            i += 7
+        }
+        return if (n > 0) sum.toFloat() / n else -1f
+    }
+
     /** 3.85.2/3.85.4：网页在滚 → 先按位移补偿顶一帧，同时重截＋停稳补截 */
     fun onDockScroll(scrollTop: Int) {
         runOnUiThread {
@@ -916,7 +945,26 @@ class MainActivity : AppCompatActivity() {
             Thread {
                 try {
                     val out = blurAndSaturate(raw, 35)
+                    // 3.85.20：详情页滚到中途截取会整张发白（WebView 绘制
+                    // 白化，cheng 录屏实锤：背后明明是深色列表、迷你却变
+                    // 纯白）。发布前验一道：新图底部条（坞自身那截）均亮
+                    // 比上一张跳升 >55 且上一张不亮 → 判白化、丢弃不用，
+                    // 旧图继续靠位移补偿顶着；连丢 4 张则认页面真变了、放行
+                    val mean = backdropStripMean(out)
                     runOnUiThread {
+                        val cliff = lastBackdropMean >= 0f &&
+                            lastBackdropMean < 170f &&
+                            mean > lastBackdropMean + 55f
+                        if (cliff && backdropRejectStreak < 4) {
+                            backdropRejectStreak++
+                            if (dockCapturePending) {
+                                dockCapturePending = false
+                                captureDockBackdrop(true)
+                            }
+                            return@runOnUiThread
+                        }
+                        backdropRejectStreak = 0
+                        lastBackdropMean = mean
                         NativeDockStore.backdrop = out.asImageBitmap()
                         NativeDockStore.backdropTopPx = top
                         NativeDockStore.backdropScale = scale
