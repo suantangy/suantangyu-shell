@@ -115,6 +115,8 @@ object NativeDockStore {
     var backdropTopPx by mutableStateOf(-1)
     var backdropScale by mutableStateOf(0.25f)
     var regionTopPx by mutableStateOf(-1)
+    // 3.85.4：底图位移补偿（截取后页面又滚过的距离，切片绘制时平移＋纵向拉伸补边）
+    var backdropShiftPx by mutableStateOf(0)
     var hasTrack by mutableStateOf(false)
     var title by mutableStateOf("")
     var artist by mutableStateOf("")
@@ -254,15 +256,16 @@ private fun DockBackdropSlice(wash: Brush) {
                 val scale = st.backdropScale
                 val dstW = (bmp.width / scale).roundToInt()
                 val dstH = (bmp.height / scale).roundToInt()
+                val shift = st.backdropShiftPx
                 drawImage(
                     bmp,
                     srcOffset = IntOffset.Zero,
                     srcSize = IntSize(bmp.width, bmp.height),
                     dstOffset = IntOffset(
                         -winPos.x.roundToInt(),
-                        -(winPos.y - st.backdropTopPx).roundToInt()
+                        -(winPos.y - st.backdropTopPx).roundToInt() - shift
                     ),
-                    dstSize = IntSize(dstW, dstH)
+                    dstSize = IntSize(dstW, dstH + maxOf(0, shift))
                 )
                 drawRect(wash, size = size)
             }
@@ -428,14 +431,18 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
                 }
                 Box(Modifier.fillMaxSize().border(1.dp, Color.Black.copy(0.35f), CircleShape))
             }
-            // 中心孔 7px：#0b0b0d＋1.5px 白 .4 边，压在封面上（网页 ::after z-index 2）
-            Box(
-                Modifier.size(7.dp).clip(CircleShape).background(Color(0xFF0B0B0D))
-            ) {
-                Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
-            }
         }
     }
+}
+
+/** 3.85.4：黏性封面——新歌封面没加载完先顶着上一首的图，到了整帧换，
+ * 不让 CoverBitmap 在切歌时露 #EEEEEE 白占位（cheng 报的切歌闪白） */
+@Composable
+private fun DockStickyCover(url: String): Bitmap? {
+    val fresh = CoverBitmap(url)
+    var shown by remember { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(fresh) { if (fresh != null) shown = fresh }
+    return fresh ?: shown
 }
 
 @Composable
@@ -884,7 +891,7 @@ private fun DockRootContent(
     val lyricColor = if (st.dark) androidx.compose.ui.graphics.lerp(
         st.accent, Color.White, 0.35f
     ) else st.npAccent
-    val bmp = CoverBitmap(st.cover)
+    val bmp = DockStickyCover(st.cover)
     val dens = LocalDensity.current.density
     Box(Modifier.fillMaxSize()) {
         Column(
@@ -905,7 +912,10 @@ private fun DockRootContent(
                 }
                 Box(
                     Modifier.weight(1f)
-                        .padding(start = (miniStart - 13f).dp, end = (miniEnd - 13f).dp)
+                        .padding(
+                            start = (miniStart - 13f - sideS).dp,
+                            end = (miniEnd - 13f - sideS).dp
+                        )
                 ) {
                     if (miniH > 0.5f) {
                         DockMiniBar(

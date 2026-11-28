@@ -795,9 +795,22 @@ class MainActivity : AppCompatActivity() {
 
     private val dockSettleCapture = Runnable { captureDockBackdrop(true) }
 
-    /** 3.85.2：网页在滚（1_182 报）→ 立刻重截＋停稳后再补一张准的 */
-    fun onDockScroll() {
+    // 3.85.4 位移补偿账本：dockScrollY=网页最近报的滚动位置（设备 px），
+    // dockCaptureScrollY=现行底图截取那一刻的滚动位置；切片按两者之差平移，
+    // 截取间隙里糊影跟着内容走，不再滞后一拍
+    @Volatile private var dockScrollY = 0
+    @Volatile private var dockCaptureScrollY = 0
+
+    private fun dockShiftNow(): Int =
+        (dockScrollY - dockCaptureScrollY).coerceIn(-260, 340)
+
+    /** 3.85.2/3.85.4：网页在滚 → 先按位移补偿顶一帧，同时重截＋停稳补截 */
+    fun onDockScroll(scrollTop: Int) {
         runOnUiThread {
+            if (scrollTop >= 0) {
+                dockScrollY = scrollTop
+                NativeDockStore.backdropShiftPx = dockShiftNow()
+            }
             captureDockBackdrop()
             uiHandler.removeCallbacks(dockSettleCapture)
             uiHandler.postDelayed(dockSettleCapture, 220)
@@ -823,8 +836,9 @@ class MainActivity : AppCompatActivity() {
     private fun captureDockBackdrop(force: Boolean = false) {
         if (!NativeDockStore.enabled || NativeDockStore.imeOpen) return
         if (!::webView.isInitialized) return
-        val top = NativeDockStore.regionTopPx
-        if (top < 0 || webView.width <= 0 || webView.height <= top + 40) return
+        val top = (NativeDockStore.regionTopPx - 260).coerceAtLeast(0)
+        if (NativeDockStore.regionTopPx < 0 || webView.width <= 0 || webView.height <= top + 40) return
+        val capScrollY = dockScrollY
         val now = SystemClock.uptimeMillis()
         if (!force && now - lastDockBackdropAt < 70) return
         if (dockBackdropBusy) return
@@ -847,6 +861,8 @@ class MainActivity : AppCompatActivity() {
                         NativeDockStore.backdrop = out.asImageBitmap()
                         NativeDockStore.backdropTopPx = top
                         NativeDockStore.backdropScale = scale
+                        dockCaptureScrollY = capScrollY
+                        NativeDockStore.backdropShiftPx = dockShiftNow()
                     }
                 } catch (_: Exception) {
                 } finally {
