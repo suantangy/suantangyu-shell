@@ -43,6 +43,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
@@ -55,6 +56,7 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -69,7 +71,12 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.json.JSONObject
@@ -122,6 +129,17 @@ object NativeHomeStore {
     var platMenuShown by mutableStateOf(false)
     // 3.86.2 ⑦：底部安全区（dp），MainActivity 随 insets 灌入，与注入网页的值同源
     var safeBottomDp by mutableStateOf(0)
+    // 3.86.3：网页实算 --safe-b（快照 safeB，CSS px）——底距公式优先用它
+    var safeBWeb by mutableStateOf(0)
+    // 3.86.3 ②：停稳烘焙好的主页糊位图（Dock/站源菜单贴它，不再逐帧过模糊）
+    var homeBlurBmp by mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null)
+    // 快照代次：parse 成功即 +1，烘焙以它为触发键之一
+    var dataVersion by mutableStateOf(0)
+    // 3.86.3 ⑥：站源菜单锚点（tap 当场 rect，设备 px；-1=无，用快照 platRect 兜底）
+    var menuAnchorL by mutableStateOf(-1)
+    var menuAnchorT by mutableStateOf(-1)
+    var menuAnchorW by mutableStateOf(0)
+    var menuAnchorH by mutableStateOf(0)
     // 3.86.1：站源菜单开着时原生主页让位（菜单挂在网页 header 下、垂进主页区，
     // 不让位会被原生层盖住点不了）
     var platMenuOpen by mutableStateOf(false)
@@ -131,7 +149,7 @@ object NativeHomeStore {
             rectWidthPx > 0 && rectHeightPx > 0
 
     fun blurActive(): Boolean =
-        visibleNow() && homeLayer != null && Build.VERSION.SDK_INT >= 31
+        visibleNow() && homeBlurBmp != null
 
     fun parse(json: String) {
         try {
@@ -158,6 +176,7 @@ object NativeHomeStore {
                 platRectL = prc.optInt(0); platRectT = prc.optInt(1)
                 platRectW = prc.optInt(2); platRectH = prc.optInt(3)
             }
+            safeBWeb = o.optDouble("safeB", 0.0).toInt()
             val duo = o.optJSONObject("duo")
             if (duo != null) {
                 duoGuess = duoOf(duo.optJSONObject("guess"), duoGuess)
@@ -207,6 +226,7 @@ object NativeHomeStore {
                 val c = rkArr!!.optJSONObject(i) ?: JSONObject()
                 HomeCard(c.optString("cover"), c.optString("name"), "")
             }
+            dataVersion++
         } catch (_: Exception) {
         }
     }
@@ -291,32 +311,8 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
     val xDp = with(density) { st.rectLeftPx.toDp() }
     val yDp = with(density) { st.rectTopPx.toDp() }
     val layer = rememberGraphicsLayer()
-    var layerFxSet by remember { mutableStateOf(false) }
-    SideEffect {
-        st.homeLayer = layer
-        if (!layerFxSet && Build.VERSION.SDK_INT >= 31) {
-            layerFxSet = true
-            try {
-                layer.renderEffect = androidx.compose.ui.graphics.BlurEffect(
-                    150f, 150f, TileMode.Decal
-                )
-                // 3.86.1：网页玻璃是 saturate(220%) blur(48px)——只糊不饱和，
-                // 在浅色主页上看着像白色透明；给图层补 2.2 饱和（色矩阵）
-                val s = 1.85f
-                layer.colorFilter = ColorFilter.colorMatrix(
-                    ColorMatrix(
-                        floatArrayOf(
-                            0.213f + 0.787f * s, 0.715f - 0.715f * s, 0.072f - 0.072f * s, 0f, 0f,
-                            0.213f - 0.213f * s, 0.715f + 0.285f * s, 0.072f - 0.072f * s, 0f, 0f,
-                            0.213f - 0.213f * s, 0.715f - 0.715f * s, 0.072f + 0.928f * s, 0f, 0f,
-                            0f, 0f, 0f, 1f, 0f
-                        )
-                    )
-                )
-            } catch (_: Exception) {
-            }
-        }
-    }
+    // 3.86.3 ②：图层只录原图，模糊＋饱和在停稳烘焙时一次算进位图（见 bakeHomeBlur）
+    SideEffect { st.homeLayer = layer }
     val listState = rememberLazyListState()
     // 3.86.2 ②：滚动中停录图层（每帧重录是滑动掉帧主因），停稳补录一次
     var homeScrolling by remember { mutableStateOf(false) }
@@ -327,6 +323,19 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                 homeScrolling = sc
                 if (!sc) recordTick++
             }
+    }
+    // 3.86.3 ② 烘焙：停稳/数据变/页面出现后 90ms，把图层算成糊位图存好
+    LaunchedEffect(recordTick, st.dataVersion, vis) {
+        if (!vis) return@LaunchedEffect
+        delay(90)
+        if (!homeScrolling && st.visibleNow()) {
+            try {
+                val raw = layer.toImageBitmap()
+                val baked = withContext(Dispatchers.Default) { bakeHomeBlur(raw) }
+                if (baked != null) st.homeBlurBmp = baked
+            } catch (_: Exception) {
+            }
+        }
     }
     // 原生主页滚动驱动 Dock 收起（网页主页没在滚、它的收起值已过期）：
     // 下滚收起、上滚展开、回顶必展开
@@ -373,10 +382,14 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                     if (vis && !homeScrolling && tick >= 0) {
                         try {
                             val cds = this
-                            // 3.86.1：图层只录底部 240dp 条（Dock 只采样这一带），
-                            // 录制/光栅成本降一大截，滑动更跟手
+                            // 3.86.3：录两条——底部 240dp 供 Dock、顶部 360dp
+                            // 供站源菜单的玻璃底；中间不录，省光栅
                             val strip = 240.dp.toPx()
+                            val topStrip = 360.dp.toPx()
                             layer.record {
+                                clipRect(0f, 0f, size.width, topStrip) {
+                                    with(cds) { drawContent() }
+                                }
                                 clipRect(
                                     0f, size.height - strip, size.width, size.height
                                 ) {
@@ -393,7 +406,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
             LazyColumn(
                 state = listState,
                 contentPadding = PaddingValues(start = 20.dp, end = 20.dp,
-                    bottom = (130 + st.safeBottomDp).dp)
+                    bottom = (130 + if (st.safeBWeb > 0) st.safeBWeb else st.safeBottomDp).dp)
             ) {
                 // —— 双卡 ——
                 item(key = "duo") {
@@ -1038,17 +1051,22 @@ private fun HotRow(
 @Composable
 fun HomePlatMenu(onSelect: (String) -> Unit, onDismiss: () -> Unit) {
     val st = NativeHomeStore
-    if (st.plats.isEmpty() || st.platRectW <= 0) return
     val pal = remember(st.dark) { HomePal(st.dark) }
     val density = LocalDensity.current
+    // 3.86.3 ⑥：锚点优先用 tap 当场 rect（桥带回），快照 platRect 只兜底
+    val aL = if (st.menuAnchorW > 0) st.menuAnchorL else st.platRectL
+    val aT = if (st.menuAnchorW > 0) st.menuAnchorT else st.platRectT
+    val aW = if (st.menuAnchorW > 0) st.menuAnchorW else st.platRectW
+    val aH = if (st.menuAnchorW > 0) st.menuAnchorH else st.platRectH
     // 右内距 = 屏宽(px) − 胶囊右缘(px)，换回 dp
     val screenWPx = with(density) {
         androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
     }
     val endDp = with(density) {
-        (screenWPx - (st.platRectL + st.platRectW)).toDp()
+        (screenWPx - (aL + aW)).toDp()
     }
-    val topDp = with(density) { (st.platRectT + st.platRectH).toDp() } + 6.dp
+    val topDp = with(density) { (aT + aH).toDp() } + 6.dp
+    if (st.plats.isEmpty() || aW <= 0) return
     Box(Modifier.fillMaxSize()) {
         Box(
             Modifier
@@ -1058,16 +1076,38 @@ fun HomePlatMenu(onSelect: (String) -> Unit, onDismiss: () -> Unit) {
                     indication = null
                 ) { onDismiss() }
         )
-        Column(
+        Box(
             Modifier
                 .align(Alignment.TopEnd)
                 .padding(top = topDp, end = endDp)
                 .width(160.dp)
                 .shadow(16.dp, RoundedCornerShape(14.dp))
                 .clip(RoundedCornerShape(14.dp))
-                .background(if (st.dark) Color(0xE62C2C2E) else Color(0xF7FFFFFF))
-                .padding(6.dp)
         ) {
+            // 3.86.3 ⑥ 玻璃底：主页糊位图按窗口坐标对位＋网页同值 0.72 罩
+            var cardPos by remember { mutableStateOf(Offset.Zero) }
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .onGloballyPositioned { cardPos = it.positionInWindow() }
+                    .drawBehind {
+                        val bmp = st.homeBlurBmp
+                        if (bmp != null) {
+                            drawImage(
+                                bmp,
+                                dstOffset = IntOffset(
+                                    (st.rectLeftPx - cardPos.x).roundToInt(),
+                                    (st.rectTopPx - cardPos.y).roundToInt()
+                                ),
+                                dstSize = IntSize(st.rectWidthPx, st.rectHeightPx)
+                            )
+                        }
+                        drawRect(
+                            if (st.dark) Color(0xB82C2C2E) else Color(0xB8FFFFFF)
+                        )
+                    }
+            )
+            Column(Modifier.padding(6.dp)) {
             st.plats.forEach { p ->
                 Row(
                     Modifier
@@ -1092,6 +1132,87 @@ fun HomePlatMenu(onSelect: (String) -> Unit, onDismiss: () -> Unit) {
                     )
                 }
             }
+            }
         }
+    }
+}
+
+/**
+ * 3.86.3 ② 烘焙：图层原图 → 0.5 缩放 → 滑动窗盒式模糊横竖各三遍（近似高斯）
+ * → 饱和 1.85。算法与 MainActivity.blurAndSaturate 同款；在后台线程跑，
+ * 只在停稳/数据变时算一次，滚动期间 Dock 只贴这张成品图。
+ */
+private fun bakeHomeBlur(
+    src: androidx.compose.ui.graphics.ImageBitmap
+): androidx.compose.ui.graphics.ImageBitmap? {
+    return try {
+        val sb = src.asAndroidBitmap()
+        val w = (sb.width / 2).coerceAtLeast(1)
+        val h = (sb.height / 2).coerceAtLeast(1)
+        val small = android.graphics.Bitmap.createScaledBitmap(sb, w, h, true)
+        val px = IntArray(w * h)
+        small.getPixels(px, 0, w, 0, 0, w, h)
+        val tmp = IntArray(w * h)
+        val radius = 16
+        val n = radius * 2 + 1
+        fun passH() {
+            for (y in 0 until h) {
+                val row = y * w
+                var sr = 0; var sg = 0; var sb2 = 0; var sa = 0
+                for (k in -radius..radius) {
+                    val c = px[row + k.coerceIn(0, w - 1)]
+                    sa += android.graphics.Color.alpha(c); sr += android.graphics.Color.red(c)
+                    sg += android.graphics.Color.green(c); sb2 += android.graphics.Color.blue(c)
+                }
+                for (x in 0 until w) {
+                    tmp[row + x] = android.graphics.Color.argb(sa / n, sr / n, sg / n, sb2 / n)
+                    val co = px[row + (x - radius).coerceIn(0, w - 1)]
+                    val ci = px[row + (x + radius + 1).coerceIn(0, w - 1)]
+                    sa += android.graphics.Color.alpha(ci) - android.graphics.Color.alpha(co)
+                    sr += android.graphics.Color.red(ci) - android.graphics.Color.red(co)
+                    sg += android.graphics.Color.green(ci) - android.graphics.Color.green(co)
+                    sb2 += android.graphics.Color.blue(ci) - android.graphics.Color.blue(co)
+                }
+            }
+            System.arraycopy(tmp, 0, px, 0, px.size)
+        }
+        fun passV() {
+            for (x in 0 until w) {
+                var sr = 0; var sg = 0; var sb2 = 0; var sa = 0
+                for (k in -radius..radius) {
+                    val c = px[k.coerceIn(0, h - 1) * w + x]
+                    sa += android.graphics.Color.alpha(c); sr += android.graphics.Color.red(c)
+                    sg += android.graphics.Color.green(c); sb2 += android.graphics.Color.blue(c)
+                }
+                for (y in 0 until h) {
+                    tmp[y * w + x] = android.graphics.Color.argb(sa / n, sr / n, sg / n, sb2 / n)
+                    val co = px[(y - radius).coerceIn(0, h - 1) * w + x]
+                    val ci = px[(y + radius + 1).coerceIn(0, h - 1) * w + x]
+                    sa += android.graphics.Color.alpha(ci) - android.graphics.Color.alpha(co)
+                    sr += android.graphics.Color.red(ci) - android.graphics.Color.red(co)
+                    sg += android.graphics.Color.green(ci) - android.graphics.Color.green(co)
+                    sb2 += android.graphics.Color.blue(ci) - android.graphics.Color.blue(co)
+                }
+            }
+            System.arraycopy(tmp, 0, px, 0, px.size)
+        }
+        passH(); passV(); passH(); passV(); passH(); passV()
+        val blurred = android.graphics.Bitmap.createBitmap(
+            w, h, android.graphics.Bitmap.Config.ARGB_8888
+        )
+        blurred.setPixels(px, 0, w, 0, 0, w, h)
+        val cm = android.graphics.ColorMatrix()
+        cm.setSaturation(1.85f)
+        val out = android.graphics.Bitmap.createBitmap(
+            w, h, android.graphics.Bitmap.Config.ARGB_8888
+        )
+        val c2 = android.graphics.Canvas(out)
+        val paint = android.graphics.Paint().apply {
+            colorFilter = android.graphics.ColorMatrixColorFilter(cm)
+        }
+        c2.drawBitmap(blurred, 0f, 0f, paint)
+        out.asImageBitmap()
+    } catch (_: Exception) {
+        null
     }
 }

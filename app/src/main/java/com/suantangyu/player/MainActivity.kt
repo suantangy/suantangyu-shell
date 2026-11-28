@@ -895,9 +895,17 @@ class MainActivity : AppCompatActivity() {
         runJsOnPage("window.__aqHomeAction&&window.__aqHomeAction('$act','$arg')")
     }
 
-    /** 3.86.2 ⑥：网页胶囊被点（原生主页在场）→ 壳画原生站源菜单 */
-    fun onHomePlatTap() {
-        runOnUiThread { NativeHomeStore.platMenuShown = true }
+    /** 3.86.3 ⑥：网页胶囊被点（带当场 rect）→ 壳画原生站源菜单 */
+    fun onHomePlatTap(x: Int, y: Int, w: Int, h: Int) {
+        runOnUiThread {
+            if (w > 0) {
+                NativeHomeStore.menuAnchorL = x
+                NativeHomeStore.menuAnchorT = y
+                NativeHomeStore.menuAnchorW = w
+                NativeHomeStore.menuAnchorH = h
+            }
+            NativeHomeStore.platMenuShown = true
+        }
     }
 
     fun onDockScroll(scrollTop: Int) {
@@ -1034,7 +1042,7 @@ class MainActivity : AppCompatActivity() {
         val blurred = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         blurred.setPixels(px, 0, w, 0, 0, w, h)
         val cm = ColorMatrix()
-        cm.setSaturation(2.2f)
+        cm.setSaturation(1.85f)
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c2 = Canvas(out)
         val paint = Paint().apply { colorFilter = ColorMatrixColorFilter(cm) }

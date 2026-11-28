@@ -286,20 +286,24 @@ private fun DockBackdropSlice(wash: Brush) {
     var winPos by remember { mutableStateOf(Offset.Zero) }
     // 3.86.0 真毛玻璃第一步：原生主页在场时，改画主页录制的 GraphicsLayer
     // （已挂 RenderEffect 模糊），按窗口坐标对位——不再用 WebView 截图糊
-    val homeLayer = if (NativeHomeStore.blurActive()) NativeHomeStore.homeLayer else null
-    if (homeLayer != null) {
-        // drawLayer 是 ContentDrawScope 的成员（drawBehind 的 DrawScope 没有），
-        // 故这一支走 drawWithContent；本 Box 无子内容，不调 drawContent 无副作用
+    // 3.86.3 ②：主页在场时贴烘焙好的糊位图（停稳时一次算好），不再逐帧过图层模糊
+    val homeBmp = if (NativeHomeStore.blurActive()) NativeHomeStore.homeBlurBmp else null
+    if (homeBmp != null) {
         Box(
             Modifier.fillMaxSize()
                 .onGloballyPositioned { winPos = it.positionInWindow() }
-                .drawWithContent {
-                    translate(
-                        left = (NativeHomeStore.rectLeftPx - winPos.x),
-                        top = (NativeHomeStore.rectTopPx - winPos.y)
-                    ) {
-                        drawLayer(homeLayer)
-                    }
+                .drawBehind {
+                    drawImage(
+                        homeBmp,
+                        dstOffset = IntOffset(
+                            (NativeHomeStore.rectLeftPx - winPos.x).roundToInt(),
+                            (NativeHomeStore.rectTopPx - winPos.y).roundToInt()
+                        ),
+                        dstSize = IntSize(
+                            NativeHomeStore.rectWidthPx,
+                            NativeHomeStore.rectHeightPx
+                        )
+                    )
                     drawRect(wash, size = size)
                 }
         )

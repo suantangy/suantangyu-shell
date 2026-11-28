@@ -493,10 +493,10 @@ class BaoBridge(private val activity: MainActivity) {
         activity.onHomeState(json)
     }
 
-    /** 3.86.2：1_186 起原生主页在场时点站源胶囊转壳，壳画原生站源菜单 */
+    /** 3.86.3：1_187 起带胶囊当场 rect（设备 px），菜单锚点不再吃快照旧值 */
     @JavascriptInterface
-    fun postHomePlatTap() {
-        activity.onHomePlatTap()
+    fun postHomePlatTap(x: Int, y: Int, w: Int, h: Int) {
+        activity.onHomePlatTap(x, y, w, h)
     }
 
     @JavascriptInterface
