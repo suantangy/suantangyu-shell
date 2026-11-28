@@ -1381,7 +1381,15 @@ fun NativePlayerRoot(
             // 进度(四种样式与网页版一致:orbit 星轨/heart 心跳波/
             // bar 线条/glow 流光,跟随网页设置 aq_np_seek)
             val dur = maxOf(st.durMs, 1L)
-            val seekFrac = (shownPos.toFloat() / dur).coerceIn(0f, 1f)
+            // 3.84.39：durMs=0（切歌先行展示期、真时长未到）时进度
+            // 必须为空——旧写法把 dur 兜底成 1ms，shownPos 只要涨
+            // 过 1ms 就拉满整条（cheng 实锤：点下一首画面跳过去
+            // 了、进度条却是满的，到真时长落地才从头开始）
+            val seekFrac = if (st.durMs > 0) {
+                (shownPos.toFloat() / dur).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
             // 盒高对齐网页 .np-seek(3.84.24):orbit 36、heart/glow 44;
             // 此前 orbit 48 把时间/控制行整体顶低约 14dp(cheng 实测
             // 网页进度条偏上)

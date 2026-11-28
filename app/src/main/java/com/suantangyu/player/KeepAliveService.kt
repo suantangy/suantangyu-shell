@@ -2800,7 +2800,9 @@ class KeepAliveService : Service() {
                     .put("cover", pcov)
                     .put("playing", playing)
                     .put("pos", 0)
-                    .put("dur", 0)
+                    // 3.84.39：描述符带 interval（秒）就先报真时长，
+                    // 进度条总长不必等落地；没有就 0，页面按 0 处理
+                    .put("dur", pd.optLong("interval", 0) * 1000)
                     .put("mode", brainMode)
                     .put("rate", pendingRate.toDouble())
                     .put("uiKey", pk)
