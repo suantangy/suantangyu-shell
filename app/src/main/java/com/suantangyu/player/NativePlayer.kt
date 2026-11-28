@@ -224,7 +224,7 @@ private fun SvgIconStroke(pathData: String, size: Dp, color: Color, strokeDp: Dp
 @Composable
 private fun PlayerLyricLine(
     line: PlayerLine, tier: Int, lyOn: Color, base: Color,
-    showTr: Boolean, onClick: () -> Unit
+    darkUi: Boolean, showTr: Boolean, onClick: () -> Unit
 ) {
     val targetSize = when (tier) { 2 -> 22f; 1 -> 15f; else -> 14f }
     val animSize by animateFloatAsState(
@@ -232,10 +232,15 @@ private fun PlayerLyricLine(
         tween(280, easing = CubicBezierEasing(0.34f, 1.56f, 0.64f, 1f)),
         label = "lySize"
     )
+    // 三档颜色照网页级联终局(3.84.36):网页 .ly 的颜色 alpha 还要
+    // 再乘元素 opacity——near:色 .55(白字版 .58)×opacity .8≈.44/.46;
+    // far:色 .32×opacity .4≈.128。旧版只抄了个大概(near .75/far
+    // .42),实测 App 相邻行比网页深约一倍、远行深约三倍(cheng
+    // 2026-11-28 截图指认「字体颜色不对、远行效果不对」)
     val targetColor = when (tier) {
         2 -> lyOn
-        1 -> base.copy(alpha = 0.75f)
-        else -> base.copy(alpha = 0.42f)
+        1 -> base.copy(alpha = if (darkUi) 0.44f else 0.46f)
+        else -> base.copy(alpha = 0.128f)
     }
     val animColor by animateColorAsState(targetColor, tween(250), label = "lyColor")
     val targetScale = when (tier) { 2 -> 1f; 1 -> 0.97f; else -> 0.94f }
@@ -1216,6 +1221,7 @@ fun NativePlayerRoot(
                 Column(Modifier.fillMaxSize()) {
                 val listState = rememberLazyListState()
                 var holdUntil by remember { mutableStateOf(0L) }
+                val lyCenterShiftPx = with(LocalDensity.current) { 6.dp.roundToPx() }
                 // 手动滚动后 3 秒不抢(3.84.35):旧版盯 isScrollInProgress,
                 // 但程序自己的居中滚动也算 scrolling——一滚动就把
                 // holdUntil 顶到 +3 秒,歌词换行间隔短于 3 秒时下一行
@@ -1260,7 +1266,12 @@ fun NativePlayerRoot(
                                     }
                                 }
                                 if (item != null) {
-                                    val delta = (item.offset + item.size / 2) - vh / 2
+                                    // 锚点下移 6dp(3.84.36):双截图实测
+                                    // App 当前行停 62.45%、网页 63.09%,
+                                    // 整体高约 0.64% 屏高≈6dp(cheng 指认
+                                    // 「歌词整体位置偏上」),锚点补差
+                                    val delta = (item.offset + item.size / 2) - vh / 2 -
+                                        lyCenterShiftPx
                                     if (kotlin.math.abs(delta) > 2) {
                                         listState.animateScrollBy(
                                             delta.toFloat(),
@@ -1314,7 +1325,7 @@ fun NativePlayerRoot(
                                 kotlin.math.abs(i - curIdx) == 1 -> 1
                                 else -> 0
                             },
-                            lyOn = lyOn, base = wht, showTr = st.transOn,
+                            lyOn = lyOn, base = wht, darkUi = darkUi, showTr = st.transOn,
                             onClick = { onSeek(line.t) }
                         )
                     }
