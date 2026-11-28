@@ -471,6 +471,12 @@ class BaoBridge(private val activity: MainActivity) {
         activity.onDockState(json)
     }
 
+    /** 3.85.2：网页滚动（内层容器）在滚 → 通知壳重截毛玻璃底图，1_182 滚动监听发起 */
+    @JavascriptInterface
+    fun postDockScroll() {
+        activity.onDockScroll()
+    }
+
     @JavascriptInterface
     fun showNativeQueue(dark: Boolean, accent: String) {
         activity.runOnUiThread { activity.showNativeQueue(dark, accent) }

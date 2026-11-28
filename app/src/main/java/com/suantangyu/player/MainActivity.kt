@@ -793,6 +793,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val dockSettleCapture = Runnable { captureDockBackdrop(true) }
+
+    /** 3.85.2：网页在滚（1_182 报）→ 立刻重截＋停稳后再补一张准的 */
+    fun onDockScroll() {
+        runOnUiThread {
+            captureDockBackdrop()
+            uiHandler.removeCallbacks(dockSettleCapture)
+            uiHandler.postDelayed(dockSettleCapture, 220)
+        }
+    }
+
     private fun startDockBackdropLoop() {
         if (dockBackdropLoopStarted) return
         dockBackdropLoopStarted = true
