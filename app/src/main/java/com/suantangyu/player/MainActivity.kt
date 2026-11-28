@@ -522,6 +522,9 @@ class MainActivity : AppCompatActivity() {
         val cv = ComposeView(this)
         cv.visibility = View.GONE
         cv.setContent {
+            NativeHomeRoot(
+                onAction = { act, arg -> homeAction(act, arg) }
+            )
             NativeDockRoot(
                 onTab = { p -> runJsOnPage("window.__aqDockGo&&window.__aqDockGo('$p')") },
                 onToggle = { nativePlayerToggle() },
@@ -603,7 +606,7 @@ class MainActivity : AppCompatActivity() {
         val v = queueComposeView ?: return
         v.visibility =
             if (NativeQueueStore.visible || NativePlayerStore.visible ||
-                NativeDockStore.enabled
+                NativeDockStore.enabled || NativeHomeStore.enabled
             ) View.VISIBLE else View.GONE
     }
 
@@ -727,8 +730,12 @@ class MainActivity : AppCompatActivity() {
                 val oldCollapsed = NativeDockStore.collapsed
                 val oldDetail = NativeDockStore.detail
                 NativeDockStore.page = o.optString("page", "home")
-                NativeDockStore.collapsed = o.optBoolean("collapsed")
                 NativeDockStore.detail = o.optBoolean("detail")
+                // 3.86.0：原生主页在场时，收起由主页滚动驱动（网页主页没在滚、
+                // 它推的收起值已过期），不采网页值
+                if (!NativeHomeStore.visibleNow()) {
+                    NativeDockStore.collapsed = o.optBoolean("collapsed")
+                }
                 NativeDockStore.style = o.optString("style", "liuli")
                 NativeDockStore.dark = o.optBoolean("dark")
                 val acc = o.optString("accent")
@@ -856,6 +863,22 @@ class MainActivity : AppCompatActivity() {
         (dockScrollY - dockCaptureScrollY).coerceIn(-260, 340)
 
     /** 3.85.2/3.85.4：网页在滚 → 先按位移补偿顶一帧，同时重截＋停稳补截 */
+    /** 3.86.0 原生主页：网页推快照（桥线程进来，切主线程落状态） */
+    fun onHomeState(json: String) {
+        runOnUiThread {
+            NativeHomeStore.parse(json)
+            if (!NativeHomeStore.enabled) {
+                NativeHomeStore.enabled = true
+                syncNativeComposeVisibility()
+            }
+        }
+    }
+
+    /** 3.86.0：原生主页点击回线——转发给网页隐藏 DOM 的真实 click */
+    fun homeAction(act: String, arg: String) {
+        runJsOnPage("window.__aqHomeAction&&window.__aqHomeAction('$act','$arg')")
+    }
+
     fun onDockScroll(scrollTop: Int) {
         runOnUiThread {
             if (scrollTop >= 0) {

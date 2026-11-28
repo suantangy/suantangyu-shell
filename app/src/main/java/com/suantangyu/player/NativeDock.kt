@@ -280,8 +280,27 @@ private fun DockHalo(radiusDp: Float, offYDp: Float, blurDp: Float, alpha: Float
 @Composable
 private fun DockBackdropSlice(wash: Brush) {
     val st = NativeDockStore
-    val bmp = st.backdrop ?: return
     var winPos by remember { mutableStateOf(Offset.Zero) }
+    // 3.86.0 真毛玻璃第一步：原生主页在场时，改画主页录制的 GraphicsLayer
+    // （已挂 RenderEffect 模糊），按窗口坐标对位——不再用 WebView 截图糊
+    val homeLayer = if (NativeHomeStore.blurActive()) NativeHomeStore.homeLayer else null
+    if (homeLayer != null) {
+        Box(
+            Modifier.fillMaxSize()
+                .onGloballyPositioned { winPos = it.positionInWindow() }
+                .drawBehind {
+                    translate(
+                        left = (NativeHomeStore.rectLeftPx - winPos.x),
+                        top = (NativeHomeStore.rectTopPx - winPos.y)
+                    ) {
+                        drawLayer(homeLayer)
+                    }
+                    drawRect(wash, size = size)
+                }
+        )
+        return
+    }
+    val bmp = st.backdrop ?: return
     Box(
         Modifier.fillMaxSize()
             .onGloballyPositioned { winPos = it.positionInWindow() }
@@ -577,7 +596,7 @@ private fun DockSideBtn(
                     .clip(shape).dockPress(0.9f) { onClick() },
                 contentAlignment = Alignment.Center
             ) {
-                if (NativeDockStore.backdrop != null) DockBackdropSlice(dockWash(false, dark))
+                if (NativeDockStore.backdrop != null || NativeHomeStore.blurActive()) DockBackdropSlice(dockWash(false, dark))
                 if (home) DockSvg(D_HOME, 24.dp, col) else DockSearchIcon(24.dp, col)
             }
         }
@@ -669,7 +688,7 @@ private fun DockMiniBar(
                     indication = null
                 ) { onOpenPlayer() }
         ) {
-            if (st.backdrop != null) DockBackdropSlice(dockWash(true, dark))
+            if (st.backdrop != null || NativeHomeStore.blurActive()) DockBackdropSlice(dockWash(true, dark))
             if (isLiuli && frac > 0f) {
                 // 网页 .mini-fill：固定 --pink #fa2d48（不随主题色），渐变
                 // 26/18/8/2 还要再乘 mask（72% 前全显、88% 处 .45、末端 0），
@@ -820,7 +839,7 @@ private fun DockTabBar(
         else -> RoundedCornerShape(28.dp)
     }
     Box(Modifier.fillMaxWidth().height(tabH.dp).clipToBounds()) {
-        val hasBd = NativeDockStore.backdrop != null
+        val hasBd = NativeDockStore.backdrop != null || NativeHomeStore.blurActive()
         val inner = if (isNetease) {
             // 网易风通栏：无整圈边框/阴影，只有顶边线；内容坐在上方 60dp
             if (hasBd) Modifier.fillMaxSize()

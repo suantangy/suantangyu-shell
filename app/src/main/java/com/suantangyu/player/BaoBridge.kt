@@ -483,6 +483,16 @@ class BaoBridge(private val activity: MainActivity) {
         activity.onDockScroll(scrollTop)
     }
 
+    /** 3.86.0 原生主页：网页问壳有没有（老壳无此法、网页自动走网页主页） */
+    @JavascriptInterface
+    fun hasNativeHome(): Boolean = true
+
+    /** 3.86.0：网页推主页快照（1_184 __aqHomePush 发起） */
+    @JavascriptInterface
+    fun postHomeState(json: String) {
+        activity.onHomeState(json)
+    }
+
     @JavascriptInterface
     fun showNativeQueue(dark: Boolean, accent: String) {
         activity.runOnUiThread { activity.showNativeQueue(dark, accent) }
