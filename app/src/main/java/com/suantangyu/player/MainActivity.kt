@@ -370,8 +370,12 @@ class MainActivity : AppCompatActivity() {
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             val density = resources.displayMetrics.density
-            lastTopCss = (bars.top / density).toInt()
+            // 3.86.2 ①：壳里整页比网页版高约 8 CSS px（cheng 双图实测），
+            // 注入的顶部安全区 +8 对齐——标题与各页起点、主页 rect 一起下移
+            lastTopCss = (bars.top / density).toInt() + 8
             lastBottomCss = (bars.bottom / density).toInt()
+            // 3.86.2 ⑦：原生主页底部留白要用与网页同一个安全区值
+            NativeHomeStore.safeBottomDp = lastBottomCss
             insetsReady = true
             maybeLoadPage()
             // 页面已就绪：值变了（旋转/分屏）就补注入
@@ -525,6 +529,18 @@ class MainActivity : AppCompatActivity() {
             NativeHomeRoot(
                 onAction = { act, arg -> homeAction(act, arg) }
             )
+            if (NativeHomeStore.platMenuShown && NativeDockStore.page == "home") {
+                HomePlatMenu(
+                    onSelect = { id ->
+                        NativeHomeStore.platMenuShown = false
+                        runJsOnPage("window.__aqSetPlat&&window.__aqSetPlat('$id')")
+                    },
+                    onDismiss = {
+                        NativeHomeStore.platMenuShown = false
+                        runJsOnPage("window.__aqPlatMenuClosed&&window.__aqPlatMenuClosed()")
+                    }
+                )
+            }
             NativeDockRoot(
                 onTab = { p -> runJsOnPage("window.__aqDockGo&&window.__aqDockGo('$p')") },
                 onToggle = { nativePlayerToggle() },
@@ -877,6 +893,11 @@ class MainActivity : AppCompatActivity() {
     /** 3.86.0：原生主页点击回线——转发给网页隐藏 DOM 的真实 click */
     fun homeAction(act: String, arg: String) {
         runJsOnPage("window.__aqHomeAction&&window.__aqHomeAction('$act','$arg')")
+    }
+
+    /** 3.86.2 ⑥：网页胶囊被点（原生主页在场）→ 壳画原生站源菜单 */
+    fun onHomePlatTap() {
+        runOnUiThread { NativeHomeStore.platMenuShown = true }
     }
 
     fun onDockScroll(scrollTop: Int) {

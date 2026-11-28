@@ -43,6 +43,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
@@ -79,6 +80,8 @@ import kotlin.math.roundToInt
 // 主页内容同时录入 GraphicsLayer，Dock 在主页上方时改画该层＋RenderEffect
 // 模糊＝真毛玻璃第一步（其余页面仍走 WebView 截图糊）。
 
+data class HomePlat(val id: String, val name: String, val tail: String, val on: Boolean)
+
 data class HomeDuo(val show: Boolean, val title: String, val sub: String, val cover: String)
 data class HomeCard(val cover: String, val name: String, val sub: String)
 data class HomeChannel(val name: String, val mark: String, val g1: String, val g2: String)
@@ -110,13 +113,22 @@ object NativeHomeStore {
     var rankMsg by mutableStateOf("")
     var ranks by mutableStateOf<List<HomeCard>>(emptyList())
     var homeLayer by mutableStateOf<GraphicsLayer?>(null)
+    // 3.86.2 ⑥：站源菜单数据（快照 plats/platRect）与原生菜单开关（壳本地状态）
+    var plats by mutableStateOf<List<HomePlat>>(emptyList())
+    var platRectL by mutableStateOf(0)
+    var platRectT by mutableStateOf(0)
+    var platRectW by mutableStateOf(0)
+    var platRectH by mutableStateOf(0)
+    var platMenuShown by mutableStateOf(false)
+    // 3.86.2 ⑦：底部安全区（dp），MainActivity 随 insets 灌入，与注入网页的值同源
+    var safeBottomDp by mutableStateOf(0)
     // 3.86.1：站源菜单开着时原生主页让位（菜单挂在网页 header 下、垂进主页区，
     // 不让位会被原生层盖住点不了）
     var platMenuOpen by mutableStateOf(false)
 
     fun visibleNow(): Boolean =
         enabled && NativeDockStore.page == "home" && !NativeDockStore.detail &&
-            !platMenuOpen && rectWidthPx > 0 && rectHeightPx > 0
+            rectWidthPx > 0 && rectHeightPx > 0
 
     fun blurActive(): Boolean =
         visibleNow() && homeLayer != null && Build.VERSION.SDK_INT >= 31
@@ -133,6 +145,19 @@ object NativeHomeStore {
             dark = o.optBoolean("dark")
             duoPlat = o.optString("duoPlat", "")
             platMenuOpen = o.optBoolean("platMenu", false)
+            val plts = o.optJSONArray("plats")
+            plats = List(plts?.length() ?: 0) { i ->
+                val c = plts!!.optJSONObject(i) ?: JSONObject()
+                HomePlat(
+                    c.optString("id"), c.optString("name"),
+                    c.optString("tail"), c.optBoolean("on")
+                )
+            }
+            val prc = o.optJSONArray("platRect")
+            if (prc != null && prc.length() == 4) {
+                platRectL = prc.optInt(0); platRectT = prc.optInt(1)
+                platRectW = prc.optInt(2); platRectH = prc.optInt(3)
+            }
             val duo = o.optJSONObject("duo")
             if (duo != null) {
                 duoGuess = duoOf(duo.optJSONObject("guess"), duoGuess)
@@ -273,11 +298,11 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
             layerFxSet = true
             try {
                 layer.renderEffect = androidx.compose.ui.graphics.BlurEffect(
-                    110f, 110f, TileMode.Decal
+                    150f, 150f, TileMode.Decal
                 )
                 // 3.86.1：网页玻璃是 saturate(220%) blur(48px)——只糊不饱和，
                 // 在浅色主页上看着像白色透明；给图层补 2.2 饱和（色矩阵）
-                val s = 2.2f
+                val s = 1.85f
                 layer.colorFilter = ColorFilter.colorMatrix(
                     ColorMatrix(
                         floatArrayOf(
@@ -293,6 +318,16 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
         }
     }
     val listState = rememberLazyListState()
+    // 3.86.2 ②：滚动中停录图层（每帧重录是滑动掉帧主因），停稳补录一次
+    var homeScrolling by remember { mutableStateOf(false) }
+    var recordTick by remember { mutableStateOf(0) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }
+            .collect { sc ->
+                homeScrolling = sc
+                if (!sc) recordTick++
+            }
+    }
     // 原生主页滚动驱动 Dock 收起（网页主页没在滚、它的收起值已过期）：
     // 下滚收起、上滚展开、回顶必展开
     LaunchedEffect(listState) {
@@ -334,7 +369,8 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
             Modifier
                 .fillMaxSize()
                 .drawWithContent {
-                    if (vis) {
+                    val tick = recordTick
+                    if (vis && !homeScrolling && tick >= 0) {
                         try {
                             val cds = this
                             // 3.86.1：图层只录底部 240dp 条（Dock 只采样这一带），
@@ -356,7 +392,8 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
         ) {
             LazyColumn(
                 state = listState,
-                contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 150.dp)
+                contentPadding = PaddingValues(start = 20.dp, end = 20.dp,
+                    bottom = (130 + st.safeBottomDp).dp)
             ) {
                 // —— 双卡 ——
                 item(key = "duo") {
@@ -437,7 +474,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                         androidx.compose.material3.Text(
                             if (st.chView == "playlist") "热门歌单" else "频道",
                             color = pal.label, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-                            letterSpacing = (-0.66).sp, lineHeight = 32.sp
+                            letterSpacing = (-0.66).sp, lineHeight = 30.sp
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             androidx.compose.material3.Text(
@@ -576,7 +613,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                     androidx.compose.material3.Text(
                         "新歌首发", color = pal.label, fontSize = 22.sp,
                         fontWeight = FontWeight.Bold, letterSpacing = (-0.66).sp,
-                        lineHeight = 32.sp,
+                        lineHeight = 30.sp,
                         modifier = Modifier.padding(bottom = 14.dp)
                     )
                 }
@@ -817,7 +854,7 @@ private fun SecHead(
     ) {
         androidx.compose.material3.Text(
             title, color = pal.label, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-            letterSpacing = (-0.66).sp, lineHeight = 32.sp
+            letterSpacing = (-0.66).sp, lineHeight = 30.sp
         )
         if (linkText != null && onLink != null) {
             androidx.compose.material3.Text(
@@ -989,6 +1026,72 @@ private fun HotRow(
                     .height(0.5.dp)
                     .background(pal.separator)
             )
+        }
+    }
+}
+
+/**
+ * 3.86.2 ⑥ 原生站源菜单：照网页 .plat-menu 样式（白玻璃卡、圆角 14、内距 6，
+ * 行：站名 14/500 左、源数 11 号 label3 右；当前站粉字 700＋8% 粉底、行圆角 10）。
+ * 锚点＝网页胶囊 rect（快照 platRect，设备 px），菜单在其下 6dp、右缘与胶囊齐。
+ */
+@Composable
+fun HomePlatMenu(onSelect: (String) -> Unit, onDismiss: () -> Unit) {
+    val st = NativeHomeStore
+    if (st.plats.isEmpty() || st.platRectW <= 0) return
+    val pal = remember(st.dark) { HomePal(st.dark) }
+    val density = LocalDensity.current
+    // 右内距 = 屏宽(px) − 胶囊右缘(px)，换回 dp
+    val screenWPx = with(density) {
+        androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.toPx()
+    }
+    val endDp = with(density) {
+        (screenWPx - (st.platRectL + st.platRectW)).toDp()
+    }
+    val topDp = with(density) { (st.platRectT + st.platRectH).toDp() } + 6.dp
+    Box(Modifier.fillMaxSize()) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    indication = null
+                ) { onDismiss() }
+        )
+        Column(
+            Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = topDp, end = endDp)
+                .width(160.dp)
+                .shadow(16.dp, RoundedCornerShape(14.dp))
+                .clip(RoundedCornerShape(14.dp))
+                .background(if (st.dark) Color(0xE62C2C2E) else Color(0xF7FFFFFF))
+                .padding(6.dp)
+        ) {
+            st.plats.forEach { p ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (p.on) Color(0x14FA2D48) else Color.Transparent
+                        )
+                        .clickable { onSelect(p.id) }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.SpaceBetween
+                ) {
+                    androidx.compose.material3.Text(
+                        p.name,
+                        color = if (p.on) Color(0xFFFA2D48) else pal.label,
+                        fontSize = 14.sp,
+                        fontWeight = if (p.on) FontWeight(700) else FontWeight(500)
+                    )
+                    androidx.compose.material3.Text(
+                        p.tail, color = pal.label3, fontSize = 11.sp
+                    )
+                }
+            }
         }
     }
 }

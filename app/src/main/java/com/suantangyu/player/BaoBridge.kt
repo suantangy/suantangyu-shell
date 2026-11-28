@@ -493,6 +493,12 @@ class BaoBridge(private val activity: MainActivity) {
         activity.onHomeState(json)
     }
 
+    /** 3.86.2：1_186 起原生主页在场时点站源胶囊转壳，壳画原生站源菜单 */
+    @JavascriptInterface
+    fun postHomePlatTap() {
+        activity.onHomePlatTap()
+    }
+
     @JavascriptInterface
     fun showNativeQueue(dark: Boolean, accent: String) {
         activity.runOnUiThread { activity.showNativeQueue(dark, accent) }
