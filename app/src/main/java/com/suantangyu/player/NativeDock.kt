@@ -238,10 +238,10 @@ private fun DockLyricLine(text: String, color: Color) {
     AnimatedContent(
         targetState = text,
         transitionSpec = {
-            (slideInHorizontally(tween(320, DockEase)) {
+            (slideInHorizontally(tween(320, easing = DockEase)) {
                 (28 * density.density).toInt()
             } + fadeIn(tween(280))) togetherWith
-                (slideOutHorizontally(tween(320, DockEase)) {
+                (slideOutHorizontally(tween(320, easing = DockEase)) {
                     -(18 * density.density).toInt()
                 } + fadeOut(tween(280)))
         },
@@ -593,9 +593,9 @@ private fun DockTabBar(
     Box(Modifier.fillMaxWidth().height(tabH.dp)) {
         val inner = if (isNetease) {
             // 网易风通栏：无整圈边框/阴影，只有顶边线；内容坐在上方 60dp
-            Modifier.fillMaxSize().background(
-                if (dark) Color(0xD11C1C1E)
-                else Brush.verticalGradient(
+            if (dark) Modifier.fillMaxSize().background(Color(0xD11C1C1E), shape)
+            else Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
                     listOf(Color.White.copy(0.78f), Color.White.copy(0.62f))
                 ),
                 shape
@@ -716,10 +716,10 @@ private fun DockRootContent(
     }
     val collapseT by animateFloatAsState(
         if (st.collapsed && isLiuli && !st.detail) 1f else 0f,
-        tween(780, DockEase), label = "dkCol"
+        tween(780, easing = DockEase), label = "dkCol"
     )
     val detailT by animateFloatAsState(
-        if (st.detail) 1f else 0f, tween(600, DockEase), label = "dkDet"
+        if (st.detail) 1f else 0f, tween(600, easing = DockEase), label = "dkDet"
     )
     val navInset = WindowInsets.navigationBars.asPaddingValues()
         .calculateBottomPadding().value.coerceAtMost(10f)
