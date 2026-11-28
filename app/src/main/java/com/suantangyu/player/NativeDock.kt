@@ -1167,7 +1167,14 @@ private fun DockRootContent(
             if (tabH > 0.5f) {
                 Box(
                     Modifier.fillMaxWidth()
-                        .padding(start = tabStart.dp, end = tabEnd.dp)
+                        .padding(
+                            start = tabStart.dp,
+                            // 展开时导航栏宽度从左往右长开（cheng 真机录屏实锤：
+                            // 初时是左锚的短条、四页签挤在里面，随涨高一起长满；
+                            // 3.85.15 撤掉是助手错步，3.85.16 恢复）
+                            end = (tabEnd + (screenWDp - tabStart - tabEnd) *
+                                (1f - tabGrow.value)).dp
+                        )
                         .alpha(tabAlpha)
                         .graphicsLayer {
                             scaleX = tabScale; scaleY = tabScale
