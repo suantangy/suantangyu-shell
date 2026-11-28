@@ -552,25 +552,34 @@ private fun DockSideBtn(
     else Color(60, 60, 67).copy(0.55f)
     // 3.85.5 照网页 .dock-side：槽位宽 0→52 把迷你条推窄，圆钮本体固定 52、
     // scale .72→1＋整钮淡入（旧版圆从 0 长大，入场观感与网页不同）
+    // 3.85.18：阴影层与按钮层分离——阴影不裁剪（网页 box-shadow 本就晕出
+    // 钮盒之外：0 6px 20px rgba(0,0,0,.06)、深色 .35），旧版把 DockHalo
+    // 关在带 clipToBounds 的槽里、影子被槽沿切平，看着像没加；按钮本体
+    // 仍在内层裁剪盒里，保证槽宽动画时不溢出压到迷你条
     Box(
-        Modifier.width(sizeDp.dp).height(52.dp).clipToBounds(),
+        Modifier.width(sizeDp.dp).height(52.dp),
         contentAlignment = Alignment.Center
     ) {
         Box(Modifier.size(52.dp)) {
             DockHalo(26f, 6f, 20f, (if (dark) 0.35f else 0.06f) * t)
         }
         Box(
-            Modifier.size(52.dp)
-                .graphicsLayer {
-                    val sc = 0.72f + 0.28f * t
-                    scaleX = sc; scaleY = sc; alpha = t
-                }
-                .dockGlass(shape, dark, shown = false, bg = NativeDockStore.backdrop == null)
-                .clip(shape).dockPress(0.9f) { onClick() },
+            Modifier.matchParentSize().clipToBounds(),
             contentAlignment = Alignment.Center
         ) {
-            if (NativeDockStore.backdrop != null) DockBackdropSlice(dockWash(false, dark))
-            if (home) DockSvg(D_HOME, 24.dp, col) else DockSearchIcon(24.dp, col)
+            Box(
+                Modifier.size(52.dp)
+                    .graphicsLayer {
+                        val sc = 0.72f + 0.28f * t
+                        scaleX = sc; scaleY = sc; alpha = t
+                    }
+                    .dockGlass(shape, dark, shown = false, bg = NativeDockStore.backdrop == null)
+                    .clip(shape).dockPress(0.9f) { onClick() },
+                contentAlignment = Alignment.Center
+            ) {
+                if (NativeDockStore.backdrop != null) DockBackdropSlice(dockWash(false, dark))
+                if (home) DockSvg(D_HOME, 24.dp, col) else DockSearchIcon(24.dp, col)
+            }
         }
     }
 }
