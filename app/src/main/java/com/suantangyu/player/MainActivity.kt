@@ -826,12 +826,12 @@ class MainActivity : AppCompatActivity() {
         val top = NativeDockStore.regionTopPx
         if (top < 0 || webView.width <= 0 || webView.height <= top + 40) return
         val now = SystemClock.uptimeMillis()
-        if (!force && now - lastDockBackdropAt < 110) return
+        if (!force && now - lastDockBackdropAt < 70) return
         if (dockBackdropBusy) return
         lastDockBackdropAt = now
         dockBackdropBusy = true
         try {
-            val scale = 0.18f
+            val scale = 0.25f
             val regionH = webView.height - top
             val bw = (webView.width * scale).toInt().coerceAtLeast(1)
             val bh = (regionH * scale).toInt().coerceAtLeast(1)
@@ -842,7 +842,7 @@ class MainActivity : AppCompatActivity() {
             webView.draw(canvas)
             Thread {
                 try {
-                    val out = blurAndSaturate(raw, 26)
+                    val out = blurAndSaturate(raw, 35)
                     runOnUiThread {
                         NativeDockStore.backdrop = out.asImageBitmap()
                         NativeDockStore.backdropTopPx = top
@@ -858,44 +858,60 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 小图糊化（盒式模糊横竖各两遍）＋饱和提升（网页 backdrop 还有 saturate 180%） */
+    /** 小图糊化：滑动窗盒式模糊横竖各三遍（近似高斯，边缘不发板）＋饱和 2.2（网页 .mini/.tabbar 是 saturate(220%) blur(48px)） */
     private fun blurAndSaturate(src: Bitmap, radius: Int): Bitmap {
         val w = src.width
         val h = src.height
         val px = IntArray(w * h)
         src.getPixels(px, 0, w, 0, 0, w, h)
         val tmp = IntArray(w * h)
-        fun boxPass(horizontal: Boolean) {
+        val n = radius * 2 + 1
+        fun passH() {
             for (y in 0 until h) {
+                val row = y * w
+                var sr = 0; var sg = 0; var sb = 0; var sa = 0
+                for (k in -radius..radius) {
+                    val c = px[row + k.coerceIn(0, w - 1)]
+                    sa += android.graphics.Color.alpha(c); sr += android.graphics.Color.red(c)
+                    sg += android.graphics.Color.green(c); sb += android.graphics.Color.blue(c)
+                }
                 for (x in 0 until w) {
-                    var r = 0
-                    var g = 0
-                    var b = 0
-                    var a = 0
-                    var n = 0
-                    for (k in -radius..radius) {
-                        val xx = if (horizontal) (x + k).coerceIn(0, w - 1) else x
-                        val yy = if (horizontal) y else (y + k).coerceIn(0, h - 1)
-                        val c = px[yy * w + xx]
-                        a += android.graphics.Color.alpha(c)
-                        r += android.graphics.Color.red(c)
-                        g += android.graphics.Color.green(c)
-                        b += android.graphics.Color.blue(c)
-                        n++
-                    }
-                    tmp[y * w + x] = android.graphics.Color.argb(a / n, r / n, g / n, b / n)
+                    tmp[row + x] = android.graphics.Color.argb(sa / n, sr / n, sg / n, sb / n)
+                    val co = px[row + (x - radius).coerceIn(0, w - 1)]
+                    val ci = px[row + (x + radius + 1).coerceIn(0, w - 1)]
+                    sa += android.graphics.Color.alpha(ci) - android.graphics.Color.alpha(co)
+                    sr += android.graphics.Color.red(ci) - android.graphics.Color.red(co)
+                    sg += android.graphics.Color.green(ci) - android.graphics.Color.green(co)
+                    sb += android.graphics.Color.blue(ci) - android.graphics.Color.blue(co)
                 }
             }
             System.arraycopy(tmp, 0, px, 0, px.size)
         }
-        boxPass(true)
-        boxPass(false)
-        boxPass(true)
-        boxPass(false)
+        fun passV() {
+            for (x in 0 until w) {
+                var sr = 0; var sg = 0; var sb = 0; var sa = 0
+                for (k in -radius..radius) {
+                    val c = px[k.coerceIn(0, h - 1) * w + x]
+                    sa += android.graphics.Color.alpha(c); sr += android.graphics.Color.red(c)
+                    sg += android.graphics.Color.green(c); sb += android.graphics.Color.blue(c)
+                }
+                for (y in 0 until h) {
+                    tmp[y * w + x] = android.graphics.Color.argb(sa / n, sr / n, sg / n, sb / n)
+                    val co = px[(y - radius).coerceIn(0, h - 1) * w + x]
+                    val ci = px[(y + radius + 1).coerceIn(0, h - 1) * w + x]
+                    sa += android.graphics.Color.alpha(ci) - android.graphics.Color.alpha(co)
+                    sr += android.graphics.Color.red(ci) - android.graphics.Color.red(co)
+                    sg += android.graphics.Color.green(ci) - android.graphics.Color.green(co)
+                    sb += android.graphics.Color.blue(ci) - android.graphics.Color.blue(co)
+                }
+            }
+            System.arraycopy(tmp, 0, px, 0, px.size)
+        }
+        passH(); passV(); passH(); passV(); passH(); passV()
         val blurred = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         blurred.setPixels(px, 0, w, 0, 0, w, h)
         val cm = ColorMatrix()
-        cm.setSaturation(1.5f)
+        cm.setSaturation(2.2f)
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c2 = Canvas(out)
         val paint = Paint().apply { colorFilter = ColorMatrixColorFilter(cm) }

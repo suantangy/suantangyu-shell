@@ -1,6 +1,7 @@
 package com.suantangyu.player
 
 import android.graphics.Bitmap
+import android.graphics.BlurMaskFilter
 import android.os.SystemClock
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
@@ -67,6 +68,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -111,7 +113,7 @@ object NativeDockStore {
     // 3.85.1 真毛玻璃：MainActivity 截取 Dock 背后网页画面糊化后垫底（backdropTopPx=截取区顶边窗口坐标）
     var backdrop by mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null)
     var backdropTopPx by mutableStateOf(-1)
-    var backdropScale by mutableStateOf(0.18f)
+    var backdropScale by mutableStateOf(0.25f)
     var regionTopPx by mutableStateOf(-1)
     var hasTrack by mutableStateOf(false)
     var title by mutableStateOf("")
@@ -356,43 +358,83 @@ private fun DockRing(frac: Float, accent: Color, dark: Boolean) {
 /** 黑胶盘：Ø76 径向黑盘＋同心纹＋光扫＋中心孔，封面 44 居中，整盘转 */
 @Composable
 private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
-    Box(
-        Modifier.size(76.dp).graphicsLayer { rotationZ = spin },
-        contentAlignment = Alignment.Center
-    ) {
-        Canvas(Modifier.fillMaxSize()) {
-            val r = size.minDimension / 2
-            drawCircle(
-                Brush.radialGradient(
-                    listOf(Color(0xFF2A2A30), Color(0xFF060608)),
-                    center = center, radius = r
-                ),
-                radius = r
-            )
-            var rr = r * 0.97f
-            val step = 3.dp.toPx()
-            while (rr > r * 0.32f) {
-                drawCircle(Color.White.copy(0.05f), radius = rr, style = Stroke(1f))
-                rr -= step
-            }
-            drawArc(Color.White.copy(0.13f), startAngle = 210f, sweepAngle = 18f, useCenter = true)
-            drawArc(Color.White.copy(0.08f), startAngle = 15f, sweepAngle = 23f, useCenter = true)
-            drawCircle(Color(0xFF0B0B0D), radius = 3.5.dp.toPx())
-            drawCircle(
-                Color.White.copy(0.4f), radius = 3.5.dp.toPx(),
-                style = Stroke(1.5.dp.toPx())
-            )
-        }
+    // 3.85.3 照网页 .mini-vinyl 逐项复刻：投影（不转）＋盘体（转）＋封面＋中心孔（压在封面上）
+    Box(Modifier.size(76.dp), contentAlignment = Alignment.Center) {
         Box(
-            Modifier.size(44.dp).clip(CircleShape)
-                .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE)),
+            Modifier.fillMaxSize().drawBehind {
+                val paint = android.graphics.Paint().apply {
+                    color = android.graphics.Color.argb(82, 20, 10, 10)
+                    maskFilter = BlurMaskFilter(10.dp.toPx(), BlurMaskFilter.Blur.NORMAL)
+                }
+                drawContext.canvas.nativeCanvas.drawCircle(
+                    center.x, center.y + 8.dp.toPx(), size.minDimension / 2, paint
+                )
+            }
+        )
+        Box(
+            Modifier.fillMaxSize().graphicsLayer { rotationZ = spin },
             contentAlignment = Alignment.Center
         ) {
-            if (bmp != null) {
-                Image(
-                    bmp.asImageBitmap(), null, Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
+            Canvas(Modifier.fillMaxSize()) {
+                val r = size.minDimension / 2
+                // 盘体：径向 #2a2a30 0% → #060608 78%（78% 后纯色到边）
+                drawCircle(
+                    Brush.radialGradient(
+                        listOf(0f to Color(0xFF2A2A30), 0.78f to Color(0xFF060608), 1f to Color(0xFF060608)),
+                        center = center, radius = r
+                    ),
+                    radius = r
                 )
+                // 纹路：每 3dp 一条 1dp 亮线（白 .055），只在封面外
+                var rr = r - 1.5.dp.toPx()
+                val grooveW = 1.dp.toPx()
+                val grooveStep = 3.dp.toPx()
+                val coverR = 22.dp.toPx()
+                while (rr > coverR) {
+                    drawCircle(Color.White.copy(0.055f), radius = rr, style = Stroke(grooveW))
+                    rr -= grooveStep
+                }
+                // 光扫：conic 软楔（from 210°，两楔峰值 .13/.08）→ 换算成 sweep 渐变
+                drawCircle(
+                    Brush.sweepGradient(
+                        listOf(
+                            0.000f to Color.Transparent,
+                            0.333f to Color.Transparent,
+                            0.383f to Color.White.copy(0.13f),
+                            0.450f to Color.Transparent,
+                            0.875f to Color.Transparent,
+                            0.939f to Color.White.copy(0.08f),
+                            1.000f to Color.Transparent
+                        ),
+                        center = center
+                    ),
+                    radius = r
+                )
+                // 内圈描边：inset 0 0 0 1px 白 .05
+                drawCircle(
+                    Color.White.copy(0.05f), radius = r - 0.5.dp.toPx(),
+                    style = Stroke(1.dp.toPx())
+                )
+            }
+            // 封面 44px 圆＋外圈 1px 暗环（box-shadow 0 0 0 1px rgba(0,0,0,.35)）
+            Box(
+                Modifier.size(44.dp).clip(CircleShape)
+                    .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (bmp != null) {
+                    Image(
+                        bmp.asImageBitmap(), null, Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+                Box(Modifier.fillMaxSize().border(1.dp, Color.Black.copy(0.35f), CircleShape))
+            }
+            // 中心孔 7px：#0b0b0d＋1.5px 白 .4 边，压在封面上（网页 ::after z-index 2）
+            Box(
+                Modifier.size(7.dp).clip(CircleShape).background(Color(0xFF0B0B0D))
+            ) {
+                Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
             }
         }
     }
