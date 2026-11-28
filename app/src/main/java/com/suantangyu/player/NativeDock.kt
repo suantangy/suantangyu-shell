@@ -380,7 +380,7 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
                 // 盘体：径向 #2a2a30 0% → #060608 78%（78% 后纯色到边）
                 drawCircle(
                     Brush.radialGradient(
-                        listOf(0f to Color(0xFF2A2A30), 0.78f to Color(0xFF060608), 1f to Color(0xFF060608)),
+                        0f to Color(0xFF2A2A30), 0.78f to Color(0xFF060608), 1f to Color(0xFF060608),
                         center = center, radius = r
                     ),
                     radius = r
@@ -397,15 +397,13 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
                 // 光扫：conic 软楔（from 210°，两楔峰值 .13/.08）→ 换算成 sweep 渐变
                 drawCircle(
                     Brush.sweepGradient(
-                        listOf(
-                            0.000f to Color.Transparent,
-                            0.333f to Color.Transparent,
-                            0.383f to Color.White.copy(0.13f),
-                            0.450f to Color.Transparent,
-                            0.875f to Color.Transparent,
-                            0.939f to Color.White.copy(0.08f),
-                            1.000f to Color.Transparent
-                        ),
+                        0.000f to Color.Transparent,
+                        0.333f to Color.Transparent,
+                        0.383f to Color.White.copy(0.13f),
+                        0.450f to Color.Transparent,
+                        0.875f to Color.Transparent,
+                        0.939f to Color.White.copy(0.08f),
+                        1.000f to Color.Transparent,
                         center = center
                     ),
                     radius = r
