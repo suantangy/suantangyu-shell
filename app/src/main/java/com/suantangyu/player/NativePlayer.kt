@@ -212,11 +212,14 @@ private fun SvgIconStroke(pathData: String, size: Dp, color: Color, strokeDp: Dp
 // 15px、远行 14px;远行带 0.5px 模糊与 0.94 缩放、相邻 0.97;字号用
 // 网页同款弹簧曲线 .28s 涨落、颜色 .25s 过渡;长行换行不截断;
 // 开译时主行下跟 12px 译文行(网页 .ly-trans)。
-// 3.84.32 行槽改固定高:槽高恒 41dp(网页当前行与相邻行的平均行距
-// 40.9px),字在槽内涨落、槽高不随档位变——旧版槽高随字号变(当前
-// 44.8/相邻 35/远行 33.6),滚动落定后上一行收缩把整列往上顶约
-// 38px,看着像滑到了又跳一下。长行换行/带译文时内容更高,槽随
-// 内容长高(该行常量、不随档位变),与网页 .ly 同理
+// 3.84.34 行槽回到网页 .ly 的档位真高:当前 padding 8+字 22*1.4=
+// 46.8、相邻 7+21=35、远行 7+19.6=33.6——网页行距本就不均匀:
+// 内距(当前↔相邻)40.9、外距(相邻↔远行)34.3。3.84.32 曾改统一
+// 41dp 固定槽治回跳,回跳是治住了,但行距被抹成均匀 41,cheng
+// 对照截图指出间距不对(实测 App 外距 4.4% vs 网页 3.7%)。回跳
+// 的根源是旧滚动 animateScrollToItem 反复锚定,3.84.32 已换
+// animateScrollBy 定距滑行、与字号动画同期进行,档位高差造成
+// 的位移和网页 smooth 滚动一样并进滑行里、落定不再二次跳
 @Composable
 private fun PlayerLyricLine(
     line: PlayerLine, tier: Int, lyOn: Color, base: Color,
@@ -238,13 +241,11 @@ private fun PlayerLyricLine(
     val animScale by animateFloatAsState(targetScale, tween(250), label = "lyScale")
     Column(
         Modifier.fillMaxWidth()
-            .heightIn(min = 41.dp)
             .aqClickable(1f, 0.72f) { onClick() }
-            .padding(horizontal = 12.dp)
+            .padding(horizontal = 12.dp, vertical = if (tier == 2) 8.dp else 7.dp)
             .graphicsLayer { scaleX = animScale; scaleY = animScale }
             .then(if (tier == 0) Modifier.blur(0.5.dp) else Modifier),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
             line.x,
@@ -1269,7 +1270,7 @@ fun NativePlayerRoot(
                     Text(
                         "译",
                         color = if (st.transOn) accent else w70,
-                        fontSize = 13.sp,
+                        fontSize = 13.sp, lineHeight = 18.sp,
                         fontWeight = if (st.transOn) FontWeight.SemiBold else FontWeight.Normal,
                         modifier = Modifier.clip(RoundedCornerShape(8.dp))
                             .aqClickable { onTool("trans") }
@@ -1307,9 +1308,17 @@ fun NativePlayerRoot(
                 }
             }
             // 故事(左)/喜欢+评论(右)浮层:贴歌词框底部(网页
-            // .np-extra-links 浮在歌词框底同理,歌词从其下滚过)
+            // .np-extra-links 浮在歌词框底同理,歌词从其下滚过)。
+            // 3.84.34 喜欢/评论照网页 .np-extra-ic:钮 30x28、图标
+            // 20、描边 1.8、色 --label-2(浅底 rgba(60,60,67,.72)/
+            // 深底 rgba(235,235,245,.68))、两钮间隔 8;喜欢态网页
+            // 是固定粉 #FA2D48 填充(非主题色);整行下移 2dp 对齐
+            // 网页(行底=进度区顶-4,原生框底=进度区顶-6)
+            val label2 = if (darkUi) Color(0xFF3C3C43).copy(alpha = 0.72f)
+                else Color(0xFFEBEBF5).copy(alpha = 0.68f)
             Row(
                 Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                    .offset(y = 2.dp)
                     .padding(horizontal = 24.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1323,20 +1332,21 @@ fun NativePlayerRoot(
                 }
                 Spacer(Modifier.weight(1f))
                 Box(
-                    Modifier.size(38.dp).clip(CircleShape)
-                        .aqClickable { onFav() },
+                    Modifier.size(width = 30.dp, height = 28.dp).clip(CircleShape)
+                        .aqClickable(0.88f, 1f) { onFav() },
                     contentAlignment = Alignment.Center
                 ) {
-                    if (st.fav) SvgIcon(P_HEART, 23.dp, accent)
-                    else SvgIconStroke(P_HEART, 23.dp, wht, 1.8.dp)
+                    if (st.fav) SvgIcon(P_HEART, 20.dp, Color(0xFFFA2D48))
+                    else SvgIconStroke(P_HEART, 20.dp, label2, 1.8.dp)
                 }
                 if (st.commentOn) {
+                    Spacer(Modifier.width(8.dp))
                     Box(
-                        Modifier.size(38.dp).clip(CircleShape)
-                            .aqClickable { onTool("comment") },
+                        Modifier.size(width = 30.dp, height = 28.dp).clip(CircleShape)
+                            .aqClickable(0.88f, 1f) { onTool("comment") },
                         contentAlignment = Alignment.Center
                     ) {
-                        SvgIconStroke(P_COMMENT, 23.dp, wht, 1.8.dp)
+                        SvgIconStroke(P_COMMENT, 20.dp, label2, 1.8.dp)
                     }
                 }
             }
