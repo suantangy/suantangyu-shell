@@ -3788,6 +3788,22 @@ class KeepAliveService : Service() {
         executeBrainAdvance(t, "ended", 0)
     }
 
+    /** 3.84.40：手动切歌点下即静音——学网页版 play() 开头
+     * audio.pause() 卸 src 的做法：旧歌声音立刻断，不等解析落地
+     * （cheng 实锤：画面已跳下一首、旧歌还响两三秒）。只 pause
+     * 不卸项：playWhenReady 落 false，看门狗对「无播放意图」明确
+     * 不干预；落地由 applyAdvance 接管照常起播。 */
+    private fun silenceForManualCut() {
+        if (!nativeActive) return
+        val p = player ?: return
+        try { p.pause() } catch (_: Exception) {}
+        if (playing) {
+            playing = false
+            updateSessionState()
+            updateNotification()
+        }
+    }
+
     private fun brainManualNext() {
         clearNetPark()
         voidPipePark()
@@ -3801,6 +3817,7 @@ class KeepAliveService : Service() {
         brainUiPaintKey = t
         brainUiPaintGen = brainOpGen
         try { MainActivity.instance?.onBrainSyncNotify() } catch (_: Exception) {}
+        silenceForManualCut()
         executeBrainAdvance(t, "next", 0)
     }
 
@@ -3817,6 +3834,7 @@ class KeepAliveService : Service() {
         brainUiPaintKey = t
         brainUiPaintGen = brainOpGen
         try { MainActivity.instance?.onBrainSyncNotify() } catch (_: Exception) {}
+        silenceForManualCut()
         executeBrainAdvance(t, "prev", 0)
     }
 
