@@ -26,6 +26,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
@@ -1215,9 +1216,22 @@ fun NativePlayerRoot(
                 Column(Modifier.fillMaxSize()) {
                 val listState = rememberLazyListState()
                 var holdUntil by remember { mutableStateOf(0L) }
-                LaunchedEffect(listState.isScrollInProgress) {
-                    if (listState.isScrollInProgress) {
-                        holdUntil = SystemClock.elapsedRealtime() + 3000
+                // 手动滚动后 3 秒不抢(3.84.35):旧版盯 isScrollInProgress,
+                // 但程序自己的居中滚动也算 scrolling——一滚动就把
+                // holdUntil 顶到 +3 秒,歌词换行间隔短于 3 秒时下一行
+                // 的居中被自己堵死,当前行停在 +1 槽位不归位(cheng
+                // 录屏实锤:《向山河》约 2 秒一行,「只知道还要向前」
+                // 停在 66.1% 而非中心 63%)。改盯 interactionSource
+                // 的 DragInteraction:只有用户真的拖动才 hold,拖完
+                // (Stop/Cancel)再续 3 秒
+                LaunchedEffect(listState) {
+                    listState.interactionSource.interactions.collect { interaction ->
+                        if (interaction is DragInteraction.Start ||
+                            interaction is DragInteraction.Stop ||
+                            interaction is DragInteraction.Cancel
+                        ) {
+                            holdUntil = SystemClock.elapsedRealtime() + 3000
+                        }
                     }
                 }
                 LaunchedEffect(curIdx) {
