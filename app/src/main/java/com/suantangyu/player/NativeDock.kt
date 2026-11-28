@@ -76,6 +76,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -151,6 +152,7 @@ private const val D_QUEUE = "M4 6h16M4 12h16M4 18h10"
 private const val D_SEARCH_LINE = "M21 21l-4.3-4.3"
 
 private val DockEase = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)
+private val EaseCss = CubicBezierEasing(0.25f, 0.1f, 0.25f, 1f)
 
 @Composable
 private fun DockSvg(pathData: String, size: Dp, color: Color, modifier: Modifier = Modifier) {
@@ -578,7 +580,7 @@ private fun DockMiniBar(
     isLiuli: Boolean, isNetease: Boolean, isHeijiao: Boolean,
     dark: Boolean, accent: Color, lyricColor: Color, lyricText: String,
     miniH: Float, coverS: Float, nameSp: Float, nameWeight: FontWeight,
-    nextW: Float, nextAlpha: Float, artistAlpha: Float,
+    nextW: Float, nextAlpha: Float, artistAlpha: Float, artistHFrac: Float,
     discOff: Float, discSpacerW: Float, detailT: Float,
     frac: Float, spin: Float, bmp: Bitmap?,
     shOff: Float, shBlur: Float, shAlpha: Float, shAlpha2: Float,
@@ -716,16 +718,20 @@ private fun DockMiniBar(
                         lineHeight = (nameSp * 1.2f).sp,
                         letterSpacing = (-0.14).sp
                     )
-                    Box(Modifier.fillMaxWidth().height(20.dp)) {
-                        if (lyricText.isNotEmpty()) {
-                            DockLyricLine(lyricText, lyricColor)
-                        } else {
-                            Text(
-                                st.artist, color = artistColor, fontSize = 12.sp,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                lineHeight = (12 * 1.35f).sp,
-                                modifier = Modifier.alpha(artistAlpha)
-                            )
+                    Box(
+                        Modifier.fillMaxWidth().height((20f * artistHFrac).dp)
+                            .clipToBounds()
+                    ) {
+                        Box(Modifier.fillMaxWidth().height(20.dp).alpha(artistAlpha)) {
+                            if (lyricText.isNotEmpty()) {
+                                DockLyricLine(lyricText, lyricColor)
+                            } else {
+                                Text(
+                                    st.artist, color = artistColor, fontSize = 12.sp,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                    lineHeight = (12 * 1.35f).sp
+                                )
+                            }
                         }
                     }
                 }
@@ -925,45 +931,100 @@ private fun DockRootContent(
             last = now
         }
     }
-    val collapseT by animateFloatAsState(
-        if (st.collapsed && isLiuli && !st.detail) 1f else 0f,
-        tween(780, easing = DockEase), label = "dkCol"
+    // —— 收起编排（3.85.12，沙盒逐帧实测网页真值后重写）——
+    // 网页收起是「快收慢长」：导航栏 height:0 无过渡、同帧消失，迷你条同帧落底、
+    // 先缩到 120 再随 flex .8s 长开，侧钮在两角 .75s 长出，封面 .28s 先缩，
+    // 歌手行 .55s 塌高、下一首约 .45s 先走；展开反过来：导航栏 .8s 涨高把
+    // 迷你条顶上去、迷你条瞬时满宽。旧版单 tween 780ms 全员同速（导航栏慢慢
+    // 裁、迷你条缓缓沉），方式完全两样（cheng 2026-11-28 指认）。
+    val colActive = st.collapsed && isLiuli && !st.detail
+    val tabGrow = remember { Animatable(1f) }
+    LaunchedEffect(colActive) {
+        if (colActive) tabGrow.snapTo(0f)
+        else tabGrow.animateTo(1f, tween(800, easing = DockEase))
+    }
+    val screenWDp = LocalConfiguration.current.screenWidthDp.toFloat()
+    val miniW = remember { Animatable(0f) }
+    var colMode by remember { mutableStateOf(false) }
+    LaunchedEffect(colActive) {
+        if (colActive) {
+            colMode = true
+            miniW.snapTo(120f)
+            miniW.animateTo(
+                (screenWDp - 146f).coerceAtLeast(120f),
+                tween(800, easing = DockEase)
+            )
+        } else colMode = false
+    }
+    val tCover by animateFloatAsState(
+        if (colActive) 1f else 0f, tween(280, easing = EaseCss), label = "dkCov"
     )
+    val tArtist by animateFloatAsState(
+        if (colActive) 1f else 0f,
+        if (colActive) tween(550, easing = EaseCss)
+        else tween(600, easing = EaseCss),
+        label = "dkArt"
+    )
+    val tNextW by animateFloatAsState(
+        if (colActive) 0f else 1f,
+        if (colActive) tween(550, easing = DockEase)
+        else tween(600, easing = DockEase),
+        label = "dkNxtW"
+    )
+    val tNextA by animateFloatAsState(
+        if (colActive) 0f else 1f,
+        if (colActive) tween(400, easing = EaseCss)
+        else tween(500, easing = EaseCss, delayMillis = 150),
+        label = "dkNxtA"
+    )
+    val tSide by animateFloatAsState(
+        if (colActive) 1f else 0f, tween(750, easing = DockEase), label = "dkSide"
+    )
+    val collapseT = tSide
     val detailT by animateFloatAsState(
         if (st.detail) 1f else 0f, tween(600, easing = DockEase), label = "dkDet"
     )
     val navInset = WindowInsets.navigationBars.asPaddingValues()
         .calculateBottomPadding().value.coerceAtMost(10f)
     // —— 几何（网页 CSS 级联终局，单位 dp=CSS px）——
-    val miniH = if (!st.hasTrack) 0f
-    else lerpF(lerpF(56f, 52f, collapseT), 58f, detailT)
+    val miniH by animateFloatAsState(
+        when {
+            !st.hasTrack -> 0f
+            st.detail -> 58f
+            colActive -> 52f
+            else -> 56f
+        },
+        if (isLiuli) tween(800, easing = DockEase)
+        else tween(600, easing = DockEase),
+        label = "dkMiniH"
+    )
     val coverS = when {
         isHeijiao -> 44f
         isNetease -> lerpF(44f, 40f, detailT)
-        else -> lerpF(lerpF(44f, 36f, collapseT), 40f, detailT)
+        else -> lerpF(lerpF(44f, 36f, tCover), 40f, detailT)
     }
-    val nameSp = if (isLiuli) lerpF(14f, 13f, collapseT) else 14f
+    val nameSp = if (isLiuli) lerpF(14f, 13f, tCover) else 14f
     val nameWeight = when {
         isNetease -> FontWeight(650)
         isHeijiao -> FontWeight.W600
         else -> FontWeight.W700
     }
-    val nextW = lerpF(40f * (1f - collapseT), 40f, detailT)
-    val nextAlpha = lerpF(1f - collapseT, 1f, detailT)
-    val artistAlpha = 1f - collapseT
-    val sideS = 52f * collapseT * (1f - detailT)
+    val nextW = lerpF(40f * tNextW, 40f, detailT)
+    val nextAlpha = lerpF(tNextA, 1f, detailT)
+    val artistAlpha = (1f - tArtist * 1.25f).coerceIn(0f, 1f)
+    val artistHFrac = 1f - tArtist
+    val sideS = 52f * tSide * (1f - detailT)
     val tabBase = if (isNetease) 60f + navInset else 56f
-    val tabH = tabBase * (1f - collapseT) * (1f - detailT)
-    val tabAlpha = (1f - collapseT) * (1f - detailT)
-    val gapH = if (st.hasTrack) 4f * (1f - maxOf(collapseT, detailT)) else 0f
+    val tabVis = tabGrow.value * (1f - detailT)
+    val tabH = tabBase * tabVis
+    val tabAlpha = tabVis
+    val gapH = if (st.hasTrack) 4f * tabVis else 0f
     val miniStart = when {
         isHeijiao -> lerpF(32f, 16f, detailT)
-        isLiuli -> lerpF(lerpF(13f, 73f, collapseT), 13f, detailT)
         else -> 13f
     }
     val miniEnd = when {
         isHeijiao -> lerpF(59f, 13f, detailT)
-        isLiuli -> lerpF(lerpF(13f, 73f, collapseT), 13f, detailT)
         else -> 13f
     }
     val tabStart = when {
@@ -977,8 +1038,8 @@ private fun DockRootContent(
     )
     val discOff = lerpF(-19f, -3f, detailT)
     val discSpacerW = discOff + 76f + lerpF(12f, 10f, detailT)
-    val tabScale = lerpF(1f, 0.88f, collapseT)
-    val tabTyDp = lerpF(0f, 18f, collapseT)
+    val tabScale = lerpF(0.88f, 1f, tabGrow.value)
+    val tabTyDp = lerpF(18f, 0f, tabGrow.value)
     val lyricColor = if (st.dark) androidx.compose.ui.graphics.lerp(
         st.accent, Color.White, 0.35f
     ) else st.npAccent
@@ -992,6 +1053,58 @@ private fun DockRootContent(
                     NativeDockStore.regionTopPx = it.positionInWindow().y.toInt()
                 }
         ) {
+            if (isLiuli) {
+                // 琉璃光布局（3.85.12）：侧钮角锚、迷你条独立定位——网页 collapsed 是
+                // flex 行＋space-between：侧钮钉两角、迷你条居中长开，互不挤压；
+                // 展开时侧钮脱离流、迷你条满宽。旧版打包 Row 里迷你条被槽位推窄，
+                // 宽度方向与网页相反（网页先缩 120 再长开，原生从满宽慢慢变窄）。
+                Box(Modifier.fillMaxWidth().height(miniH.dp)) {
+                    Box(
+                        if (colMode) Modifier.width(miniW.value.dp)
+                            .align(Alignment.Center)
+                        else Modifier.fillMaxWidth().padding(horizontal = 13.dp)
+                            .align(Alignment.Center)
+                    ) {
+                        if (miniH > 0.5f) {
+                        // 阴影照网页：展开 0 10px 32px .10（网易风 30px/.12、深色 8px 28px .45），
+                        // 收起 0 6px 20px .06（深色 .40），随 collapseT 插值
+                        val shOff = if (st.dark) lerpF(8f, 6f, collapseT)
+                            else lerpF(10f, 6f, collapseT)
+                        val shBlur = if (st.dark) lerpF(28f, 20f, collapseT)
+                            else lerpF(if (isNetease) 30f else 32f, 20f, collapseT)
+                        val shAlpha = if (st.dark) lerpF(0.45f, 0.40f, collapseT)
+                            else lerpF(if (isNetease) 0.12f else 0.10f, 0.06f, collapseT)
+                        val shAlpha2 = if (st.dark) 0f else lerpF(0.05f, 0f, collapseT)
+                        DockMiniBar(
+                            isLiuli, isNetease, isHeijiao, st.dark, st.accent,
+                            lyricColor, dockLyric, miniH, coverS, nameSp, nameWeight,
+                            nextW, nextAlpha, artistAlpha, artistHFrac, discOff, discSpacerW,
+                            detailT, frac, spin, bmp,
+                            shOff, shBlur, shAlpha, shAlpha2,
+                            onToggle, onNext, onOpenPlayer, onQueue
+                        )
+                        }
+                    }
+                    if (sideS > 0.5f) {
+                        Box(
+                            Modifier.align(Alignment.CenterStart)
+                                .padding(start = 13.dp)
+                        ) {
+                            DockSideBtn(true, sideS, tSide, st.page == "home", st.dark, st.accent) {
+                                onTab("home")
+                            }
+                        }
+                        Box(
+                            Modifier.align(Alignment.CenterEnd)
+                                .padding(end = 13.dp)
+                        ) {
+                            DockSideBtn(false, sideS, tSide, st.page == "search", st.dark, st.accent) {
+                                onTab("search")
+                            }
+                        }
+                    }
+                }
+            } else {
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 13.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1021,7 +1134,7 @@ private fun DockRootContent(
                         DockMiniBar(
                             isLiuli, isNetease, isHeijiao, st.dark, st.accent,
                             lyricColor, dockLyric, miniH, coverS, nameSp, nameWeight,
-                            nextW, nextAlpha, artistAlpha, discOff, discSpacerW,
+                            nextW, nextAlpha, artistAlpha, artistHFrac, discOff, discSpacerW,
                             detailT, frac, spin, bmp,
                             shOff, shBlur, shAlpha, shAlpha2,
                             onToggle, onNext, onOpenPlayer, onQueue
@@ -1033,6 +1146,7 @@ private fun DockRootContent(
                         onTab("search")
                     }
                 }
+            }
             }
             if (gapH > 0.1f) Spacer(Modifier.height(gapH.dp))
             if (tabH > 0.5f) {
