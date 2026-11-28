@@ -48,8 +48,9 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.layer.GraphicsLayer
-import androidx.compose.ui.graphics.layer.rememberGraphicsLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.Image
@@ -223,7 +224,7 @@ private fun Modifier.homePress(scaleTo: Float = 0.97f, onClick: () -> Unit): Mod
     val pressed by src.collectIsPressedAsState()
     val sc by animateFloatAsState(if (pressed) scaleTo else 1f, label = "homePress")
     return this
-        .androidx.compose.ui.graphics.graphicsLayer { scaleX = sc; scaleY = sc }
+        .graphicsLayer { scaleX = sc; scaleY = sc }
         .clickable(interactionSource = src, indication = null, onClick = onClick)
 }
 
@@ -309,7 +310,8 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                 .drawWithContent {
                     if (vis) {
                         try {
-                            layer.record { drawContent() }
+                            val cds = this
+                            layer.record { with(cds) { drawContent() } }
                         } catch (_: Exception) {
                         }
                     }
