@@ -662,13 +662,19 @@ private fun DockMiniBar(
         ) {
             if (st.backdrop != null) DockBackdropSlice(dockWash(true, dark))
             if (isLiuli && frac > 0f) {
+                // 网页 .mini-fill：固定 --pink #fa2d48（不随主题色），渐变
+                // 26/18/8/2 还要再乘 mask（72% 前全显、88% 处 .45、末端 0），
+                // 旧版漏了 mask、前沿偏硬（3.85.17 补齐为等效止点）
+                val pink = Color(0xFFFA2D48)
                 val stops = if (dark) arrayOf(
-                    0f to accent.copy(0.32f), 0.55f to accent.copy(0.20f),
-                    0.82f to accent.copy(0.08f), 0.94f to accent.copy(0.02f),
+                    0f to pink.copy(0.32f), 0.55f to pink.copy(0.20f),
+                    0.72f to pink.copy(0.124f), 0.82f to pink.copy(0.052f),
+                    0.88f to pink.copy(0.0225f), 0.94f to pink.copy(0.0045f),
                     1f to Color.Transparent
                 ) else arrayOf(
-                    0f to accent.copy(0.26f), 0.55f to accent.copy(0.18f),
-                    0.82f to accent.copy(0.08f), 0.94f to accent.copy(0.02f),
+                    0f to pink.copy(0.26f), 0.55f to pink.copy(0.18f),
+                    0.72f to pink.copy(0.117f), 0.82f to pink.copy(0.052f),
+                    0.88f to pink.copy(0.0225f), 0.94f to pink.copy(0.0045f),
                     1f to Color.Transparent
                 )
                 Box(
@@ -688,8 +694,8 @@ private fun DockMiniBar(
                         else 0.85f * (1f - (prog - 0.12f) / 0.88f)
                         val s = p.s0 + (0.35f - p.s0) * prog
                         val base = if (dark) androidx.compose.ui.graphics.lerp(
-                            accent, Color.White, 0.30f
-                        ) else accent
+                            Color(0xFFFA2D48), Color.White, 0.30f
+                        ) else Color(0xFFFA2D48)
                         val alphaBase = if (dark) 1f else 0.75f
                         drawCircle(
                             base.copy(alpha = alphaBase * a.coerceIn(0f, 1f)),
@@ -718,19 +724,30 @@ private fun DockMiniBar(
                         lineHeight = (nameSp * 1.2f).sp,
                         letterSpacing = (-0.14).sp
                     )
+                    // 网页 .mini-sub 恒高 20px：收起时塌的只有歌手自己
+                    // （.mini-artist max-height/opacity），歌词行常显——旧版把
+                    // 歌词塞进歌手的塌高槽，收起时歌词被一起挤没（3.85.17 修）
                     Box(
-                        Modifier.fillMaxWidth().height((20f * artistHFrac).dp)
-                            .clipToBounds()
+                        Modifier.fillMaxWidth().height(20.dp).clipToBounds()
                     ) {
-                        Box(Modifier.fillMaxWidth().height(20.dp).alpha(artistAlpha)) {
-                            if (lyricText.isNotEmpty()) {
-                                DockLyricLine(lyricText, lyricColor)
-                            } else {
-                                Text(
-                                    st.artist, color = artistColor, fontSize = 12.sp,
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                    lineHeight = (12 * 1.35f).sp
-                                )
+                        if (lyricText.isNotEmpty()) {
+                            DockLyricLine(lyricText, lyricColor)
+                        } else {
+                            Box(
+                                Modifier.fillMaxWidth()
+                                    .height((20f * artistHFrac).dp).clipToBounds()
+                            ) {
+                                Box(
+                                    Modifier.fillMaxWidth().height(20.dp)
+                                        .alpha(artistAlpha)
+                                ) {
+                                    Text(
+                                        st.artist, color = artistColor,
+                                        fontSize = 12.sp, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        lineHeight = (12 * 1.35f).sp
+                                    )
+                                }
                             }
                         }
                     }
@@ -1056,7 +1073,7 @@ private fun DockRootContent(
     val tabScale = lerpF(0.88f, 1f, tabGrow.value)
     val tabTyDp = lerpF(18f, 0f, tabGrow.value)
     val lyricColor = if (st.dark) androidx.compose.ui.graphics.lerp(
-        st.accent, Color.White, 0.35f
+        Color(0xFFFA2D48), Color.White, 0.35f
     ) else st.npAccent
     val bmp = DockStickyCover(st.cover)
     val dens = LocalDensity.current.density
