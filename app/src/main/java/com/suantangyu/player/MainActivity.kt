@@ -585,6 +585,7 @@ class MainActivity : AppCompatActivity() {
 
     // ===== 3.82.0 原生播放页（二期）=====
     private var playerLastDark = false
+    private var lastPlayerUiKey = "" // 3.84.38：播放页正在显示的歌（脑快照 uiKey）
     private var playerLastAccent = "#E4002B"
     private val playerPollHandler = Handler(Looper.getMainLooper())
     private var playerPollActive = false
@@ -660,6 +661,15 @@ class MainActivity : AppCompatActivity() {
             NativePlayerStore.anchorPosMs = o.optLong("pos")
             NativePlayerStore.anchorAtMs = SystemClock.elapsedRealtime()
             NativePlayerStore.durMs = o.optLong("dur")
+            // 3.84.38：显示的歌变了（切歌先行展示/真歌落地）→ 上一首的
+            // 歌词/喜欢/音质作废，等网页推新歌的来；不然新标题下挂旧歌词
+            val uiKey = o.optString("uiKey")
+            if (uiKey.isNotEmpty() && uiKey != lastPlayerUiKey) {
+                lastPlayerUiKey = uiKey
+                NativePlayerStore.lyrics = emptyList()
+                NativePlayerStore.fav = false
+                NativePlayerStore.quality = ""
+            }
         } catch (_: Exception) {
         }
         // 3.84.21:当前歌的取色/合成背景没备好就后台补预合成——
@@ -690,8 +700,16 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             try {
                 val o = JSONObject(json)
-                NativePlayerStore.fav = o.optBoolean("fav")
-                NativePlayerStore.quality = o.optString("quality")
+                // 3.84.38：推送带的 key 与页面正在显示的歌对不上时
+                // （先行展示期间网页还没跟上），fav/音质/歌词先不收，
+                // 等网页切到同一首再推；与歌无关的字段照常收
+                val pKey = o.optString("key")
+                val songMatch = pKey.isEmpty() || lastPlayerUiKey.isEmpty() ||
+                    pKey == lastPlayerUiKey
+                if (songMatch) {
+                    NativePlayerStore.fav = o.optBoolean("fav")
+                    NativePlayerStore.quality = o.optString("quality")
+                }
                 val npAcc = o.optString("npAccent")
                 if (npAcc.isNotEmpty()) {
                     try {
@@ -709,7 +727,7 @@ class MainActivity : AppCompatActivity() {
                 NativePlayerStore.dmOn = o.optBoolean("dmOn")
                 NativePlayerStore.ktvOn = o.optBoolean("ktvOn")
                 NativePlayerStore.transOn = o.optBoolean("transOn")
-                val arr = o.optJSONArray("lyrics")
+                val arr = if (songMatch) o.optJSONArray("lyrics") else null
                 val list = ArrayList<PlayerLine>()
                 if (arr != null) {
                     for (i in 0 until arr.length()) {

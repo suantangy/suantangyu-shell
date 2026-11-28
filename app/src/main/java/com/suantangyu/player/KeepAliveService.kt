@@ -1269,6 +1269,7 @@ class KeepAliveService : Service() {
      * 是 phase-3 原生接播：播放器已经自己切到了这首，只补状态对齐。
      */
     private fun applyAdvance(item: ArmedItem, playIt: Boolean) {
+        brainUiPaintKey = "" // 3.84.38：真歌落地，先行展示作废
         // 先把曲目信息换上，锁屏卡片立刻是对的，不必等网页醒来
         if (item.title.isNotEmpty()) title = item.title
         artist = item.artist
@@ -2778,6 +2779,33 @@ class KeepAliveService : Service() {
             pos = anchorPosMs + ((SystemClock.elapsedRealtime() - anchorAtMs) * pendingRate).toLong()
         }
         if (durationMs > 0) pos = pos.coerceIn(0, durationMs) else pos = maxOf(0, pos)
+        // 3.84.38：先行展示——目标歌还没落地时快照先报目标歌，
+        // 页面标题/封面/进度立刻翻过去（pos/dur 归零，落地后转实值）
+        val pk = brainUiPaintKey
+        if (pk.isNotEmpty() && brainUiPaintGen == brainOpGen && pk != brainCurrentKey()) {
+            val pdi = brainQueueKeys.indexOf(pk)
+            val pd = if (pdi >= 0) brainQueue[pdi] else null
+            if (pd != null) {
+                var pcov = ""
+                for (f in arrayOf(
+                    "cover", "pic", "albumPic", "album_pic", "picurl", "picUrl",
+                    "albumpic", "hts_albumpic", "img", "image", "albumImg"
+                )) {
+                    val v = pd.optString(f, "")
+                    if (v.startsWith("http")) { pcov = v; break }
+                }
+                return JSONObject()
+                    .put("title", pd.optString("name"))
+                    .put("artist", pd.optString("artist").ifEmpty { pd.optString("singer") })
+                    .put("cover", pcov)
+                    .put("playing", playing)
+                    .put("pos", 0)
+                    .put("dur", 0)
+                    .put("mode", brainMode)
+                    .put("rate", pendingRate.toDouble())
+                    .put("uiKey", pk)
+            }
+        }
         return JSONObject()
             .put("title", title)
             .put("artist", artist)
@@ -2787,6 +2815,7 @@ class KeepAliveService : Service() {
             .put("dur", durationMs)
             .put("mode", brainMode)
             .put("rate", pendingRate.toDouble())
+            .put("uiKey", brainCurrentKey())
     }
 
     /** 3.80.0：原生队列读脑快照（队列/当前键/模式/播放态）。封面字段序与网页 songCover 对齐 */
@@ -3447,6 +3476,11 @@ class KeepAliveService : Service() {
     private var brainOpGen: Int = 0 // 意图代次：新意图一来，旧解析落地作废（与落雪 gettingUrlId 同构）
     private var brainStartKey: String = "" // 正在办的起播键（终点回执 startfailed 按它回）
     private var brainIntendedKey: String = "" // 3.47.0：手动切歌想去的目标——快速连点时「当前在播」还没跟上，用它接着往后算；歌出声即清
+    // 3.84.38：手动切歌先行展示——点下瞬间把目标歌顶上 UI 快照，
+    // 播放页立刻翻（学网页版 paintNow），声音等解析落地。gen 与
+    // brainOpGen 对齐，被新操作代次即失效；applyAdvance 落地即清
+    @Volatile private var brainUiPaintKey: String = ""
+    @Volatile private var brainUiPaintGen: Int = -1
     private var brainIntendedCause: String = "" // 3.47.0：想去的目标是哪种切歌来的（next/prev），补解析时原样带回
     private var brainSaveRunnable: Runnable? = null
 
@@ -3636,7 +3670,10 @@ class KeepAliveService : Service() {
             return
         }
         // 单脑第 2 步：起播（cause=start）走 swapExec 优先车道，不排补仓的队；
-        // 其余切歌仍走 resolveExec。两条车道各自 busy，落地回主线程串行执行。
+        // 3.84.38：手动上一首/下一首（next/prev）同走优先车道——原来排在
+        // resolveExec 后面跟补仓/探针挤一条单线程，用户点切歌要等补仓
+        // 解析完才轮到。自动连播（ended）仍走 resolveExec。两条车道
+        // 各自 busy，落地回主线程串行执行。
         val isStart = cause == "start"
         if (isStart) {
             brainStartBusy = true
@@ -3645,7 +3682,7 @@ class KeepAliveService : Service() {
             brainAdvanceBusy = true
         }
         val gen = brainOpGen
-        val exec = if (isStart) swapExec else resolveExec
+        val exec = if (isStart || cause == "next" || cause == "prev") swapExec else resolveExec
         exec.execute {
             val url = try {
                 LxResolver.resolve(
@@ -3759,6 +3796,9 @@ class KeepAliveService : Service() {
         val t = computeBrainNextKey(true, base) ?: return
         brainIntendedKey = t
         brainIntendedCause = "next"
+        brainUiPaintKey = t
+        brainUiPaintGen = brainOpGen
+        try { MainActivity.instance?.onBrainSyncNotify() } catch (_: Exception) {}
         executeBrainAdvance(t, "next", 0)
     }
 
@@ -3772,6 +3812,9 @@ class KeepAliveService : Service() {
         val t = computeBrainPrevKey(base) ?: return
         brainIntendedKey = t
         brainIntendedCause = "prev"
+        brainUiPaintKey = t
+        brainUiPaintGen = brainOpGen
+        try { MainActivity.instance?.onBrainSyncNotify() } catch (_: Exception) {}
         executeBrainAdvance(t, "prev", 0)
     }
 
