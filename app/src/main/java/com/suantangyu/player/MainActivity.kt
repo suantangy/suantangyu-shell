@@ -726,8 +726,7 @@ class MainActivity : AppCompatActivity() {
                 val o = org.json.JSONObject(json)
                 val oldCollapsed = NativeDockStore.collapsed
                 val oldDetail = NativeDockStore.detail
-                // 3.85.20：页面/详情/深浅一变，白化守卫基线清零（新页首图无条件认）
-                                NativeDockStore.page = o.optString("page", "home")
+                NativeDockStore.page = o.optString("page", "home")
                 NativeDockStore.collapsed = o.optBoolean("collapsed")
                 NativeDockStore.detail = o.optBoolean("detail")
                 NativeDockStore.style = o.optString("style", "liuli")
@@ -856,39 +855,6 @@ class MainActivity : AppCompatActivity() {
     private fun dockShiftNow(): Int =
         (dockScrollY - dockCaptureScrollY).coerceIn(-260, 340)
 
-    /** 底图底部 40% 条带的（平均亮度， 标准差）（小图抽样，0-255）。
-     * 3.85.22：白化的签名是「又白又平」（实测 251±2、整片无内容），不是
-     * 「亮」——真实的白页面条带里有文字和封面、标准差大得多。旧悬崖规则
-     * 只看相对上一张的均亮跳升，分不清白化与「深色内容划过后的正常亮
-     * 图」，基线被一张深色图毒化后整页底图冻死（3.85.21 主页粉红冻结
-     * 实锤），故改判平坦度、逐张独立判决、不留基线 */
-    private fun backdropStripStats(bmp: Bitmap): Pair<Float, Float> {
-        val w = bmp.width
-        val h = bmp.height
-        if (w <= 0 || h <= 0) return Pair(-1f, 0f)
-        val y0 = (h * 0.6f).toInt()
-        val px = IntArray(w * (h - y0))
-        bmp.getPixels(px, 0, w, 0, y0, w, h - y0)
-        var sum = 0.0
-        var sumSq = 0.0
-        var n = 0
-        var i = 0
-        while (i < px.size) {
-            val c = px[i]
-            val lum = (android.graphics.Color.red(c) +
-                android.graphics.Color.green(c) +
-                android.graphics.Color.blue(c)) / 3.0
-            sum += lum
-            sumSq += lum * lum
-            n++
-            i += 7
-        }
-        if (n == 0) return Pair(-1f, 0f)
-        val mean = sum / n
-        val variance = (sumSq / n - mean * mean).coerceAtLeast(0.0)
-        return Pair(mean.toFloat(), kotlin.math.sqrt(variance).toFloat())
-    }
-
     /** 3.85.2/3.85.4：网页在滚 → 先按位移补偿顶一帧，同时重截＋停稳补截 */
     fun onDockScroll(scrollTop: Int) {
         runOnUiThread {
@@ -950,19 +916,7 @@ class MainActivity : AppCompatActivity() {
             Thread {
                 try {
                     val out = blurAndSaturate(raw, 35)
-                    // 3.85.22：发布前验一道——平坦纯白（均亮 >235 且标准
-                    // 差 <6）判为 WebView 绘制白化、丢弃不用，旧图继续靠
-                    // 位移补偿顶着；带内容的亮图（哪怕刚划过深色内容）
-                    // 标准差大、照常放行，底图不会再被冻死
-                    val (mean, std) = backdropStripStats(out)
                     runOnUiThread {
-                        if (mean > 235f && std < 6f) {
-                            if (dockCapturePending) {
-                                dockCapturePending = false
-                                captureDockBackdrop(true)
-                            }
-                            return@runOnUiThread
-                        }
                         NativeDockStore.backdrop = out.asImageBitmap()
                         NativeDockStore.backdropTopPx = top
                         NativeDockStore.backdropScale = scale
