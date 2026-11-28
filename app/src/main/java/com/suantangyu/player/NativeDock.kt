@@ -213,7 +213,7 @@ private fun lerpF(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 /** 玻璃面（网页 backdrop 毛玻璃的近似：同值半透明渐变＋边＋软影） */
 @Composable
 private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: Boolean, bg: Boolean = true): Modifier {
-    val bg = if (dark) {
+    val bgC = if (dark) {
         if (shown) Color(0xC72C2C2E) else Color(0xD11C1C1E)
     } else {
         Color.White
@@ -227,7 +227,7 @@ private fun Modifier.dockGlass(shape: RoundedCornerShape, dark: Boolean, shown: 
         spotColor = Color.Black.copy(alpha = shadowA)
     )
     if (bg) {
-        m = if (dark) m.background(bg, shape)
+        m = if (dark) m.background(bgC, shape)
         else m.background(
             Brush.verticalGradient(listOf(Color.White.copy(0.78f), Color.White.copy(0.62f))),
             shape
