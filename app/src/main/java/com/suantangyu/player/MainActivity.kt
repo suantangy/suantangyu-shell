@@ -728,7 +728,6 @@ class MainActivity : AppCompatActivity() {
                 val oldDetail = NativeDockStore.detail
                 // 3.85.20：页面/详情/深浅一变，白化守卫基线清零（新页首图无条件认）
                 lastBackdropMean = -1f
-                backdropRejectStreak = 0
                 NativeDockStore.page = o.optString("page", "home")
                 NativeDockStore.collapsed = o.optBoolean("collapsed")
                 NativeDockStore.detail = o.optBoolean("detail")
@@ -858,9 +857,8 @@ class MainActivity : AppCompatActivity() {
     private fun dockShiftNow(): Int =
         (dockScrollY - dockCaptureScrollY).coerceIn(-260, 340)
 
-    // 3.85.20 白化守卫的账本：上一张已发布底图的底部条均亮与连丢计数
+    // 3.85.20 白化守卫的账本：上一张已发布底图的底部条均亮
     private var lastBackdropMean = -1f
-    private var backdropRejectStreak = 0
 
     /** 底图底部 40% 条带的平均亮度（小图抽样，0-255） */
     private fun backdropStripMean(bmp: Bitmap): Float {
@@ -932,6 +930,44 @@ class MainActivity : AppCompatActivity() {
         }
         lastDockBackdropAt = now
         dockBackdropBusy = true
+        // 3.85.21：截取改走 PixelCopy 读合成器已呈现的帧——旧 webView.draw()
+        // 在详情页滚动中途会整张白化（3.85.20 的守卫拦不住：白化是持续的，
+        // 连丢计数放行后就锁死白）。PixelCopy 拿的是屏幕上真实显示的像素，
+        // 从源头没这毛病；失败/老系统回退 draw() 老路。回调万一不来，
+        // 900ms 安全阀按 token 释放 busy，别把截取永久卡死
+        val token = ++dockCaptureToken
+        uiHandler.postDelayed({
+            if (dockCaptureToken == token && dockBackdropBusy) {
+                dockBackdropBusy = false
+                if (dockCapturePending) {
+                    dockCapturePending = false
+                    captureDockBackdrop(true)
+                }
+            }
+        }, 900)
+        val scale = 0.25f
+        val bw = (webView.width * scale).toInt().coerceAtLeast(1)
+        val bh = (webView.height * scale).toInt().coerceAtLeast(1)
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            try {
+                val full = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+                android.view.PixelCopy.request(webView, full, { res ->
+                    if (res == android.view.PixelCopy.SUCCESS) {
+                        blurAndPublishDockBackdrop(full, 0, capScrollY)
+                    } else {
+                        drawFallbackDockBackdrop(top, capScrollY)
+                    }
+                }, uiHandler)
+            } catch (_: Exception) {
+                drawFallbackDockBackdrop(top, capScrollY)
+            }
+        } else {
+            drawFallbackDockBackdrop(top, capScrollY)
+        }
+    }
+
+    /** 3.85.21 回退路：老 draw() 截取（PixelCopy 不可用/失败时） */
+    private fun drawFallbackDockBackdrop(top: Int, capScrollY: Int) {
         try {
             val scale = 0.25f
             val regionH = webView.height - top
@@ -942,48 +978,52 @@ class MainActivity : AppCompatActivity() {
             canvas.scale(scale, scale)
             canvas.translate(0f, -top.toFloat())
             webView.draw(canvas)
-            Thread {
-                try {
-                    val out = blurAndSaturate(raw, 35)
-                    // 3.85.20：详情页滚到中途截取会整张发白（WebView 绘制
-                    // 白化，cheng 录屏实锤：背后明明是深色列表、迷你却变
-                    // 纯白）。发布前验一道：新图底部条（坞自身那截）均亮
-                    // 比上一张跳升 >55 且上一张不亮 → 判白化、丢弃不用，
-                    // 旧图继续靠位移补偿顶着；连丢 4 张则认页面真变了、放行
-                    val mean = backdropStripMean(out)
-                    runOnUiThread {
-                        val cliff = lastBackdropMean >= 0f &&
-                            lastBackdropMean < 170f &&
-                            mean > lastBackdropMean + 55f
-                        if (cliff && backdropRejectStreak < 4) {
-                            backdropRejectStreak++
-                            if (dockCapturePending) {
-                                dockCapturePending = false
-                                captureDockBackdrop(true)
-                            }
-                            return@runOnUiThread
-                        }
-                        backdropRejectStreak = 0
-                        lastBackdropMean = mean
-                        NativeDockStore.backdrop = out.asImageBitmap()
-                        NativeDockStore.backdropTopPx = top
-                        NativeDockStore.backdropScale = scale
-                        dockCaptureScrollY = capScrollY
-                        NativeDockStore.backdropShiftPx = dockShiftNow()
-                        if (dockCapturePending) {
-                            dockCapturePending = false
-                            captureDockBackdrop(true)
-                        }
-                    }
-                } catch (_: Exception) {
-                } finally {
-                    dockBackdropBusy = false
-                }
-            }.start()
+            blurAndPublishDockBackdrop(raw, top, capScrollY)
         } catch (_: Exception) {
             dockBackdropBusy = false
         }
     }
+
+    /** 截得原始小图 → 糊化 → 白化守卫 → 发布（busy 在此收尾） */
+    private fun blurAndPublishDockBackdrop(raw: Bitmap, top: Int, capScrollY: Int) {
+        Thread {
+            try {
+                val out = blurAndSaturate(raw, 35)
+                // 3.85.20 白化悬崖守卫（3.85.21 起无条件拦：白化是持续性
+                // 的，连丢放行只会把白图锁死；页面真切换时 onDockState
+                // 会清基线、新页首图无条件认）
+                val mean = backdropStripMean(out)
+                runOnUiThread {
+                    val cliff = lastBackdropMean >= 0f &&
+                        lastBackdropMean < 170f &&
+                        mean > lastBackdropMean + 55f
+                    if (cliff) {
+                        if (dockCapturePending) {
+                            dockCapturePending = false
+                            captureDockBackdrop(true)
+                        }
+                        return@runOnUiThread
+                    }
+                    lastBackdropMean = mean
+                    NativeDockStore.backdrop = out.asImageBitmap()
+                    NativeDockStore.backdropTopPx = top
+                    NativeDockStore.backdropScale = 0.25f
+                    dockCaptureScrollY = capScrollY
+                    NativeDockStore.backdropShiftPx = dockShiftNow()
+                    if (dockCapturePending) {
+                        dockCapturePending = false
+                        captureDockBackdrop(true)
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                dockBackdropBusy = false
+            }
+        }.start()
+    }
+
+    private var dockCaptureToken = 0
+
 
     /** 小图糊化：滑动窗盒式模糊横竖各三遍（近似高斯，边缘不发板）＋饱和 2.2（网页 .mini/.tabbar 是 saturate(220%) blur(48px)） */
     private fun blurAndSaturate(src: Bitmap, radius: Int): Bitmap {
