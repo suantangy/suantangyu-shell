@@ -457,7 +457,7 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
                 )
                 Box(
                     Modifier.size(44.dp)
-                        .background(if (dark) Color(0xFF2C2C2E) else Color(0xFFEEEEEE), CircleShape),
+                        .background(Color(0xFF0A0A0C), CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
                     if (bmp != null) {
@@ -477,10 +477,10 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
         // 3.85.9：总径 11（黑心 8）——cheng 逐行实测 App 黑心 Ø≈21.5px < 网页 ≈24px：
         // 原生边框＋抗锯齿对黑心的侵蚀比 CSS 大约 1.4px/边，按实测差额放大黑心补偿
         Box(
-            Modifier.size(11.dp).background(Color(0xFF0B0B0D), CircleShape),
+            Modifier.size(10.5.dp).background(Color(0xFF0B0B0D), CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
+            Box(Modifier.fillMaxSize().border(1.25.dp, Color.White.copy(0.4f), CircleShape))
         }
     }
 }
