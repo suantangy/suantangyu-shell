@@ -1337,13 +1337,14 @@ fun NativePlayerRoot(
             // 3.84.34 喜欢/评论照网页 .np-extra-ic:钮 30x28、图标
             // 20、描边 1.8、色 --label-2(浅底 rgba(60,60,67,.72)/
             // 深底 rgba(235,235,245,.68))、两钮间隔 8;喜欢态网页
-            // 是固定粉 #FA2D48 填充(非主题色);整行下移 2dp 对齐
-            // 网页(行底=进度区顶-4,原生框底=进度区顶-6)
+            // 是固定粉 #FA2D48 填充(非主题色)。整行下移量 3.84.37
+            // 改 9dp:双截图实测图标底边到进度线网页 60px(≈28dp)、
+            // App 74px(≈35dp),差约 7dp,offset 2->9 补掉
             val label2 = if (darkUi) Color(0xFF3C3C43).copy(alpha = 0.72f)
                 else Color(0xFFEBEBF5).copy(alpha = 0.68f)
             Row(
                 Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                    .offset(y = 2.dp)
+                    .offset(y = 9.dp)
                     .padding(horizontal = 24.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
