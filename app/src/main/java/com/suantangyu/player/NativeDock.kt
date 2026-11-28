@@ -941,7 +941,7 @@ private fun DockRootContent(
     val tabGrow = remember { Animatable(1f) }
     LaunchedEffect(colActive) {
         if (colActive) tabGrow.snapTo(0f)
-        else tabGrow.animateTo(1f, tween(800, easing = DockEase))
+        else tabGrow.animateTo(1f, tween(680, easing = DockEase))
     }
     val screenWDp = LocalConfiguration.current.screenWidthDp.toFloat()
     val miniW = remember { Animatable(0f) }
@@ -964,6 +964,12 @@ private fun DockRootContent(
         if (colActive) tween(550, easing = EaseCss)
         else tween(600, easing = EaseCss),
         label = "dkArt"
+    )
+    val tArtistA by animateFloatAsState(
+        if (colActive) 0f else 1f,
+        if (colActive) tween(450, easing = EaseCss)
+        else tween(550, easing = EaseCss, delayMillis = 100),
+        label = "dkArtA"
     )
     val tNextW by animateFloatAsState(
         if (colActive) 0f else 1f,
@@ -1011,14 +1017,17 @@ private fun DockRootContent(
     }
     val nextW = lerpF(40f * tNextW, 40f, detailT)
     val nextAlpha = lerpF(tNextA, 1f, detailT)
-    val artistAlpha = (1f - tArtist * 1.25f).coerceIn(0f, 1f)
+    val artistAlpha = tArtistA
     val artistHFrac = 1f - tArtist
     val sideS = 52f * tSide * (1f - detailT)
     val tabBase = if (isNetease) 60f + navInset else 56f
     val tabVis = tabGrow.value * (1f - detailT)
-    val tabH = tabBase * tabVis
+    // 网页涨高走 max-height 0→64 的曲线、内容高 56 先饱和：高度/间距按 64 过冲折算，
+    // 比 0→56 直线明显快（沙盒实测 t=200ms 时网页已 45/56、直线只有约 34）
+    val tabHFrac = min(1f, tabGrow.value * (64f / tabBase)) * (1f - detailT)
+    val tabH = tabBase * tabHFrac
     val tabAlpha = tabVis
-    val gapH = if (st.hasTrack) 4f * tabVis else 0f
+    val gapH = if (st.hasTrack) 4f * tabHFrac else 0f
     val miniStart = when {
         isHeijiao -> lerpF(32f, 16f, detailT)
         else -> 13f
@@ -1152,7 +1161,11 @@ private fun DockRootContent(
             if (tabH > 0.5f) {
                 Box(
                     Modifier.fillMaxWidth()
-                        .padding(start = tabStart.dp, end = tabEnd.dp)
+                        .padding(
+                            start = tabStart.dp,
+                            end = (tabEnd + (screenWDp - tabStart - tabEnd) *
+                                (1f - tabGrow.value)).dp
+                        )
                         .alpha(tabAlpha)
                         .graphicsLayer {
                             scaleX = tabScale; scaleY = tabScale
