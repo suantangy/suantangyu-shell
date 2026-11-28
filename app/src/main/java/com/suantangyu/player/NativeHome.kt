@@ -27,6 +27,11 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -43,6 +48,9 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.TileMode
@@ -56,6 +64,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.Image
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -101,10 +110,13 @@ object NativeHomeStore {
     var rankMsg by mutableStateOf("")
     var ranks by mutableStateOf<List<HomeCard>>(emptyList())
     var homeLayer by mutableStateOf<GraphicsLayer?>(null)
+    // 3.86.1：站源菜单开着时原生主页让位（菜单挂在网页 header 下、垂进主页区，
+    // 不让位会被原生层盖住点不了）
+    var platMenuOpen by mutableStateOf(false)
 
     fun visibleNow(): Boolean =
         enabled && NativeDockStore.page == "home" && !NativeDockStore.detail &&
-            rectWidthPx > 0 && rectHeightPx > 0
+            !platMenuOpen && rectWidthPx > 0 && rectHeightPx > 0
 
     fun blurActive(): Boolean =
         visibleNow() && homeLayer != null && Build.VERSION.SDK_INT >= 31
@@ -120,6 +132,7 @@ object NativeHomeStore {
             plat = o.optString("plat", "qq")
             dark = o.optBoolean("dark")
             duoPlat = o.optString("duoPlat", "")
+            platMenuOpen = o.optBoolean("platMenu", false)
             val duo = o.optJSONObject("duo")
             if (duo != null) {
                 duoGuess = duoOf(duo.optJSONObject("guess"), duoGuess)
@@ -262,6 +275,19 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                 layer.renderEffect = androidx.compose.ui.graphics.BlurEffect(
                     110f, 110f, TileMode.Decal
                 )
+                // 3.86.1：网页玻璃是 saturate(220%) blur(48px)——只糊不饱和，
+                // 在浅色主页上看着像白色透明；给图层补 2.2 饱和（色矩阵）
+                val s = 2.2f
+                layer.colorFilter = ColorFilter.colorMatrix(
+                    ColorMatrix(
+                        floatArrayOf(
+                            0.213f + 0.787f * s, 0.715f - 0.715f * s, 0.072f - 0.072f * s, 0f, 0f,
+                            0.213f - 0.213f * s, 0.715f + 0.285f * s, 0.072f - 0.072f * s, 0f, 0f,
+                            0.213f - 0.213f * s, 0.715f - 0.715f * s, 0.072f + 0.928f * s, 0f, 0f,
+                            0f, 0f, 0f, 1f, 0f
+                        )
+                    )
+                )
             } catch (_: Exception) {
             }
         }
@@ -311,7 +337,16 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                     if (vis) {
                         try {
                             val cds = this
-                            layer.record { with(cds) { drawContent() } }
+                            // 3.86.1：图层只录底部 240dp 条（Dock 只采样这一带），
+                            // 录制/光栅成本降一大截，滑动更跟手
+                            val strip = 240.dp.toPx()
+                            layer.record {
+                                clipRect(
+                                    0f, size.height - strip, size.width, size.height
+                                ) {
+                                    with(cds) { drawContent() }
+                                }
+                            }
                         } catch (_: Exception) {
                         }
                     }
@@ -358,7 +393,8 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                 item(key = "recRow") {
                     if (st.rec.isNotEmpty()) {
                         LazyRow(
-                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(14.dp)
+                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(14.dp),
+                            contentPadding = PaddingValues(bottom = 4.dp)
                         ) {
                             itemsIndexed(st.rec, key = { i, c -> "rec$i${c.name}" }) { i, c ->
                                 Column(
@@ -373,11 +409,13 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                                     androidx.compose.material3.Text(
                                         c.name, color = pal.label, fontSize = 13.sp,
                                         fontWeight = FontWeight(500), maxLines = 1,
+                                        lineHeight = 19.sp,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     if (c.sub.isNotEmpty()) {
                                         androidx.compose.material3.Text(
                                             c.sub, color = pal.label2, fontSize = 13.sp,
+                                            lineHeight = 18.sp,
                                             maxLines = 1, overflow = TextOverflow.Ellipsis
                                         )
                                     }
@@ -399,7 +437,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                         androidx.compose.material3.Text(
                             if (st.chView == "playlist") "热门歌单" else "频道",
                             color = pal.label, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-                            letterSpacing = (-0.66).sp
+                            letterSpacing = (-0.66).sp, lineHeight = 32.sp
                         )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             androidx.compose.material3.Text(
@@ -453,6 +491,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                                     Spacer(Modifier.height(2.dp))
                                     androidx.compose.material3.Text(
                                         c.sub, color = pal.label3, fontSize = 10.sp,
+                                        lineHeight = 14.sp,
                                         maxLines = 1, overflow = TextOverflow.Ellipsis
                                     )
                                 }
@@ -521,6 +560,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                                 androidx.compose.material3.Text(
                                     ch.name, color = pal.label, fontSize = 12.sp,
                                     fontWeight = FontWeight(600), maxLines = 1,
+                                    lineHeight = 17.sp,
                                     overflow = TextOverflow.Ellipsis,
                                     textAlign = TextAlign.Center,
                                     modifier = Modifier.fillMaxWidth()
@@ -528,13 +568,15 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                             }
                         }
                     }
-                    Spacer(Modifier.height(28.dp))
+                    // 网页边距折叠:max(频道区 mb 28, 新歌区 mt 30) = 30
+                    Spacer(Modifier.height(30.dp))
                 }
                 // —— 新歌首发 ——
                 item(key = "nsHead") {
                     androidx.compose.material3.Text(
                         "新歌首发", color = pal.label, fontSize = 22.sp,
                         fontWeight = FontWeight.Bold, letterSpacing = (-0.66).sp,
+                        lineHeight = 32.sp,
                         modifier = Modifier.padding(bottom = 14.dp)
                     )
                 }
@@ -576,15 +618,12 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                                             )
                                             Spacer(Modifier.width(12.dp))
                                             Column(Modifier.weight(1f)) {
-                                                androidx.compose.material3.Text(
-                                                    row.name, color = pal.label,
-                                                    fontSize = 14.sp, maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
+                                                NsNameText(row.name, pal.label)
                                                 Spacer(Modifier.height(4.dp))
                                                 androidx.compose.material3.Text(
                                                     row.sub, color = pal.label2,
                                                     fontSize = 12.sp, maxLines = 1,
+                                                    lineHeight = 15.sp,
                                                     overflow = TextOverflow.Ellipsis
                                                 )
                                             }
@@ -655,6 +694,7 @@ fun NativeHomeRoot(onAction: (String, String) -> Unit) {
                                     androidx.compose.material3.Text(
                                         c.name, color = pal.label, fontSize = 12.sp,
                                         fontWeight = FontWeight(600), maxLines = 1,
+                                        lineHeight = 17.sp,
                                         overflow = TextOverflow.Ellipsis,
                                         textAlign = TextAlign.Center,
                                         modifier = Modifier.fillMaxWidth()
@@ -690,6 +730,59 @@ private fun Grid3(count: Int, cell: @Composable (Int) -> Unit) {
     }
 }
 
+// 3.86.1 新歌名跑马灯：照网页 newSongMarquee——溢出才滚、双份复制无缝循环、
+// 约 30px/秒、时长 max(5s, (文宽+60)/30)
+@Composable
+private fun NsNameText(name: String, color: Color) {
+    val style = TextStyle(color = color, fontSize = 14.sp, lineHeight = 17.5.sp)
+    val measurer = rememberTextMeasurer()
+    val density = LocalDensity.current
+    BoxWithConstraints(Modifier.fillMaxWidth().clipToBounds()) {
+        val boxW = constraints.maxWidth
+        val textW = remember(name, boxW) {
+            try {
+                measurer.measure(name, style).size.width
+            } catch (e: Exception) {
+                0
+            }
+        }
+        if (textW <= boxW || textW == 0) {
+            androidx.compose.material3.Text(
+                name, style = style, maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+        } else {
+            val cyclePx = textW + with(density) { 30.dp.toPx() }
+            val durMs = maxOf(
+                5000,
+                ((textW + with(density) { 60.dp.toPx() }) /
+                    with(density) { 30.dp.toPx() } * 1000).toInt()
+            )
+            val anim = remember(name) { Animatable(0f) }
+            LaunchedEffect(name, textW) {
+                while (true) {
+                    anim.snapTo(0f)
+                    anim.animateTo(-cyclePx, tween(durMs, easing = LinearEasing))
+                }
+            }
+            Row(
+                Modifier
+                    .wrapContentWidth(unbounded = true)
+                    .offset { IntOffset(anim.value.roundToInt(), 0) }
+            ) {
+                val wDp = with(density) { textW.toDp() }
+                androidx.compose.material3.Text(
+                    name, style = style, maxLines = 1, modifier = Modifier.width(wDp)
+                )
+                Spacer(Modifier.width(30.dp))
+                androidx.compose.material3.Text(
+                    name, style = style, maxLines = 1, modifier = Modifier.width(wDp)
+                )
+                Spacer(Modifier.width(30.dp))
+            }
+        }
+    }
+}
+
 @Composable
 private fun ChTab(text: String, on: Boolean, pal: HomePal, onClick: () -> Unit) {
     Box(
@@ -705,6 +798,7 @@ private fun ChTab(text: String, on: Boolean, pal: HomePal, onClick: () -> Unit) 
     ) {
         androidx.compose.material3.Text(
             text, fontSize = 13.sp, fontWeight = FontWeight(600),
+            lineHeight = 19.sp,
             color = if (on) pal.label else pal.label3
         )
     }
@@ -723,7 +817,7 @@ private fun SecHead(
     ) {
         androidx.compose.material3.Text(
             title, color = pal.label, fontSize = 22.sp, fontWeight = FontWeight.Bold,
-            letterSpacing = (-0.66).sp
+            letterSpacing = (-0.66).sp, lineHeight = 32.sp
         )
         if (linkText != null && onLink != null) {
             androidx.compose.material3.Text(
@@ -826,6 +920,7 @@ private fun HotRow(
             Column(Modifier.weight(1f)) {
                 androidx.compose.material3.Text(
                     s.name, color = pal.label, fontSize = 16.sp, maxLines = 1,
+                    lineHeight = 20.8.sp,
                     overflow = TextOverflow.Ellipsis
                 )
                 Row(
@@ -849,6 +944,7 @@ private fun HotRow(
                     }
                     androidx.compose.material3.Text(
                         s.sub, color = pal.label2, fontSize = 13.sp, maxLines = 1,
+                        lineHeight = 18.sp,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
