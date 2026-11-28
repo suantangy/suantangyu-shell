@@ -470,8 +470,10 @@ private fun DockDisc(spin: Float, bmp: Bitmap?, dark: Boolean) {
         // 中心孔（3.85.5 加回，3.85.8 按实测修正）：网页 ::after 是伪元素、不吃全局
         // border-box，是 content-box——宽 7px 是黑心、1.5px 边在外，总径 10px、黑心 7px
         // （cheng 两图实测：网页黑心 Ø≈6.6 单位、总 Ø≈10 单位）
+        // 3.85.9：总径 11（黑心 8）——cheng 逐行实测 App 黑心 Ø≈21.5px < 网页 ≈24px：
+        // 原生边框＋抗锯齿对黑心的侵蚀比 CSS 大约 1.4px/边，按实测差额放大黑心补偿
         Box(
-            Modifier.size(10.dp).clip(CircleShape).background(Color(0xFF0B0B0D)),
+            Modifier.size(11.dp).clip(CircleShape).background(Color(0xFF0B0B0D)),
             contentAlignment = Alignment.Center
         ) {
             Box(Modifier.fillMaxSize().border(1.5.dp, Color.White.copy(0.4f), CircleShape))
